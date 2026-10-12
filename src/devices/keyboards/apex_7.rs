@@ -72,10 +72,10 @@
 //! frames that make the new one live (`89 01`, `41 00`, `74 00 01 00`) are a
 //! separate step, and [`Self::deploy_tail`] returns them without sending anything.
 
-use super::{GenericKeyboard, Keyboard};
+use super::{GenericKeyboard, Keyboard, OnboardConfig};
 use crate::devices::hid_reports::{
-    FS_BLOCK, FS_WRITE_MAX, FS_WRITE_REPORT_SIZE, FsCommitCommand, FsEraseCommand, FsValidateCommand, FsWriteCommand,
-    HidCommand, HidDeviceType, KEYBOARD_REPORT_SIZE, stm32crc,
+    FS_BLOCK, FS_READ_REPORT_SIZE, FS_WRITE_MAX, FS_WRITE_REPORT_SIZE, FsCommitCommand, FsEraseCommand, FsPullCommand,
+    FsReadCommand, FsValidateCommand, FsWriteCommand, HidCommand, HidDeviceType, KEYBOARD_REPORT_SIZE, stm32crc,
 };
 use crate::devices::key_mapping::{APEX_LED_TABLE, KeyAddress, KeyId, KeyMapping};
 use crate::devices::key_names::multimedia_code;
@@ -115,6 +115,19 @@ pub const PROFILE_CHUNK: usize = FS_WRITE_MAX;
 /// 122, because the object's size sets the count and not the payload's.
 pub const PROFILE_BLOCKS: usize = PROFILE_PADDED_LEN / PROFILE_BLOCK;
 pub const PROFILE_FRAMES: usize = 1 + 3 * PROFILE_BLOCKS + 1;
+
+/// How many windows of the device's own buffer one read of a profile covers: the engine's device
+/// code counts `schema-b-num-chunks` as the payload's size over the buffer size, rounded up, so
+/// the last window runs past the payload's end and its tail is dropped by the reader.
+pub const PROFILE_READ_WINDOWS: usize = (PROFILE_PAYLOAD_LEN + PROFILE_BLOCK - 1) / PROFILE_BLOCK;
+
+/// How many frames one read of one profile sends: each window is staged and then asked for in two
+/// halves. A read is 36 frames against a write's 122, and both counts are geometry.
+pub const PROFILE_READ_FRAMES: usize = 3 * PROFILE_READ_WINDOWS;
+
+/// Where a read reply's data starts: the read API's specifiers skip one octet of every reply, the
+/// reply's own report octet, before the window's half.
+pub const PROFILE_READ_DATA_OFF: usize = 1;
 
 /// The schema this module writes.
 pub const PROFILE_SCHEMA: u16 = 0x000B;
@@ -1039,6 +1052,163 @@ impl Apex7 {
             }
         }
     }
+
+    // === Reading a device's own configuration back ===
+
+    /// The frames that read one slot's FS object back: per window of the device's own buffer, stage
+    /// it (`macho-pull-payload`, a 65-octet HIDIO report) and then ask for its two halves
+    /// (`macho-read-payload`, 643-octet feature reports). 36 frames for 12 windows, and the count is
+    /// the payload's geometry: 12 = ceil(11696 / 1024, the engine's buffer size), so the last window
+    /// runs past the payload's end and its tail is dropped by the reader. Nothing here has been put
+    /// on the wire from this tree, so the recipe is the engine's device code rather than a capture.
+    pub fn fs_read_frames(&self, slot: u8) -> Result<Vec<FsFrame>> {
+        if !self.valid_slot(slot) {
+            return Err(Error::InvalidConfig(
+                "not one of the five one-based onboard slots".to_string(),
+            ));
+        }
+        let fs_id = self.fs_id_of_slot(slot);
+        let mut frames: Vec<FsFrame> = Vec::new();
+        for window in 0..PROFILE_READ_WINDOWS {
+            let pull = FsPullCommand::new(fs_id, PROFILE_BLOCK * window, PROFILE_BLOCK);
+            match pull.body() {
+                Err(err) => {
+                    return Err(err);
+                }
+                Ok(body) => {
+                    let mut report = vec![0x00];
+                    report.extend(body);
+                    report.resize(KEYBOARD_REPORT_SIZE, 0);
+                    frames.push(FsFrame { report, feature: false });
+                }
+            }
+            for half in 0..2 {
+                let ask = FsReadCommand::new(PROFILE_CHUNK * half, PROFILE_CHUNK);
+                let mut report = [0u8; FS_READ_REPORT_SIZE];
+                match ask.serialize(&mut report, HidDeviceType::Keyboard) {
+                    Err(err) => {
+                        return Err(err);
+                    }
+                    Ok(_) => {
+                        frames.push(FsFrame {
+                            report: report.to_vec(),
+                            feature: true,
+                        });
+                    }
+                }
+            }
+        }
+        return Ok(frames);
+    }
+
+    /// The data one read reply carries: `PROFILE_READ_DATA_OFF` skips the reply's own octet and
+    /// `want` octets follow it. A reply that came back shorter than the request asked for is refused,
+    /// because a short read would slide every later octet in the payload.
+    pub fn reply_data(&self, reply: &[u8], want: usize) -> Result<Vec<u8>> {
+        if reply.len() < PROFILE_READ_DATA_OFF + want {
+            return Err(Error::DeviceCommunication(format!(
+                "a read reply carried {} octets, not the {} a request asked for",
+                reply.len(),
+                want,
+            )));
+        }
+        return Ok(reply[PROFILE_READ_DATA_OFF..(PROFILE_READ_DATA_OFF + want)].to_vec());
+    }
+
+    /// The name a payload carries: the 24 octets at 2, left-justified and zero-padded, so the name
+    /// ends at the first zero in the field. A field with nothing in it, or with octets that are not
+    /// ASCII, has no name to report.
+    pub fn payload_name_of(&self, payload: &[u8]) -> Option<String> {
+        if payload.len() < (PROFILE_NAME_OFF + PROFILE_NAME_LEN) {
+            return None;
+        }
+        let field = &payload[PROFILE_NAME_OFF..(PROFILE_NAME_OFF + PROFILE_NAME_LEN)];
+        let end = field.iter().position(|octet| *octet == 0).unwrap_or(PROFILE_NAME_LEN);
+        let name = &field[0..end];
+        if !name.iter().all(|octet| octet.is_ascii()) {
+            return None;
+        }
+        return Some(name.iter().map(|octet| *octet as char).collect::<String>());
+    }
+
+    /// Read one slot's FS object back off the device: send each staging request and each read request
+    /// in turn, take the reply that follows it, and keep the payload's own octets. A staging reply is
+    /// discarded, since it only acknowledges that the window is staged. A payload whose own crc does
+    /// not agree with its content is refused rather than remembered, because a payload is remembered
+    /// so it can be edited and written back. The name the payload carries is remembered too, so a
+    /// later rewrite of this slot carries the device's own spelling instead of the default.
+    pub fn pull_payload(&mut self, slot: u8) -> Result<Vec<u8>> {
+        match self.fs_read_frames(slot) {
+            Err(err) => {
+                return Err(err);
+            }
+            Ok(frames) => {
+                let mut file: Vec<u8> = Vec::new();
+                for frame in frames {
+                    if frame.feature {
+                        match self.inner.send_feature_to_control(&frame.report) {
+                            Err(err) => {
+                                return Err(err);
+                            }
+                            Ok(_) => {}
+                        }
+                        let mut reply = vec![0u8; FS_READ_REPORT_SIZE];
+                        match self.receive_raw(&mut reply) {
+                            Err(err) => {
+                                return Err(err);
+                            }
+                            Ok(_) => {}
+                        }
+                        match self.reply_data(&reply, PROFILE_CHUNK) {
+                            Err(err) => {
+                                return Err(err);
+                            }
+                            Ok(data) => {
+                                file.extend(data);
+                            }
+                        }
+                        continue;
+                    }
+                    let body = frame.body();
+                    match self.inner.send_raw(&body) {
+                        Err(err) => {
+                            return Err(err);
+                        }
+                        Ok(_) => {}
+                    }
+                    let mut reply = vec![0u8; KEYBOARD_REPORT_SIZE];
+                    match self.receive_raw(&mut reply) {
+                        Err(err) => {
+                            return Err(err);
+                        }
+                        Ok(_) => {}
+                    }
+                }
+                if file.len() < PROFILE_PAYLOAD_LEN {
+                    return Err(Error::DeviceCommunication(format!(
+                        "a read of one profile is {} octets of window, not {}",
+                        PROFILE_READ_WINDOWS * PROFILE_BLOCK,
+                        file.len(),
+                    )));
+                }
+                let payload = file[0..PROFILE_PAYLOAD_LEN].to_vec();
+                if !self.payload_intact(payload.clone()) {
+                    return Err(Error::DeviceCommunication(
+                        "the payload read back does not agree with its own crc, so it is not a configuration to save"
+                            .to_string(),
+                    ));
+                }
+                self.payloads.insert(slot, payload.clone());
+                match self.payload_name_of(&payload) {
+                    Some(name) => {
+                        self.names.insert(slot, name);
+                    }
+                    None => {}
+                }
+                return Ok(payload);
+            }
+        }
+    }
 }
 
 impl Device for Apex7 {
@@ -1153,6 +1323,23 @@ crate::impl_keyboard_with_delegation!(Apex7, {
                     return self.upload_payload(self.bindings_slot, compiled);
                 }
             },
+        }
+    }
+
+    // The other direction of the same memory: read the slot back and decode what it holds. The
+    // frames, the reply slices and the payload's own crc check all live in this module, so this arm
+    // only says what a read returns.
+    fn pull_key_bindings(&mut self) -> Result<OnboardConfig> {
+        match self.pull_payload(self.bindings_slot) {
+            Err(err) => {
+                return Err(err);
+            }
+            Ok(payload) => {
+                return Ok(OnboardConfig {
+                    name: self.payload_name_of(&payload),
+                    bindings: self.bindings_of_payload(payload),
+                });
+            }
         }
     }
 });
@@ -1524,6 +1711,8 @@ mod tests {
                         assert_eq!(payload[PROFILE_NAME_OFF], 0x43);
                         assert_eq!(payload[PROFILE_NAME_OFF + 10], 0x6e);
                         assert_eq!(payload[PROFILE_NAME_OFF + 11], 0);
+                        // A read names the payload it read, in the same field.
+                        assert_eq!(device.payload_name_of(&payload), Some("Config Main".to_string()));
                     }
                 }
             }
@@ -1567,6 +1756,80 @@ mod tests {
             Err(_) => {}
             Ok(_) => {
                 assert_eq!(false, true);
+            }
+        }
+    }
+
+    #[test]
+    fn the_read_frames_stage_every_window_of_the_payload() {
+        let device = apex7();
+        match device.fs_read_frames(1) {
+            Err(_) => {
+                assert_eq!(false, true);
+            }
+            Ok(frames) => {
+                // One staging request per window of the engine's buffer, and two read requests
+                // asked for after it, so the count is the payload's own geometry.
+                assert_eq!(frames.len(), PROFILE_READ_FRAMES);
+                for window in 0..PROFILE_READ_WINDOWS {
+                    // The staging request is an ordinary HIDIO frame; the reads are feature
+                    // reports, which go out whole with their own report octet.
+                    let stage = &frames[window * 3];
+                    assert_eq!(stage.feature, false);
+                    assert_eq!(stage.report.len(), KEYBOARD_REPORT_SIZE);
+                    for half in 1..3 {
+                        let ask = &frames[window * 3 + half];
+                        assert_eq!(ask.feature, true);
+                        assert_eq!(ask.report.len(), FS_READ_REPORT_SIZE);
+                    }
+                }
+            }
+        }
+        // A slot outside the five is refused before any frame is asked for.
+        assert!(device.fs_read_frames(6).is_err());
+    }
+
+    #[test]
+    fn the_bindings_a_payload_carries_survive_a_rewrite_of_them() {
+        let mut device = apex7();
+        let bindings = BindingSet {
+            bindings: vec![
+                Binding::new(InputKey::KEY_SPACE, Action::Combo(vec![InputKey::KEY_ENTER])),
+                Binding::new(InputKey::KEY_TAB, Action::Media(MediaKey::VolumeDown)),
+            ],
+        };
+        match device.compile_bindings(device.bare_payload("Config Main"), &bindings) {
+            Err(_) => {
+                assert_eq!(false, true);
+            }
+            Ok(compiled) => {
+                let payload = device.seal_payload(compiled.to_vec());
+                // What a read decodes is what the writer compiled: the bindings a payload carries
+                // are legal for the engine, so a configuration the device already has can become
+                // one of the engine's profiles.
+                let found = device.bindings_of_payload(payload.clone());
+                assert_eq!(found.validate().is_ok(), true);
+                assert_eq!(found.bindings.len(), 2);
+                assert_eq!(device.compile_bindings(payload.clone(), &found).is_ok(), true);
+                // The read names the payload by the same field a rewrite writes, so a profile
+                // saved from a read is called what the device spells.
+                assert_eq!(
+                    device.payload_name_of(payload.as_ref()),
+                    Some("Config Main".to_string())
+                );
+                // A read leaves both the payload and the name it spells behind, so the next
+                // rewrite of this slot starts from what the device holds rather than from nothing.
+                device.payloads.insert(1, payload.clone());
+                device.names.insert(1, "Config Main".to_string());
+                assert_eq!(device.payload_name(1), "Config Main");
+                match device.current_payload() {
+                    Err(_) => {
+                        assert_eq!(false, true);
+                    }
+                    Ok(held) => {
+                        assert_eq!(held, payload);
+                    }
+                }
             }
         }
     }

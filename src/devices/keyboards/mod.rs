@@ -51,6 +51,14 @@ pub mod setting_ids {
     pub const SAVE_TO_DEVICE: &str = "save_to_device";
 }
 
+/// What reading one onboard slot of a keyboard returns: the name the device spells for it, and the
+/// bindings its payload carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnboardConfig {
+    pub name: Option<String>,
+    pub bindings: BindingSet,
+}
+
 /// Trait for keyboard-specific functionality.
 #[async_trait]
 pub trait Keyboard: Device + Configurable {
@@ -97,6 +105,23 @@ pub trait Keyboard: Device + Configurable {
         Err(
             Error::DeviceCommunication(
                 "this model has no onboard payload decoded in this fork, so a keybinding cannot become one of its own: the engine's InputState imposes it by grabbing the device and replaying it through uinput".to_string()
+            )
+        )
+    }
+
+    /// Read back what the keyboard's own memory holds for the slot a keybinding rewrite uses: the
+    /// configuration's name as the device spells it, and the bindings it carries, so a configuration
+    /// the device already has can become one of the engine's profiles.
+    ///
+    /// The same one model is covered as for [`Self::Keyboard::set_key_bindings`]: reading that memory
+    /// means staging each window of the device's own buffer and asking for it (`macho-pull-payload`
+    /// and `macho-read-payload` in the engine's device code, spelled at
+    /// [`crate::devices::keyboards::apex_7::Apex7::fs_read_frames`]), and the payload of any other
+    /// Apex keyboard has never been decoded here, so it refuses and says so.
+    fn pull_key_bindings(&mut self) -> Result<OnboardConfig> {
+        Err(
+            Error::DeviceCommunication(
+                "this model has no onboard payload decoded in this fork, so nothing can be read back from its own memory: the engine's InputState is the only place its bindings live".to_string(),
             )
         )
     }

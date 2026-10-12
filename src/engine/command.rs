@@ -63,6 +63,18 @@ pub enum Command {
         name: String,
         description: Option<String>,
     },
+    /// Read one keyboard's own memory back and save what it holds as a profile. `device` names the
+    /// keyboard (required once more than one is connected), `slot` picks the onboard profile to read
+    /// through the keyboard's own `onboard-slot` setting, and `name` the profile to write: without it
+    /// the profile is called what the device spells inside its own memory.
+    ProfilePull {
+        #[serde(default)]
+        device: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        slot: Option<u8>,
+    },
     ProfileLoad {
         name: String,
     },

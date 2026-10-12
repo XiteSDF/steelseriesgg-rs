@@ -104,6 +104,11 @@ pub enum CommandCode {
     FsCommit = 0x05,
     /// Ask the device to validate the profile it just took: body `eb <profile index>`.
     FsValidate = 0xEB,
+    /// Ask the device for part of what it staged: body `83 00 <u16 offset> <u16 size>`, sent and
+    /// answered as a wide feature report (`macho-read-payload`). The request that stages the
+    /// window first, `85 00 <u16 fs_id> <u32 offset> <u16 size>`, has no name here: its byte is
+    /// already [`CommandCode::ApexMEnable`], so [`FsPullCommand`] spells its bytes itself.
+    FsRead = 0x83,
 }
 
 impl fmt::Display for CommandCode {
@@ -136,6 +141,7 @@ impl fmt::Display for CommandCode {
             CommandCode::FsErase => write!(f, "FS_ERASE"),
             CommandCode::FsCommit => write!(f, "FS_COMMIT"),
             CommandCode::FsValidate => write!(f, "FS_VALIDATE"),
+            CommandCode::FsRead => write!(f, "FS_READ"),
         }
     }
 }
@@ -921,6 +927,11 @@ pub const FS_WRITE_MAX: usize = 0x200;
 /// wider than a fixed-size report, which is why a write chunk is padded to it by its caller.
 pub const FS_WRITE_REPORT_SIZE: usize = 643;
 
+/// The width of the feature report a read chunk comes back in: the read API says `HIDFEATURE 643`
+/// for the request and for the reply, the same window a write chunk is padded to, so one read
+/// carries as much as one write.
+pub const FS_READ_REPORT_SIZE: usize = FS_WRITE_REPORT_SIZE;
+
 /// Erase one onboard FS object before writing it back: body `88 00 <u16 fs_id>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FsEraseCommand {
@@ -1219,6 +1230,137 @@ impl HidCommand for FsWriteCommand {
 
     fn description(&self) -> String {
         format!("write {} octets at offset {}", self.data.len(), self.offset)
+    }
+}
+
+/// Stage one window of an onboard FS object in the device's own buffer, which is what the read
+/// side asks for next: body `85 00 <u16 fs_id> <u32 offset> <u16 size>` (`macho-pull-payload`),
+/// sent as a 65-octet HIDIO report. Nothing comes back but an acknowledgement: staging is one
+/// half of the read, and asking for the window is the other.
+///
+/// This is not a [`HidCommand`]: its byte, `0x85`, is already [`CommandCode::ApexMEnable`], and the
+/// enum keeps one name per byte, so there is no name left for a pull. `from_report_byte` reads a
+/// report header of `85` as the enable sequence, which is the only one of the two that comes back;
+/// a pull only ever goes out, and hands its bytes itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FsPullCommand {
+    pub fs_id: u16,
+    pub window_offset: usize,
+    pub window_size: usize,
+}
+
+impl FsPullCommand {
+    pub fn new(fs_id: u16, window_offset: usize, window_size: usize) -> Self {
+        Self {
+            fs_id,
+            window_offset,
+            window_size,
+        }
+    }
+
+    /// The reason the window is not one the device can be asked to stage.
+    pub fn validate(&self) -> Result<()> {
+        if self.fs_id == 0 {
+            return Err(Error::InvalidConfig(
+                "FS object id 0 is not an onboard object".to_string(),
+            ));
+        }
+        if self.window_size == 0 || self.window_size > FS_BLOCK {
+            return Err(Error::InvalidConfig(
+                "a pull stages between 1 and the FS block size of octets into the device's own buffer".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The request's body, report octet not included: `85 00 <u16 fs_id> <u32 offset> <u16 size>`.
+    pub fn body(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        let out = vec![
+            0x85,
+            0x00,
+            (self.fs_id & 0xFF) as u8,
+            (self.fs_id >> 8) as u8,
+            (self.window_offset & 0xFF) as u8,
+            ((self.window_offset >> 8) & 0xFF) as u8,
+            ((self.window_offset >> 16) & 0xFF) as u8,
+            (self.window_offset >> 24) as u8,
+            (self.window_size & 0xFF) as u8,
+            (self.window_size >> 8) as u8,
+        ];
+        return Ok(out);
+    }
+
+    pub fn description(&self) -> String {
+        format!(
+            "stage {} octets at offset {} of FS object {:#06x}",
+            self.window_size, self.window_offset, self.fs_id,
+        )
+    }
+}
+
+/// Ask the device for part of the window it just staged: body `83 00 <u16 offset> <u16 size>`,
+/// sent as a 643-octet feature report and answered by one whose data starts after the report's own
+/// octet (`macho-read-payload`). The two asks of one window are its halves: a feature report
+/// cannot carry more than max_data_bytes at a time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FsReadCommand {
+    pub offset: usize,
+    pub size: usize,
+}
+
+impl FsReadCommand {
+    pub fn new(offset: usize, size: usize) -> Self {
+        Self { offset, size }
+    }
+}
+
+impl HidCommand for FsReadCommand {
+    fn command_code(&self) -> CommandCode {
+        CommandCode::FsRead
+    }
+
+    fn serialize(&self, buffer: &mut [u8], device_type: HidDeviceType) -> Result<usize> {
+        self.validate()?;
+
+        let body = if device_type.includes_report_id() { 1 } else { 0 };
+        let needed = body + 6;
+        if buffer.len() < needed {
+            return Err(Error::DeviceCommunication(format!(
+                "Buffer too small: {} bytes (expected {})",
+                buffer.len(),
+                needed
+            )));
+        }
+
+        buffer[..needed].fill(0);
+
+        buffer[body] = self.command_code() as u8;
+        buffer[body + 1] = 0x00;
+        buffer[body + 2] = (self.offset & 0xFF) as u8;
+        buffer[body + 3] = (self.offset >> 8) as u8;
+        buffer[body + 4] = (self.size & 0xFF) as u8;
+        buffer[body + 5] = (self.size >> 8) as u8;
+
+        Ok(needed)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.size == 0 || self.size > FS_WRITE_MAX {
+            return Err(Error::InvalidConfig(
+                "a read asks for between 1 and max_data_bytes of the read API".to_string(),
+            ));
+        }
+        if self.offset + self.size > FS_BLOCK {
+            return Err(Error::InvalidConfig(
+                "a read asks inside one staged window, so its half ends at the window's end".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn description(&self) -> String {
+        format!("read back {} octets at window offset {}", self.size, self.offset)
     }
 }
 
@@ -3639,6 +3781,29 @@ mod tests {
     fn rapid_tap_layout() {
         assert_eq!(build(RapidTapCommand { enabled: true }, 65)[..3], [0x00, 0x1A, 0x01]);
         assert_eq!(build(RapidTapCommand { enabled: false }, 65)[..3], [0x00, 0x1A, 0x00]);
+    }
+
+    /// The read side's two requests, spelled from the engine's device code: a pull staging one
+    /// whole FS window (`macho-pull-payload`, HIDIO 65) and one half-window read
+    /// (`macho-read-payload`, HIDFEATURE 643). Only the request bytes are pinned here: nothing of
+    /// the read has been put on the wire from this tree, so what a reply carries is a claim about
+    /// the device code, not about a capture.
+    #[test]
+    fn fs_pull_and_read_request_layouts() {
+        let pulled = FsPullCommand::new(0x0202, 0x0400, FS_BLOCK);
+        assert_eq!(
+            pulled.body().unwrap(),
+            [0x85, 0x00, 0x02, 0x02, 0x00, 0x04, 0x00, 0x00, 0x00, 0x04],
+        );
+        assert!(FsPullCommand::new(0, 0, FS_BLOCK).validate().is_err());
+        assert!(FsPullCommand::new(0x0602, 0, 0).body().is_err());
+        assert!(FsPullCommand::new(0x0602, 0, FS_BLOCK + 1).body().is_err());
+
+        let asked = build(FsReadCommand::new(FS_WRITE_MAX, FS_WRITE_MAX), FS_READ_REPORT_SIZE);
+        assert_eq!(asked, [0x00, 0x83, 0x00, 0x00, 0x02, 0x00, 0x02]);
+        assert!(FsReadCommand::new(0, 0).validate().is_err());
+        assert!(FsReadCommand::new(0, FS_WRITE_MAX + 1).validate().is_err());
+        assert!(FsReadCommand::new(FS_BLOCK, FS_WRITE_MAX).validate().is_err());
     }
 
     #[test]

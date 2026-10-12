@@ -427,8 +427,13 @@ async function viewProfiles() {
     el('button', { class: 'btn primary', onclick: async () => {
       const name = nameInput.value.trim(); if (!name) return toast('Enter a name', true);
       await run({ cmd: 'profile_save', name, description: null }, `Saved ${name}`); render(); } }, 'Save'))));
+  // Reading a keyboard's own memory back: the reply names the profile that was written, which is
+  // the name the device spells inside its payload unless the caller asked for another one.
+  out.push(el('div', { class: 'card' }, el('h2', {}, "Read the keyboard's own configuration"),
+    el('button', { class: 'btn primary', onclick: async () => {
+      const reply = await run({ cmd: 'profile_pull' });
+      toast(reply?.profile ? `Profile ${reply.profile} saved from the keyboard` : 'Read from the keyboard'); render(); } }, 'Read from keyboard')));
   const box = el('div', { class: 'profiles', style: 'margin-top:16px' });
-  if (!list.length) box.append(el('div', { class: 'empty' }, 'No profiles yet.'));
   for (const p of list) {
     const apps = el('input', { type: 'text', value: p.apps.join(', '), placeholder: 'Programs that switch to it, e.g. cs2, eldenring.exe', style: 'width:100%' });
     box.append(el('div', { class: 'profile' + (p.active ? ' active' : '') },
@@ -795,6 +800,7 @@ async function demoCall(cmd) {
     }
     case 'profile_list': return demo.profiles;
     case 'profile_save': if (!demo.profiles.some(p => p.name === cmd.name)) demo.profiles.push({ name: cmd.name, description: null, apps: [], active: false }); return { saved: cmd.name };
+    case 'profile_pull': demo.profiles.push({ name: cmd.name || 'Config 3', description: 'read from the keyboard's own memory of Apex 7', apps: [], active: false }); return { profile: cmd.name || 'Config 3', name: 'Config 3', bindings: 2 };
     case 'profile_load': demo.profiles.forEach(p => p.active = p.name === cmd.name); return demoSnapshot();
     case 'profile_delete': demo.profiles = demo.profiles.filter(p => p.name !== cmd.name); return { deleted: cmd.name };
     case 'profile_apps': demo.profiles.find(p => p.name === cmd.name).apps = cmd.apps; return { profile: cmd.name };

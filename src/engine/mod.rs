@@ -1142,8 +1142,12 @@ impl Inner {
             }
             Command::ProfileList => Ok(serde_json::to_value(self.profile_list())?),
             Command::ProfileSave { name, description } => {
-                self.save_profile(&name, description)?;
+                self.save_profile(&name, description, None)?;
                 Ok(json!({ "saved": name }))
+            }
+            Command::ProfilePull { device, name, slot } => {
+                let label = self.pull_profile(device.as_deref(), name.clone(), slot)?;
+                Ok(json!({ "profile": label }))
             }
             Command::ProfileLoad { name } => {
                 self.load_profile(&name)?;
@@ -1634,7 +1638,74 @@ impl Inner {
         Ok(())
     }
 
-    fn save_profile(&mut self, name: &str, description: Option<String>) -> Result<()> {
+    /// Read one keyboard's own memory and save what it holds as a profile: the name the device
+    /// spells inside its payload and the bindings its payload carry. Lighting and every device's
+    /// settings come from what the engine sees now, since reading that memory brings back only
+    /// bindings and a name, and this fork has never watched a reply for the lighting a profile also
+    /// holds (`lighting_profile` at bytes 27 to 83 of the payload has no reader here).
+    ///
+    /// `device` is needed once more than one keyboard is connected; `slot` picks the onboard
+    /// profile to read through the keyboard's own `onboard-slot` setting, the same one a keybinding
+    /// rewrite writes into.
+    fn pull_profile(&mut self, device: Option<&str>, name: Option<String>, slot: Option<u8>) -> Result<String> {
+        let keys = match device {
+            Some(selector) => vec![self.resolve(&selector)?],
+            None => self
+                .slots
+                .iter()
+                .filter(|(_, s)| matches!(s.handle, DeviceHandle::Keyboard(_)))
+                .map(|(k, _)| k.clone())
+                .collect(),
+        };
+        let Some(found) = keys.first() else {
+            return Err(Error::Unsupported(
+                "no connected keyboard holds its own configuration, so there is nothing to read back".to_string(),
+            ));
+        };
+        let key = found.clone();
+        if keys.len() > 1 {
+            return Err(Error::Unsupported(format!(
+                "{} keyboards are connected, name the one to read",
+                keys.len()
+            )));
+        }
+        if let Some(number) = slot {
+            self.apply_setting(&key, "onboard-slot", SettingValue::Choice(format!("{}", number)))?;
+        }
+        let slot_ref = self.slots.get_mut(&key).ok_or_else(|| Error::DeviceNotFound(key))?;
+        let DeviceHandle::Keyboard(keyboard) = &mut slot_ref.handle else {
+            return Err(Error::Unsupported(format!(
+                "{} holds no configuration of its own",
+                slot_ref.info.name
+            )));
+        };
+        let found = keyboard.as_mut().pull_key_bindings()?;
+        found.bindings.validate()?;
+        let device_name = slot_ref.info.name.to_string();
+        let label = name
+            .clone()
+            .or_else(|| found.name.clone())
+            .unwrap_or_else(|| format!("{} has no name for it", device_name));
+        let description = format!("read from the keyboard's own memory of {device_name}");
+        self.save_profile(&label, Some(description), Some(&found.bindings))?;
+        info!(
+            "Read {} key bindings back from {} into profile {}",
+            found.bindings.bindings.len(),
+            device_name,
+            label,
+        );
+        return Ok(label);
+    }
+
+    /// Snapshot the current state of every connected device into a profile. `pulled` is the set of
+    /// bindings read off a keyboard's own memory: a profile that carries one takes it over, since
+    /// what the device holds is the device's own, not the engine's current set.
+    fn save_profile(
+        &mut self,
+        name: &str,
+        description: Option<String>,
+        pulled: Option<&crate::input::BindingSet>,
+    ) -> Result<()> {
         let mut devices = BTreeMap::new();
         for (key, slot) in &self.slots {
             let record = self.state.devices.get(key);
@@ -1663,10 +1734,21 @@ impl Inner {
         }
         let lighting = self.state.lighting.clone();
         let mixer = self.mixer_snapshot.take();
-        let bindings = if self.input.active().bindings.is_empty() {
-            None
-        } else {
-            Some(serde_json::to_value(self.input.active())?)
+        let bindings = match pulled {
+            Some(set) => {
+                if set.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::to_value(set)?)
+                }
+            }
+            None => {
+                if self.input.active().bindings.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::to_value(self.input.active())?)
+                }
+            }
         };
         let profiles = self.profiles_mut()?;
         let mut profile = profiles.get(name).cloned().unwrap_or_else(|| Profile::new(name));
@@ -1677,7 +1759,7 @@ impl Inner {
         if mixer.is_some() {
             profile.mixer = mixer;
         }
-        if profile.bindings.is_none() {
+        if profile.bindings.is_none() || pulled.is_some() {
             profile.bindings = bindings;
         }
         // Keep entries for models that are not plugged in right now.

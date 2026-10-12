@@ -491,6 +491,21 @@ enum ProfileAction {
         description: Option<String>,
     },
 
+    /// Read one keyboard's own memory back and save what it holds as a profile
+    Pull {
+        /// Keyboard to read (name or slot); needed once more than one is connected
+        #[arg(short, long)]
+        device: Option<String>,
+
+        /// Profile to write: the name the keyboard spells inside its own memory by default
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// Which of the keyboard's own onboard profiles to read (1 to 5): its own choice by default
+        #[arg(short, long)]
+        slot: Option<u8>,
+    },
+
     /// Switch to this profile automatically while one of these programs runs
     Apps {
         /// Profile name
@@ -1477,6 +1492,13 @@ async fn cmd_profile(action: ProfileAction) -> Result<()> {
                 &format!("Profile deleted: {name}"),
             )
             .await
+        }
+        ProfileAction::Pull { device, name, slot } => {
+            let done = match name.as_ref() {
+                Some(label) => format!("Profile {label} saved from the keyboard's own memory"),
+                None => "Saved under the name the keyboard spells inside its own memory".to_string(),
+            };
+            cli::profile_command(Command::ProfilePull { device, name, slot }, &done).await
         }
         ProfileAction::Apps { name, apps } => {
             let done = if apps.is_empty() {
