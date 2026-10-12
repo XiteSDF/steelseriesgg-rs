@@ -654,6 +654,19 @@ impl GenericKeyboard {
         self.query_exact(&request)
     }
 
+    /// Read one input report, waiting at most `timeout_ms` for it and returning how many octets
+    /// came back (none when the deadline passed). `receive_raw` blocks until a report arrives,
+    /// which suits answers whose arrival is known: a request the device ignores would leave the
+    /// caller there until the session does, so a bounded read lets the device say nothing instead.
+    pub fn read_within(&self, buf: &mut [u8], timeout_ms: i32) -> Result<usize> {
+        let device = self
+            .device
+            .as_ref()
+            .ok_or(Error::DeviceCommunication("Device not connected".to_string()))?;
+        let device = device.lock();
+        Ok(device.read_timeout(buf, timeout_ms)?)
+    }
+
     /// Send a feature report to the opened control interface.
     #[cfg(unix)]
     pub fn send_feature_to_control(&self, report: &[u8]) -> Result<()> {

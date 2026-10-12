@@ -125,6 +125,13 @@ pub const PROFILE_READ_WINDOWS: usize = (PROFILE_PAYLOAD_LEN + PROFILE_BLOCK - 1
 /// halves. A read is 36 frames against a write's 122, and both counts are geometry.
 pub const PROFILE_READ_FRAMES: usize = 3 * PROFILE_READ_WINDOWS;
 
+/// How long one read waits for its reply, and how many looks at the wire that takes: each look is
+/// OpenRGB's `STEELSERIES_APEX_HID_TIMEOUT` (100 ms) at the wire. The total is a ceiling and not
+/// an expected delay, since no reply has been watched here: a keyboard that answers the reads not
+/// at all fails where the pull started rather than holding it on the wire until the session does.
+pub const FS_READ_LOOK_MS: i32 = 100;
+pub const FS_READ_LOOKS: usize = 5;
+
 /// Where a read reply's data starts: the read API's specifiers skip one octet of every reply, the
 /// reply's own report octet, before the window's half.
 pub const PROFILE_READ_DATA_OFF: usize = 1;
@@ -1131,12 +1138,37 @@ impl Apex7 {
         return Some(name.iter().map(|octet| *octet as char).collect::<String>());
     }
 
+    /// One reply of a read, waited for rather than blocked on: `receive_raw` waits until a report
+    /// arrives, and nothing here says one will, since the read replies are the engine's recipe and
+    /// not octets this fork watched. A bounded read lets a keyboard that answers the reads not at
+    /// all say so where the pull started.
+    pub fn read_reply(&mut self, buf: &mut [u8]) -> Result<usize> {
+        for _ in 0..FS_READ_LOOKS {
+            match self.inner.read_within(buf, FS_READ_LOOK_MS) {
+                Err(err) => {
+                    return Err(err);
+                }
+                Ok(used) => {
+                    if used != 0 {
+                        return Ok(used);
+                    }
+                }
+            }
+        }
+        return Err(Error::DeviceCommunication(format!(
+            "no reply came to the read in {} looks of {} ms: no Apex 7 has been watched answering these frames, so this keyboard may not answer them at all",
+            FS_READ_LOOKS, FS_READ_LOOK_MS,
+        )));
+    }
+
     /// Read one slot's FS object back off the device: send each staging request and each read request
-    /// in turn, take the reply that follows it, and keep the payload's own octets. A staging reply is
-    /// discarded, since it only acknowledges that the window is staged. A payload whose own crc does
-    /// not agree with its content is refused rather than remembered, because a payload is remembered
-    /// so it can be edited and written back. The name the payload carries is remembered too, so a
-    /// later rewrite of this slot carries the device's own spelling instead of the default.
+    /// in turn, keep the reply that follows a read request, and keep the payload's own octets. The
+    /// staging request is an output report like the upload's, which waits for nothing, so it is sent
+    /// and left: only the reads answer, and reading what a staging request answers would take a
+    /// report no read asked for. A payload whose own crc does not agree with its content is refused
+    /// rather than remembered, because a payload is remembered so it can be edited and written back.
+    /// The name the payload carries is remembered too, so a later rewrite of this slot carries the
+    /// device's own spelling instead of the default.
     pub fn pull_payload(&mut self, slot: u8) -> Result<Vec<u8>> {
         match self.fs_read_frames(slot) {
             Err(err) => {
@@ -1153,13 +1185,16 @@ impl Apex7 {
                             Ok(_) => {}
                         }
                         let mut reply = vec![0u8; FS_READ_REPORT_SIZE];
-                        match self.receive_raw(&mut reply) {
+                        // What the read answered, and not the whole buffer, is what counts: a
+                        // reply shorter than the window's half would slide every later octet in
+                        // the payload, so the short one is refused where it stands.
+                        let used: usize = match self.read_reply(&mut reply) {
                             Err(err) => {
                                 return Err(err);
                             }
-                            Ok(_) => {}
-                        }
-                        match self.reply_data(&reply, PROFILE_CHUNK) {
+                            Ok(octets) => octets,
+                        };
+                        match self.reply_data(&reply[0..used], PROFILE_CHUNK) {
                             Err(err) => {
                                 return Err(err);
                             }
@@ -1169,15 +1204,11 @@ impl Apex7 {
                         }
                         continue;
                     }
+                    // The staging request goes out and nothing is waited for it, as with the
+                    // upload's writes of the same kind: a staged window is acknowledged at most,
+                    // and waiting here would spend the read on a report no read asked for.
                     let body = frame.body();
                     match self.inner.send_raw(&body) {
-                        Err(err) => {
-                            return Err(err);
-                        }
-                        Ok(_) => {}
-                    }
-                    let mut reply = vec![0u8; KEYBOARD_REPORT_SIZE];
-                    match self.receive_raw(&mut reply) {
                         Err(err) => {
                             return Err(err);
                         }
@@ -1787,6 +1818,27 @@ mod tests {
         }
         // A slot outside the five is refused before any frame is asked for.
         assert!(device.fs_read_frames(6).is_err());
+    }
+
+    #[test]
+    fn a_read_waits_for_a_reply_instead_of_blocking() {
+        // The wait is a bounded number of looks at the wire, so a keyboard that answers the reads
+        // not at all fails where the pull started rather than holding it there: five looks of the
+        // 100 ms OpenRGB gives a keyboard to answer, half a second all one window may take.
+        assert_eq!(FS_READ_LOOKS, 5);
+        assert_eq!(FS_READ_LOOK_MS, 100);
+        let mut device = apex7();
+        let mut reply = vec![0u8; FS_READ_REPORT_SIZE];
+        // The test keyboard has no HID device behind it, which is the arm a deadline takes when
+        // nothing answers: the read says so at once.
+        match device.read_reply(&mut reply) {
+            Err(Error::DeviceCommunication(reason)) => {
+                assert_eq!(reason, "Device not connected");
+            }
+            _ => {
+                assert_eq!(false, true);
+            }
+        }
     }
 
     #[test]

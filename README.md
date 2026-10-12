@@ -237,7 +237,9 @@ What a read brings back is named by what the keyboard spells inside its own memo
 2`, or `Config Main` once something has renamed the slot - and its bindings come back as the
 same records a write compiles, so saving what was read and loading it again writes the
 keyboard's own configuration back. A payload whose own checksum does not agree is refused
-rather than saved. The scroll wheel of the Apex 7 is part of that memory too: the device binds
+rather than saved. Nothing has been watched answering the read frames, so a read is waited for
+rather than waited on: five looks of 100 ms at the wire, and a keyboard that answers none of
+them fails where the read started, with that reason, instead of holding the command there. The scroll wheel of the Apex 7 is part of that memory too: the device binds
 volume up to scroll up and volume down to scroll down as its own keybinding, rather than the
 engine intercepting a scroll.
 
