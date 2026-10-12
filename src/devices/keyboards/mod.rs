@@ -1,6 +1,7 @@
 //! Keyboard device support (Apex series).
 
 pub mod apex;
+pub mod apex_7;
 pub mod apex_pro_tkl_2023;
 pub mod oled;
 pub mod protocol;
@@ -23,6 +24,7 @@ use super::settings::{
 };
 use super::zone_mapping::{ZoneEffect, ZoneFallback, ZoneMapping as ZoneMap};
 use super::{Device, DeviceInfo, DeviceType, write_padded_report, zone_count_for_product_id};
+use crate::input::BindingSet;
 use crate::rgb::{Color, PerKeyEffect, PerKeyRgbController};
 use crate::{Error, Result};
 use async_trait::async_trait;
@@ -77,6 +79,26 @@ pub trait Keyboard: Device + Configurable {
     /// Apply the current RGB settings.
     async fn apply(&mut self) -> Result<()> {
         Ok(())
+    }
+
+    /// Write a whole profile's keybindings into the keyboard's own memory.
+    ///
+    /// Only one model is covered here: the Apex 7 (2023) keeps a whole profile, bindings
+    /// included, in an onboard FS object the engine rewrites (`PACKET.md` §9,
+    /// `src/devices/keyboards/apex_7.rs`). Other Apex keyboards have onboard profiles too - the
+    /// engine's own descriptors give the legacy family the same `profile_1`..`profile_5`,
+    /// `onboard_config_count` and `profile_size` fields (`base_apex_legacy.lisp:1553`, `:1609`) -
+    /// but their payload has never been decoded from a capture, so this fork cannot write one
+    /// for them, and they refuse and say so: their bindings only ever live in the engine's
+    /// `InputState`, which imposes them by grabbing the device and replaying it through uinput
+    /// (`src/input/linux.rs`).
+    fn set_key_bindings(&mut self, bindings: &BindingSet) -> Result<()> {
+        let _ = bindings;
+        Err(
+            Error::DeviceCommunication(
+                "this model has no onboard payload decoded in this fork, so a keybinding cannot become one of its own: the engine's InputState imposes it by grabbing the device and replaying it through uinput".to_string()
+            )
+        )
     }
 
     // === Per-Key RGB Control ===

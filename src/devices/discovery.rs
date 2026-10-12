@@ -8,6 +8,7 @@ use tracing::{debug, warn};
 use super::headsets::{Headset, HeadsetModel};
 use super::hid_reports::ConnectionHealth;
 use super::keyboards::apex::Apex3Tkl;
+use super::keyboards::apex_7::Apex7;
 use super::keyboards::apex_pro_tkl_2023::ApexProTkl2023;
 use super::keyboards::protocol::{KeyboardKind, keyboard_profile, openrgb_control_interface};
 use super::keyboards::{GenericKeyboard, Keyboard};
@@ -490,6 +491,7 @@ impl DeviceManager {
 
         match keyboard_profile(info.product_id).kind {
             KeyboardKind::Apex3Tkl => Ok(Box::new(Apex3Tkl::new(generic_keyboard))),
+            KeyboardKind::Apex7 => Ok(Box::new(Apex7::new(generic_keyboard))),
             KeyboardKind::ApexProTkl2023 => Ok(Box::new(ApexProTkl2023::new(generic_keyboard))),
             KeyboardKind::Generic => Ok(Box::new(generic_keyboard)),
         }

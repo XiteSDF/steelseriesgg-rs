@@ -93,6 +93,17 @@ pub enum CommandCode {
     /// [EXPERIMENTAL] Apex Pro TKL (Gen 1) live Rapid Tap on/off (0x1A). Reference: apex-control
     /// `PROTOCOL_NOTES.md`.
     RapidTap = 0x1A,
+    /// One write chunk of one onboard FS object (`0x03`, `macho-write-payload` in the engine's
+    /// own descriptor: `PACKET.md` §10). This is the write side of the Apex 7's onboard file
+    /// system, whose payloads carry the profile, its keybindings and its lighting.
+    ConfigWrite = 0x03,
+    /// Wipe one onboard FS object before writing it back: body `88 00 <u16 fs_id>`.
+    FsErase = 0x88,
+    /// Hand one whole FS block to the device once both halves are in: body
+    /// `05 00 <u16 fs_id> <u32 offset> <u16 size>`.
+    FsCommit = 0x05,
+    /// Ask the device to validate the profile it just took: body `eb <profile index>`.
+    FsValidate = 0xEB,
 }
 
 impl fmt::Display for CommandCode {
@@ -121,6 +132,10 @@ impl fmt::Display for CommandCode {
             CommandCode::ActuationLive2023 => write!(f, "ACTUATION_LIVE_2023_EXPERIMENTAL"),
             CommandCode::ActuationLiveGen1 => write!(f, "ACTUATION_LIVE_GEN1_EXPERIMENTAL"),
             CommandCode::RapidTap => write!(f, "RAPID_TAP_EXPERIMENTAL"),
+            CommandCode::ConfigWrite => write!(f, "FS_WRITE"),
+            CommandCode::FsErase => write!(f, "FS_ERASE"),
+            CommandCode::FsCommit => write!(f, "FS_COMMIT"),
+            CommandCode::FsValidate => write!(f, "FS_VALIDATE"),
         }
     }
 }
@@ -155,6 +170,10 @@ impl CommandCode {
             0x38 => Some(CommandCode::ActuationLive2023),
             0x31 => Some(CommandCode::ActuationLiveGen1),
             0x1A => Some(CommandCode::RapidTap),
+            0x03 => Some(CommandCode::ConfigWrite),
+            0x88 => Some(CommandCode::FsErase),
+            0x05 => Some(CommandCode::FsCommit),
+            0xEB => Some(CommandCode::FsValidate),
             _ => None,
         }
     }
@@ -886,6 +905,322 @@ impl HidCommand for Apex2023DirectCommand {
 
     fn description(&self) -> String {
         format!("Apex 2023 per-key RGB for {} keys", self.key_colors.len())
+    }
+}
+
+/// One onboard FS block: the device receives an object `0xA000` octets at a time, and a
+/// profile payload is padded to a whole number of blocks (`PACKET.md` §9: 40 blocks of
+/// profiles, 12 of the 12288-octet lighting map).
+pub const FS_BLOCK: usize = 0x400;
+
+/// Most data octets one write chunk carries (the engine's `max_data_bytes`).
+pub const FS_WRITE_MAX: usize = 0x200;
+
+/// The width of the feature report a write chunk goes out in: `HIDFEATURE 643` in the engine's
+/// device code, and a 643-octet report on the wire in the captures (`PACKET.md` §9, the write
+/// frame). It is
+/// wider than a fixed-size report, which is why a write chunk is padded to it by its caller.
+pub const FS_WRITE_REPORT_SIZE: usize = 643;
+
+/// Erase one onboard FS object before writing it back: body `88 00 <u16 fs_id>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FsEraseCommand {
+    pub fs_id: u16,
+}
+
+impl FsEraseCommand {
+    pub fn new(fs_id: u16) -> Self {
+        Self { fs_id }
+    }
+}
+
+impl HidCommand for FsEraseCommand {
+    fn command_code(&self) -> CommandCode {
+        CommandCode::FsErase
+    }
+
+    fn serialize(&self, buffer: &mut [u8], device_type: HidDeviceType) -> Result<usize> {
+        self.validate()?;
+
+        let report_size = device_type.report_size();
+        if buffer.len() < report_size {
+            return Err(Error::DeviceCommunication(format!(
+                "Buffer too small: {} bytes (expected {})",
+                buffer.len(),
+                report_size
+            )));
+        }
+
+        buffer[..report_size].fill(0);
+        let body = if device_type.includes_report_id() { 1 } else { 0 };
+
+        buffer[body] = self.command_code() as u8;
+        buffer[body + 1] = 0x00;
+        buffer[body + 2] = (self.fs_id & 0xFF) as u8;
+        buffer[body + 3] = (self.fs_id >> 8) as u8;
+
+        Ok(report_size)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.fs_id == 0 {
+            return Err(Error::InvalidConfig(
+                "FS object id 0 is not an onboard object".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn description(&self) -> String {
+        format!("erase FS object {:#06x}", self.fs_id)
+    }
+}
+
+/// Commit one whole FS block once both of its halves have been written: body
+/// `05 00 <u16 fs_id> <u32 offset> <u16 size>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FsCommitCommand {
+    pub fs_id: u16,
+    pub block_offset: usize,
+}
+
+impl FsCommitCommand {
+    pub fn new(fs_id: u16, block_offset: usize) -> Self {
+        Self { fs_id, block_offset }
+    }
+}
+
+impl HidCommand for FsCommitCommand {
+    fn command_code(&self) -> CommandCode {
+        CommandCode::FsCommit
+    }
+
+    fn serialize(&self, buffer: &mut [u8], device_type: HidDeviceType) -> Result<usize> {
+        self.validate()?;
+
+        let report_size = device_type.report_size();
+        if buffer.len() < report_size {
+            return Err(Error::DeviceCommunication(format!(
+                "Buffer too small: {} bytes (expected {})",
+                buffer.len(),
+                report_size
+            )));
+        }
+
+        buffer[..report_size].fill(0);
+        let body = if device_type.includes_report_id() { 1 } else { 0 };
+
+        buffer[body] = self.command_code() as u8;
+        buffer[body + 1] = 0x00;
+        buffer[body + 2] = (self.fs_id & 0xFF) as u8;
+        buffer[body + 3] = (self.fs_id >> 8) as u8;
+        buffer[body + 4] = (self.block_offset & 0xFF) as u8;
+        buffer[body + 5] = ((self.block_offset >> 8) & 0xFF) as u8;
+        buffer[body + 6] = ((self.block_offset >> 16) & 0xFF) as u8;
+        buffer[body + 7] = (self.block_offset >> 24) as u8;
+        buffer[body + 8] = (FS_BLOCK & 0xFF) as u8;
+        buffer[body + 9] = (FS_BLOCK >> 8) as u8;
+
+        Ok(report_size)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.fs_id == 0 {
+            return Err(Error::InvalidConfig(
+                "FS object id 0 is not an onboard object".to_string(),
+            ));
+        }
+        if self.block_offset % FS_BLOCK != 0 {
+            return Err(Error::InvalidConfig(
+                "a commit names a whole FS block, so its offset must be a multiple of the block size".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn description(&self) -> String {
+        format!(
+            "commit the block at offset {} of FS object {:#06x}",
+            self.block_offset, self.fs_id
+        )
+    }
+}
+
+/// Ask the device to validate one onboard profile after the rewrite: body `eb <profile index>`,
+/// one-based, the profile the client just wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FsValidateCommand {
+    pub profile_index: u8,
+}
+
+impl FsValidateCommand {
+    pub fn new(profile_index: u8) -> Self {
+        Self { profile_index }
+    }
+}
+
+impl HidCommand for FsValidateCommand {
+    fn command_code(&self) -> CommandCode {
+        CommandCode::FsValidate
+    }
+
+    fn serialize(&self, buffer: &mut [u8], device_type: HidDeviceType) -> Result<usize> {
+        self.validate()?;
+
+        let report_size = device_type.report_size();
+        if buffer.len() < report_size {
+            return Err(Error::DeviceCommunication(format!(
+                "Buffer too small: {} bytes (expected {})",
+                buffer.len(),
+                report_size
+            )));
+        }
+
+        buffer[..report_size].fill(0);
+        let body = if device_type.includes_report_id() { 1 } else { 0 };
+
+        buffer[body] = self.command_code() as u8;
+        buffer[body + 1] = self.profile_index;
+
+        Ok(report_size)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.profile_index == 0 {
+            return Err(Error::InvalidConfig(
+                "profile indexes are one-based, so 0 is not a profile".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn description(&self) -> String {
+        format!("validate profile {}", self.profile_index)
+    }
+}
+
+/// The crc the device puts at the end of an onboard payload: the CRC-32 walk the libsteel
+/// device code seeds with `0x04C11DB7` (`PACKET.md` §10, checked against the captures by
+/// `tools/stm32crc.py`). It runs over the payload with its own four trailing octets zeroed.
+pub fn stm32crc(data: Vec<u8>) -> u32 {
+    return stm32crc_with(data, 0x04C11DB7, 0xFFFF_FFFF);
+}
+
+/// The same walk with an explicit polynomial and seed: four octets at a time, MSB first, with
+/// a short tail zero-padded on the high end.
+pub fn stm32crc_with(data: Vec<u8>, poly: u32, init: u32) -> u32 {
+    let table = crc_table(poly);
+    let mut crc = init;
+    let mut i = 0;
+    let n = data.len();
+    while i + 4 <= n {
+        for k in (0..4).rev() {
+            crc = (crc << 8) ^ table[(((crc >> 24) ^ (data[i + k] as u32)) & 0xFF) as usize];
+        }
+        i = i + 4;
+    }
+    let rem = n - i;
+    if rem > 0 {
+        let mut word = 0u32;
+        for k in 0..rem {
+            word |= (data[i + k] as u32) << (24 - 8 * k);
+        }
+        word &= 0xFFFF_FFFF << (32 - 8 * rem);
+        for k in 0..4 {
+            let b = ((word >> (24 - 8 * k)) & 0xFF) as usize;
+            crc = (crc << 8) ^ table[((crc >> 24) as usize ^ b) & 0xFF];
+        }
+    }
+    return crc;
+}
+
+/// The 256-entry table for the table-driven walk above.
+fn crc_table(poly: u32) -> [u32; 256] {
+    let mut out: [u32; 256] = [0u32; 256];
+    for i in 0..256 {
+        let mut c: u32 = (i as u32) << 24;
+        for _ in 0..8 {
+            if (c & 0x8000_0000) != 0 {
+                c = (c << 1) ^ poly;
+            } else {
+                c = c << 1;
+            }
+        }
+        out[i] = c;
+    }
+    return out;
+}
+
+/// One write of one FS object: body `03 00 <u16 offset> <u16 size>` followed by `size` data
+/// octets - the engine's `ConfigWrite` on the write side (`PACKET.md` §6.1 lists its command
+/// octet, §9 and §10 list this use of it). The offset counts inside one FS block, so the two
+/// halves of a block send 0 and 512. A write chunk is wider than a fixed-size report, so it
+/// goes through `HidCommand::serialize` rather than `HidReportBuilder::build_report`, and the
+/// caller zero-pads the rest of the report and sends its full width.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FsWriteCommand {
+    pub offset: usize,
+    pub data: Vec<u8>,
+}
+
+impl FsWriteCommand {
+    pub fn new(offset: usize, data: Vec<u8>) -> Self {
+        Self { offset, data }
+    }
+}
+
+impl HidCommand for FsWriteCommand {
+    fn command_code(&self) -> CommandCode {
+        CommandCode::ConfigWrite
+    }
+
+    fn serialize(&self, buffer: &mut [u8], device_type: HidDeviceType) -> Result<usize> {
+        self.validate()?;
+
+        let body = if device_type.includes_report_id() { 1 } else { 0 };
+        let needed = body + 6 + self.data.len();
+        if buffer.len() < needed {
+            return Err(Error::DeviceCommunication(format!(
+                "Buffer too small: {} bytes (expected {})",
+                buffer.len(),
+                needed
+            )));
+        }
+
+        buffer[..needed].fill(0);
+
+        buffer[body] = self.command_code() as u8;
+        buffer[body + 1] = 0x00;
+        buffer[body + 2] = (self.offset & 0xFF) as u8;
+        buffer[body + 3] = (self.offset >> 8) as u8;
+        buffer[body + 4] = (self.data.len() & 0xFF) as u8;
+        buffer[body + 5] = (self.data.len() >> 8) as u8;
+        for (index, octet) in self.data.iter().enumerate() {
+            buffer[body + 6 + index] = *octet;
+        }
+
+        Ok(needed)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.data.len() == 0 {
+            return Err(Error::InvalidConfig("a write command must have a payload".to_string()));
+        }
+        if self.data.len() > FS_WRITE_MAX {
+            return Err(Error::InvalidConfig(
+                "a write command's payload is at most max_data_bytes of the write API".to_string(),
+            ));
+        }
+        if self.offset + self.data.len() > FS_BLOCK {
+            return Err(Error::InvalidConfig(
+                "a write command's payload stays inside one FS block".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn description(&self) -> String {
+        format!("write {} octets at offset {}", self.data.len(), self.offset)
     }
 }
 

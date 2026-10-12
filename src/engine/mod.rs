@@ -1739,8 +1739,19 @@ impl Inner {
 
         match bindings::bindings_from_profile(profile.bindings.as_ref()) {
             Ok(set) => {
-                let daemon = self.daemon;
-                self.input.apply(set, daemon);
+                // A keyboard whose own memory can hold the bindings gets them written there first:
+                // the Apex 7 (2023) rewrites its onboard profile FS object (`PACKET.md` §9), and a
+                // keyboard that did that answers the remapped keys itself, so the engine's own
+                // remapping - the evdev grab and the uinput replay - stays off for it. Other Apex
+                // keyboards have onboard profiles too, but this fork has no decoded payload for
+                // them, so they refuse and their bindings stay the engine's.
+                let (onboard_errors, all_onboard) = self.write_bindings_to_keyboards(&set);
+                errors.extend(onboard_errors);
+                if all_onboard {
+                    self.input.stop();
+                } else {
+                    self.input.apply(set, self.daemon);
+                }
             }
             Err(e) => errors.push(e.to_string()),
         }
@@ -1768,6 +1779,59 @@ impl Inner {
                 errors.join("; ")
             )))
         }
+    }
+
+    /// Push a profile's bindings into every connected keyboard this fork can write them into -
+    /// the ones whose onboard payload it has decoded, which so far is the Apex 7 (2023), see
+    /// [`keyboards::Keyboard::set_key_bindings`] - and report whether every connected keyboard
+    /// did that: such a keyboard answers the remapped keys itself, so the engine's remapping can
+    /// stay off for it. A keyboard this fork cannot write is not an error and is not counted:
+    /// its bindings stay the engine's.
+    ///
+    /// The switch is one for the whole engine, not one per keyboard, so a mixed set of connected
+    /// keyboards is a limitation rather than a success: a keyboard that took the set into its own
+    /// memory also sees the engine's replay, and nothing here has watched a device do that twice.
+    /// Such a set is reported in the errors so the user sees it.
+    ///
+    /// TODO: check what the original Engine does for a binding this model cannot spell. A
+    /// complex macro has no onboard record (`src/input/binding.rs::Action::Macro` has no function
+    /// octet, and `compile_bindings` says so), so a profile that carries one still needs the
+    /// engine's remapping turned back on for that keyboard - the original Engine only ever ran
+    /// such macros in software, so the switch may have to come back on for a keyboard that took
+    /// the rest of the set onboard. This fork has never watched a device answer a macro it cannot
+    /// hold, and leaves the switch off for every keyboard it writes.
+    fn write_bindings_to_keyboards(&mut self, set: &crate::input::BindingSet) -> (Vec<String>, bool) {
+        let keys: Vec<String> = self.slots.keys().cloned().collect();
+        let mut errors = Vec::new();
+        let mut keyboards = 0;
+        let mut onboard = 0;
+        for key in keys {
+            if let Some(slot) = self.slots.get_mut(&key) {
+                match &mut slot.handle {
+                    DeviceHandle::Keyboard(keyboard) => {
+                        keyboards += 1;
+                        if let Err(e) = keyboard.as_mut().set_key_bindings(set) {
+                            errors.push(format!("{key}: {e}"));
+                            info!("Key bindings for {} stay with the engine: {e}", slot.info.name);
+                        } else {
+                            onboard += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if onboard > 0 && onboard < keyboards {
+            errors.push(format!(
+                concat!(
+                    "{} of {} connected keyboards hold these key bindings in their own memory, so the ",
+                    "engine's one switch stays on for all of them and those that hold their own see ",
+                    "the bindings twice",
+                ),
+                onboard, keyboards,
+            ));
+        }
+        return (errors, keyboards > 0 && onboard == keyboards);
     }
 
     fn save_state(&mut self) {

@@ -163,6 +163,9 @@ pub enum KeyboardKind {
     Generic,
     /// `apex::Apex3Tkl` around a `GenericKeyboard`.
     Apex3Tkl,
+    /// `apex_7::Apex7` around a `GenericKeyboard`: the model whose onboard payload this fork
+    /// decodes, so a keybinding written to it becomes one of its own.
+    Apex7,
     /// `apex_pro_tkl_2023::ApexProTkl2023` around a `GenericKeyboard`.
     ApexProTkl2023,
 }
@@ -227,13 +230,18 @@ impl KeyboardProfile {
 pub fn keyboard_profile(product_id: u16) -> KeyboardProfile {
     use ApexGeneration::{Gen1, Gen2, Gen3};
     use KeyboardFamily::{ApexM, ApexPerKey, EightZone, Legacy, OldApex, TriZone};
-    use KeyboardKind::{Apex3Tkl, ApexProTkl2023, Generic};
+    use KeyboardKind::{Apex3Tkl, Apex7, ApexProTkl2023, Generic};
     use Verification::{Guess, Hardware, Reference};
     use product_ids::*;
 
     let openrgb = |generation, wireless| ApexPerKey(ApexPerKeyProtocol::openrgb(generation, wireless));
     match product_id {
-        APEX_5 | APEX_7 | APEX_7_TKL => KeyboardProfile::new(Generic, openrgb(Gen1, false), Reference),
+        APEX_5 => KeyboardProfile::new(Generic, openrgb(Gen1, false), Reference),
+        // The Apex 7 (2023) is the one model this crate can rewrite its own keybindings into:
+        // its onboard profile FS object is capture-confirmed (`PACKET.md` §9), and its lighting
+        // stays the per-key family of the OpenRGB reference.
+        APEX_7 => KeyboardProfile::new(Apex7, openrgb(Gen1, false), Reference),
+        APEX_7_TKL => KeyboardProfile::new(Generic, openrgb(Gen1, false), Reference),
         APEX_PRO => KeyboardProfile::new(Generic, openrgb(Gen1, false), Reference).with_actuation(),
         APEX_PRO_TKL => {
             let mut protocol = ApexPerKeyProtocol::openrgb(Gen1, false);
@@ -388,7 +396,7 @@ mod tests {
     #[test]
     fn pid_routing_table() {
         use ApexDirectPacket::{Gen1, Wired2023, Wireless2023};
-        use KeyboardKind::{Apex3Tkl, ApexProTkl2023, Generic};
+        use KeyboardKind::{Apex3Tkl, Apex7, ApexProTkl2023, Generic};
         use Verification::{Guess, Hardware, Reference};
         use product_ids::*;
 
@@ -398,7 +406,7 @@ mod tests {
         };
         let rows: [(u16, KeyboardKind, Option<ApexDirectPacket>, Verification); 23] = [
             (APEX_PRO, Generic, Some(Gen1), Reference),
-            (APEX_7, Generic, Some(Gen1), Reference),
+            (APEX_7, Apex7, Some(Gen1), Reference),
             (APEX_PRO_TKL, Generic, Some(Gen1), Reference),
             (APEX_7_TKL, Generic, Some(Gen1), Reference),
             (APEX_5, Generic, Some(Gen1), Reference),
