@@ -18,8 +18,11 @@ panel in the browser.
 > **Hardware status.** Only the Apex Pro TKL (2023) was ever tested on real hardware by this
 > project. Every other protocol comes from a published open-source driver (OpenRGB, rivalcfg,
 > HeadsetControl, apex-tux, nova-chatmix-linux) and is pinned by unit tests, but has not been
-> tried here. The CLI and the control panel mark such settings **untested**, and extrapolated
-> ones **guess**. Reports from real devices are what turn them into confirmed support.
+> tried here. The frames this fork writes to put a keybinding into an Apex 7's own memory, and
+> the frames that read that memory back, are its own as well: no device was watched answering
+> them, so both directions stay pinned by tests alone. The CLI and the control panel mark such
+> settings **untested**, and extrapolated ones **guess**. Reports from real devices are what
+> turn them into confirmed support.
 
 ## Quickstart
 
@@ -68,6 +71,7 @@ ssgg ui          # opens the desktop app (or the panel in a browser)
 | Sonar: Game/Chat/Media/Aux/Mic devices, ChatMix, 10-band EQ, noise reduction, streamer mix | Yes, on PipeWire | `ssgg mixer ...`, panel *Audio* |
 | Key bindings, macros, macro recording, launch apps | Yes (X11 and Wayland) | `ssgg bind`, `ssgg macro record`, panel *Key bindings* |
 | Profiles and per-game switching | Yes | `ssgg profile save/load/apps`, switches while a linked program (also Proton games) runs |
+| The keyboard's own onboard profiles (Apex 7) | Yes | a profile's key bindings are written into the keyboard itself, `ssgg profile pull` reads one back, panel *Profiles* |
 | GameSense (game events → lighting and screens) | Yes | built into the daemon on port 27301; `coreProps.json` is also written into Proton/Wine prefixes |
 | Moments (instant replay) | Yes, via gpu-screen-recorder | `ssgg moments enable`, `ssgg moments save` (bind it to a key) |
 | Polling rate | Device-side per model; kernel-side up to 1000 Hz | `ssgg set mouse polling_rate 1000`, `sudo ssgg pollrate mouse 1000 --persistent` |
@@ -213,6 +217,29 @@ ssgg profile list
 
 A profile stores every device's settings and lighting, the key bindings and (when enabled) the
 mixer settings, per device model.
+
+### The keyboard's own memory
+
+An Apex 7 keeps five keybinding profiles inside itself, and a profile here can be put into
+that memory rather than replayed by the engine: loading the profile writes its key bindings
+into the keyboard, which then answers the remapped keys on its own, so the engine's own key
+interception stays off for it. A keyboard that refuses such a binding keeps it the engine's.
+Which of the five profiles is written, and which is read back, is the keyboard's own setting:
+
+```bash
+ssgg set keyboard onboard-slot 3                  # which onboard profile a write or a read uses
+ssgg profile pull                                 # read the keyboard's own configuration back
+ssgg profile pull --device apex --slot 2 --name fps   # a chosen keyboard, slot and profile name
+ssgg profile list
+```
+
+What a read brings back is named by what the keyboard spells inside its own memory - `Config
+2`, or `Config Main` once something has renamed the slot - and its bindings come back as the
+same records a write compiles, so saving what was read and loading it again writes the
+keyboard's own configuration back. A payload whose own checksum does not agree is refused
+rather than saved. The scroll wheel of the Apex 7 is part of that memory too: the device binds
+volume up to scroll up and volume down to scroll down as its own keybinding, rather than the
+engine intercepting a scroll.
 
 ### Moments
 
