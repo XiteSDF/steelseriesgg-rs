@@ -94,7 +94,7 @@ pub enum CommandCode {
     /// `PROTOCOL_NOTES.md`.
     RapidTap = 0x1A,
     /// One write chunk of one onboard FS object (`0x03`, `macho-write-payload` in the engine's
-    /// own descriptor: `PACKET.md` §10). This is the write side of the Apex 7's onboard file
+    /// own descriptor). This is the write side of the Apex 7's onboard file
     /// system, whose payloads carry the profile, its keybindings and its lighting.
     ConfigWrite = 0x03,
     /// Wipe one onboard FS object before writing it back: body `88 00 <u16 fs_id>`.
@@ -909,16 +909,15 @@ impl HidCommand for Apex2023DirectCommand {
 }
 
 /// One onboard FS block: the device receives an object `0xA000` octets at a time, and a
-/// profile payload is padded to a whole number of blocks (`PACKET.md` §9: 40 blocks of
-/// profiles, 12 of the 12288-octet lighting map).
+/// profile payload is padded to a whole number of blocks: 40 blocks of profiles, 12 of the
+/// 12288-octet lighting map.
 pub const FS_BLOCK: usize = 0x400;
 
 /// Most data octets one write chunk carries (the engine's `max_data_bytes`).
 pub const FS_WRITE_MAX: usize = 0x200;
 
 /// The width of the feature report a write chunk goes out in: `HIDFEATURE 643` in the engine's
-/// device code, and a 643-octet report on the wire in the captures (`PACKET.md` §9, the write
-/// frame). It is
+/// device code, and a 643-octet report on the wire. It is
 /// wider than a fixed-size report, which is why a write chunk is padded to it by its caller.
 pub const FS_WRITE_REPORT_SIZE: usize = 643;
 
@@ -1100,8 +1099,8 @@ impl HidCommand for FsValidateCommand {
 }
 
 /// The crc the device puts at the end of an onboard payload: the CRC-32 walk the libsteel
-/// device code seeds with `0x04C11DB7` (`PACKET.md` §10, checked against the captures by
-/// `tools/stm32crc.py`). It runs over the payload with its own four trailing octets zeroed.
+/// device code seeds with `0x04C11DB7`. The walk runs over the payload with its own four
+/// trailing octets zeroed.
 pub fn stm32crc(data: Vec<u8>) -> u32 {
     return stm32crc_with(data, 0x04C11DB7, 0xFFFF_FFFF);
 }
@@ -1152,8 +1151,7 @@ fn crc_table(poly: u32) -> [u32; 256] {
 }
 
 /// One write of one FS object: body `03 00 <u16 offset> <u16 size>` followed by `size` data
-/// octets - the engine's `ConfigWrite` on the write side (`PACKET.md` §6.1 lists its command
-/// octet, §9 and §10 list this use of it). The offset counts inside one FS block, so the two
+/// octets - the engine's `ConfigWrite` on the write side. The offset counts inside one FS block, so the two
 /// halves of a block send 0 and 512. A write chunk is wider than a fixed-size report, so it
 /// goes through `HidCommand::serialize` rather than `HidReportBuilder::build_report`, and the
 /// caller zero-pads the rest of the report and sends its full width.

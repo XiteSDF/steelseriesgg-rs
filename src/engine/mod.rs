@@ -1740,7 +1740,7 @@ impl Inner {
         match bindings::bindings_from_profile(profile.bindings.as_ref()) {
             Ok(set) => {
                 // A keyboard whose own memory can hold the bindings gets them written there first:
-                // the Apex 7 (2023) rewrites its onboard profile FS object (`PACKET.md` §9), and a
+                // the Apex 7 (2023) rewrites its onboard profile FS object, and a
                 // keyboard that did that answers the remapped keys itself, so the engine's own
                 // remapping - the evdev grab and the uinput replay - stays off for it. Other Apex
                 // keyboards have onboard profiles too, but this fork has no decoded payload for

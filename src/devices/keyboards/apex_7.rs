@@ -4,9 +4,9 @@
 //! descriptors carry the same `profile_1`..`profile_5`, `onboard_config_count` and
 //! `profile_size` fields for the wider legacy Apex family (`base_apex_legacy.lisp:1553`, `:1609`),
 //! so other Apex keyboards are addressed the same way. What is established here is the Apex 7's
-//! payload and its write recipe and nothing else, since the captures are Apex 7 captures and no
-//! other model has been put on the wire from this tree. The scope of this module is therefore
-//! Apex 7: the other models have no decoded payload to write, so they stay on the engine's path,
+//! payload and its write recipe and nothing else, since only the Apex 7 has been put on the wire
+//! from this tree. The scope of this module is therefore Apex 7: the other models have no decoded
+//! payload to write, so they stay on the engine's path,
 //! and covering them means capturing one of them rather than assuming this one's layout fits.
 //!
 //! For the models this module does not cover, keybindings are imposed on the *wire*: the input
@@ -17,33 +17,32 @@
 //! This is the only place in this fork a `BindingSet` has been turned into device-side bytes,
 //! which is a statement about what has been decoded here and not about what devices can do.
 //!
-//! The payload and its frames are pinned by the captures (`PACKET.md` §9; `tools/onboard.py`
-//! reproduces all 159 frames of the three captures byte for byte) and cross-read in the engine's
-//! device descriptors (`apex_7.lisp:37-105` is the payload's field list, `:235-267` its write
-//! recipe, `base_apex_legacy.lisp:186-219` the table that numbers the binding slots).
+//! The payload and its frames are pinned by the engine's device descriptors and by the bytes of
+//! the frames this module builds: `apex_7.lisp:37-105` is the payload's field list, `:235-267`
+//! its write recipe, `base_apex_legacy.lisp:186-219` the table that numbers the binding slots.
 //!
 //! # Shape
 //!
 //! - The payload is 11648 octets for the release schema `0x000A` and 11696 for `0x000B`, which
 //!   adds the dual-actuation block: one `rapid_tap_enable` octet at 2025 and ten five-octet
 //!   `rapid_tap_pairs` at 2026-2075, and drops the three `crc_padding` octets schema A has. This
-//!   module writes schema B, because that is what the captures show.
+//!   module writes schema B, the wider of the two.
 //! - The crc covers the payload without its own four trailing octets, which is the same value as
 //!   the crc of a copy whose last four octets are zero: the walk is four-octet aligned and the
 //!   payload ends with the crc.
 //! - Bindings are 128 five-octet records at 85, in the device's own slot order: a slot is not a
 //!   HID usage, it is `HID_SLOT_TABLE[usage]`, and the eight slots the table never names (6, 7,
-//!   29, 69, 102, 103, 110, 111) get no record. The captures show the numbering byte for byte:
-//!   slot 0 carries `51 29` (escape: HID usage 0x29), slot 1 `51 35`, slot 2 `51 2b`, slot 4 `51 e1`,
-//!   slot 5 `51 e0`, and the table sends those usages to those slots.
-//! - Every slot the table names carries a record in the captures, unbound ones included: a bare
+//!   29, 69, 102, 103, 110, 111) get no record. The numbering itself is byte for byte:
+//!   slot 0 carries `51 29` (escape: HID usage 0x29), slot 1 `51 35`, slot 2 `51 2b`, slot 4 `51
+//!   e1`, slot 5 `51 e0`, and the table sends those usages to those slots.
+//! - Every slot the table names carries a record, unbound ones included: a bare
 //!   key bound to itself, `51 <its own usage>`. A zero record means the deactivating button
 //!   (`function` 0x00 of the `key_mapping` struct), so an unbound slot has to be written as its
 //!   identity or the key stops typing.
 //! - The wheel's two usages (0x6A/0x6B) get no slot; the wheel has its own two-record layer at
-//!   725, one record per scroll direction, and the captures find it at rest bound to two media
-//!   keys, `61 e9` and `61 ea`. Those are volume up for scroll up and volume down for scroll down,
-//!   and the captures spell both at rest, so the wheel is the device's own volume control rather
+//!   725, one record per scroll direction, which at rest is bound to two media
+//!   keys, `61 e9` and `61 ea`: volume up for scroll up and volume down for scroll down, so the
+//!   wheel is the device's own volume control rather
 //!   than a key this fork binds. `e9`/`ea` are HID consumer-page usages: the media function codes
 //!   a consumer-page usage where the other functions spell a page-1 usage, and that numbering is
 //!   the one multimedia table in this fork (`devices/key_names.rs`) already carries, mute and all,
@@ -54,7 +53,7 @@
 //!   code for the SS key, so this module preserves those layers and zeroes them only in a payload
 //!   it built itself from nothing.
 //! - A payload's name is the 24 ASCII octets at 2, left-justified and zero-padded (`Config 1`
-//!   fills 8 of them and one capture set renames a profile to `Config Main`, `PACKET.md` §6b);
+//!   fills 8 of them, and a profile may be renamed to something like `Config Main`);
 //!   the engine's default spelling is the slot's number, and the device shows this name on its
 //!   OLED, so a rewrite carries a name rather than inventing one.
 //! - The FS object's size never changes with the payload: it is `profile_size` = `0xA000` = 40
@@ -70,8 +69,7 @@
 //! schemas cost the same 122 frames.
 //!
 //! A rewrite is not a deploy: the device keeps running whatever profile it had selected, so the
-//! frames that make the new one live (`89 01`, `41 00`, `74 00 01 00` - `PACKET.md` §9, deploy
-//! tail) are a
+//! frames that make the new one live (`89 01`, `41 00`, `74 00 01 00`) are a
 //! separate step, and [`Self::deploy_tail`] returns them without sending anything.
 
 use super::{GenericKeyboard, Keyboard};
@@ -94,7 +92,7 @@ use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
 
-/// The payload of one onboard profile, as the captures show it: schema `0x000B`, with the
+/// The payload of one onboard profile, as this module writes it: schema `0x000B`, with the
 /// dual-actuation block (`apex_7.lisp:107`).
 pub const PROFILE_PAYLOAD_LEN: usize = 11696;
 
@@ -159,7 +157,7 @@ pub const FUNCTION_MACRO: u8 = 0x71;
 pub const FUNCTION_DEACTIVATED: u8 = 0x00;
 
 /// The two octets the media function (`0x61`) uses for the wheel's own volume control: volume up
-/// for scroll up and volume down for scroll down. The captures spell both at rest. These are HID
+/// for scroll up and volume down for scroll down. These are HID
 /// consumer-page usages, the numbering `devices/key_names.rs`'s multimedia table carries, not the
 /// page-1 usages the other records spell.
 pub const WHEEL_VOLUME_UP: u8 = 0xE9;
@@ -178,20 +176,20 @@ pub const MEDIA_NAMES: [(MediaKey, &str); 6] = [
     (MediaKey::Mute, "mute"),
 ];
 
-/// The wheel layer as the captures find it at rest: the wheel's two scroll directions bound to the
+/// The wheel layer as it sits at rest: the wheel's two scroll directions bound to the
 /// two volume media keys.
 #[rustfmt::skip]
 pub const WHEEL_DEFAULT: [u8; PROFILE_WHEEL_LAYER_LEN] = [FUNCTION_MEDIA, WHEEL_VOLUME_UP, 0, 0, 0, FUNCTION_MEDIA, WHEEL_VOLUME_DOWN, 0, 0, 0];
 
 /// The SteelSeries key's own HID usage (`key_mapping.rs:389`), which is what byte 84 of the
-/// captures names as the profile's `meta_toggle_hid`.
+/// payload names as the profile's `meta_toggle_hid`.
 pub const SS_KEY_USAGE: u8 = 0xF0;
 
 /// The slot of one HID usage: the engine's own `device-offset-lookup-table`
 /// (`base_apex_legacy.lisp:186-219`), whose index is a HID usage in the page-folded numbering
 /// `APEX_LED_TABLE` and `KeyAddress::hid_code` use (0xE1 is left shift, 0xF0 the SS key) and
 /// whose value is the slot that key's bindings live in. `-1` marks a usage with no slot.
-/// The captures confirm the numbering byte for byte: slot 0 carries `51 29` (escape), slot 1
+/// The numbering is byte for byte: slot 0 carries `51 29` (escape), slot 1
 /// `51 35`, slot 2 `51 2b`, slot 4 `51 e1`, slot 5 `51 e0`.
 pub const HID_SLOT_TABLE: [i8; 256] = [
     -1, -1, -1, -1, 11, 52, 36, 27, 26, 35, 43, 51, 66, 59, 67, 75, 68, 60, 74, 82, 10, 34, 19, 42, 58, 44, 18, 28, 50,
@@ -210,13 +208,12 @@ pub const HID_SLOT_TABLE: [i8; 256] = [
 /// describing a key the device has no slot for.
 pub const HID_SLOT_GAPS: [usize; 8] = [6, 7, 29, 69, 102, 103, 110, 111];
 
-/// The FS object of one onboard slot, and the lighting map that sits beside it (`PACKET.md` §9,
-/// FS objects: the object ids and their order are confirmed by all three captures).
+/// The FS object of one onboard slot, and the lighting map that sits beside it.
 pub const FS_PROFILES_BASE: u16 = 0x0201;
 pub const FS_LIGHTING_MAP: u16 = 0x0301;
 
 /// The onboard slots a keybinding rewrite may target: the engine's `onboard_config_count` of
-/// five (`base_apex_legacy.lisp:178`), and the captures answer that the device runs `Config 1`.
+/// five (`base_apex_legacy.lisp:178`), and the device runs `Config 1` until told otherwise.
 pub const PROFILE_SLOTS: [u8; 5] = [1, 2, 3, 4, 5];
 
 /// One frame of an upload: its wire bytes, and whether they go out as a feature report. The two
@@ -268,7 +265,7 @@ impl Apex7 {
     pub const PRODUCT_ID: u16 = product_ids::APEX_7;
 
     /// Which onboard slot [`Self::set_key_bindings`] writes. Slots are one-based, and the
-    /// captures show the engine rewrote `Config 1`, the first slot, every time.
+    /// engine rewrites `Config 1`, the first slot, until told otherwise.
     pub const DEFAULT_BINDINGS_SLOT: u8 = 1;
 
     pub fn new(keyboard: GenericKeyboard) -> Self {
@@ -314,8 +311,8 @@ impl Apex7 {
     }
 
     /// The name one slot's payload carries, which is what the device shows on its OLED. `Config
-    /// {slot}` is the engine's own default spelling, the one the captures show (`Config 1` at
-    /// payload offset 2), and [`Self::set_payload_name`] replaces it for a slot.
+    /// {slot}` is the engine's own default spelling, spelled `Config 1` at payload offset 2, and
+    /// [`Self::set_payload_name`] replaces it for a slot.
     pub fn payload_name(&self, slot: u8) -> String {
         match self.names.get(&slot) {
             Some(name) => {
@@ -327,10 +324,10 @@ impl Apex7 {
         }
     }
 
-    /// Does a name fit the payload's name field? The field is the 24 octets at 2, which the
-    /// captures show left-justified and zero-padded, and it holds ASCII: the captures spell the
-    /// default `Config 1` (8 octets) and one capture set renames the profile to `Config Main`
-    /// (11), so a name is a free-form string rather than a `Config <number>` pattern, and an
+    /// Does a name fit the payload's name field? The field is the 24 octets at 2, written
+    /// left-justified and zero-padded, and it holds ASCII: the default `Config 1` is 8 octets
+    /// and a renamed profile such as `Config Main` is 11, so a name is a free-form string rather
+    /// than a `Config <number>` pattern, and an
     /// octet outside ASCII is not something a name field has ever been seen to hold.
     pub fn valid_name(&self, name: &str) -> bool {
         return name.is_ascii() && name.len() >= 1 && name.len() <= PROFILE_NAME_LEN;
@@ -391,9 +388,9 @@ impl Apex7 {
         self.payloads.remove(&slot);
     }
 
-    /// A payload of the right length with nothing in it, except what the captures find in every
-    /// payload: this fork's schema, a name, the wheel at rest, the SS key as the profile's meta
-    /// toggle, the captures' guid, and identity bindings in every slot the table names. Building
+    /// A payload of the right length with nothing in it, except what every payload carries: this
+    /// fork's schema, a name, the wheel at rest, the SS key as the profile's meta toggle, a guid,
+    /// and identity bindings in every slot the table names. Building
     /// one is the only honest "nothing remembered yet" state. The name is written into the field
     /// left-justified and zero-padded, and is truncated to the field if it is longer than it:
     /// [`Self::named_payload`] is the checked entry point that refuses such a name.
@@ -745,8 +742,8 @@ impl Apex7 {
     }
 
     /// The consumer usage the media function spells for one of GG's media keys: the vendor's own
-    /// numbering, kept once in `devices/key_names.rs`, and confirmed by the captures on the wheel's
-    /// own layer, which carries `61 e9` (volume up, scroll up) and `61 ea` (volume down, scroll
+    /// numbering, kept once in `devices/key_names.rs`, and confirmed on the wheel's own layer,
+    /// which carries `61 e9` (volume up, scroll up) and `61 ea` (volume down, scroll
     /// down).
     pub fn media_code(&self, media: MediaKey) -> Option<u8> {
         for entry in MEDIA_NAMES {
@@ -780,8 +777,9 @@ impl Apex7 {
     /// them, a layer this fork has no model for, so `Action::Macro` stays where it already
     /// works, in software. A media action does compile: its code is a HID consumer-page usage,
     /// which is the numbering the one multimedia table in this fork (`devices/key_names.rs`) keeps,
-    /// and the wheel's own records confirm it (`61 e9` is volume up, `61 ea` is volume down). `Action::MouseButton` is still refused: the descriptors
-    /// list `01..08` as mouse buttons, but no capture has shown a record spelling one and this fork
+    /// and the wheel's own records confirm it (`61 e9` is volume up, `61 ea` is volume down).
+    /// `Action::MouseButton` is still refused: the descriptors list `01..08` as mouse buttons, but
+    /// no record has been decoded that spells one and this fork
     /// has no table naming the eight, so which button is which cannot be picked without guessing.
     pub fn action_record(&self, source: InputKey, action: Action) -> Option<Vec<u8>> {
         match action {
@@ -882,8 +880,7 @@ impl Apex7 {
     }
 
     /// One 643-octet write frame: a `ConfigWrite` carrying up to 512 data octets, which is wider
-    /// than a fixed-size report and therefore goes out as a feature report (`PACKET.md` §9, write
-    /// frame).
+    /// than a fixed-size report and therefore goes out as a feature report.
     pub fn write_frame(&self, chunk_offset: usize, data: Vec<u8>) -> Result<FsFrame> {
         if data.len() == 0 || data.len() > PROFILE_CHUNK {
             return Err(Error::InvalidConfig(format!(
@@ -997,7 +994,7 @@ impl Apex7 {
     }
 
     /// The frames that make a freshly written profile the running one: select it, apply, push it
-    /// live (`PACKET.md` §9, deploy tail). These are not part of an upload - the device keeps running
+    /// live. These are not part of an upload - the device keeps running
     /// whatever profile it had selected - and this returns them rather than sending anything, so
     /// a caller decides when a profile goes live.
     pub fn deploy_tail(&self, slot: u8) -> Vec<Vec<u8>> {
@@ -1088,7 +1085,7 @@ impl Configurable for Apex7 {
             SettingKind::Choice { options },
         )
         .description(
-            "Which of the keyboard's own onboard profiles a keybinding rewrite rewrites: the rewrite writes that profile's FS object, whatever profile the device has selected to run. Only the payload of the profile this fork has decoded from a capture can be written."
+            "Which of the keyboard's own onboard profiles a keybinding rewrite rewrites: the rewrite writes that profile's FS object, whatever profile the device has selected to run. Only the payload of the profile this fork has decoded can be written."
         )
         .default_value(SettingValue::Choice(format!("{}", self.bindings_slot)))
         .verification(Verification::Hardware);
@@ -1197,9 +1194,9 @@ mod tests {
     }
 
     #[test]
-    fn slot_table_numbers_the_captures() {
+    fn slot_table_numbers_the_payload() {
         let device = apex7();
-        // The captures' button layer, read back through the table.
+        // A button layer's own numbering, read back through the table.
         assert_eq!(device.slot_of_usage(0x29), Some(0));
         assert_eq!(device.slot_of_usage(0x35), Some(1));
         assert_eq!(device.slot_of_usage(0x2b), Some(2));
@@ -1240,7 +1237,7 @@ mod tests {
     }
 
     #[test]
-    fn payload_fields_end_where_the_captures_say() {
+    fn payload_fields_end_where_the_layout_says() {
         assert_eq!(PROFILE_CRC_OFF + 4, PROFILE_PAYLOAD_LEN);
         assert_eq!(PROFILE_GUID_OFF + 16, PROFILE_CRC_OFF);
         assert_eq!(PROFILE_MACRO_OFF + PROFILE_MACRO_LEN, PROFILE_GUID_OFF);
@@ -1328,7 +1325,7 @@ mod tests {
     #[test]
     fn a_key_with_no_slot_refuses_instead_of_guessing() {
         let device = apex7();
-        // KeyId::Menu has no LED in the captures' table, so the table gives it no usage, and
+        // KeyId::Menu has no LED in `APEX_LED_TABLE`, so the table gives it no usage, and
         // there is no record to write for it.
         let Some(source) = InputKey::from_key_id(KeyId::Menu) else {
             assert!(false);
@@ -1366,7 +1363,7 @@ mod tests {
     }
 
     #[test]
-    fn the_upload_frames_are_the_captures_geometry() {
+    fn the_upload_frames_are_the_payload_geometry() {
         let device = apex7();
         let frames = match device.fs_frames(1, device.bare_payload("Config 1")) {
             Ok(frames) => frames,
@@ -1411,7 +1408,7 @@ mod tests {
             assert_eq!(push.report[at + 9], (PROFILE_BLOCK >> 8) as u8);
         }
         // The last frame asks the device to validate the profile it now holds, one-based: `eb
-        // <profile index>`, which is the capture's `eb` plus the index the engine numbered from
+        // <profile index>`, which is `eb` plus the index the engine numbered from
         // zero.
         let last = &frames[PROFILE_FRAMES - 1];
         assert_eq!(last.feature, false);
@@ -1488,11 +1485,10 @@ mod tests {
     }
 
     #[test]
-    fn the_crc_is_the_python_tools_compute() {
-        // The same walk `tools/stm32crc.py` does, pinned against the vectors it prints for short
-        // inputs, so the crc this module writes is the crc the captures' own payloads carry (the
-        // Apex7-3 profile's is `76c199fb` at 11692, which `check` confirms by hashing the buffer
-        // with its own four trailing octets excluded).
+    fn the_crc_is_pinned_on_short_inputs() {
+        // A few short inputs pinned to the walk's own definition, so the crc this module writes is
+        // the crc the device puts at the end of an onboard payload: the walk runs over the payload
+        // with its own four trailing octets excluded.
         assert_eq!(stm32crc(Vec::new()), 0xffff_ffff);
         assert_eq!(stm32crc(vec![0x41]), 0xca7a_d799);
         assert_eq!(stm32crc(vec![0x41, 0x42, 0x43, 0x44]), 0xcf53_4ae1);
@@ -1501,7 +1497,7 @@ mod tests {
     #[test]
     fn a_profile_name_is_any_ascii_that_fits_the_field() {
         let mut device = apex7();
-        // The captures' default spelling, and the other spelling one capture set uses.
+        // The engine's default spelling, and a renamed profile's spelling.
         assert_eq!(device.payload_name(1), "Config 1");
         assert_eq!(device.valid_name("Config Main"), true);
         assert_eq!(device.valid_name("Main"), true);

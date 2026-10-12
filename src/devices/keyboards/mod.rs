@@ -84,8 +84,8 @@ pub trait Keyboard: Device + Configurable {
     /// Write a whole profile's keybindings into the keyboard's own memory.
     ///
     /// Only one model is covered here: the Apex 7 (2023) keeps a whole profile, bindings
-    /// included, in an onboard FS object the engine rewrites (`PACKET.md` §9,
-    /// `src/devices/keyboards/apex_7.rs`). Other Apex keyboards have onboard profiles too - the
+    /// included, in an onboard FS object the engine rewrites (`src/devices/keyboards/apex_7.rs`). Other
+    /// Apex keyboards have onboard profiles too - the
     /// engine's own descriptors give the legacy family the same `profile_1`..`profile_5`,
     /// `onboard_config_count` and `profile_size` fields (`base_apex_legacy.lisp:1553`, `:1609`) -
     /// but their payload has never been decoded from a capture, so this fork cannot write one
