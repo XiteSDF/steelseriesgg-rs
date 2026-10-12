@@ -48,6 +48,10 @@
 //!   0xF0) held. The engine's binding model has no source key for it, because evdev invents no
 //!   code for the SS key, so this module preserves those layers and zeroes them only in a payload
 //!   it built itself from nothing.
+//! - A payload's name is the 24 ASCII octets at 2, left-justified and zero-padded (`Config 1`
+//!   fills 8 of them and one capture set renames a profile to `Config Main`, `PACKET.md` §6b);
+//!   the engine's default spelling is the slot's number, and the device shows this name on its
+//!   OLED, so a rewrite carries a name rather than inventing one.
 //! - The FS object's size never changes with the payload: it is `profile_size` = `0xA000` = 40
 //!   blocks of 1024 whatever the payload's size, so a short payload is zero-padded to it.
 //!
@@ -222,10 +226,13 @@ pub struct MappingLayers {
 ///
 /// `payloads` is the invariant the whole file rests on: each onboard slot the device has is
 /// keyed to the 2560-octet payload last seen there, so any payload read back for one of
-/// [`Self::PROFILE_SLOTS`] is a payload that can be edited and written back.
+/// [`Self::PROFILE_SLOTS`] is a payload that can be edited and written back. `names` is what a
+/// slot's payload is called: `Config {slot}` is the engine's default, and a slot can carry any
+/// ASCII name that fits the field.
 pub struct Apex7 {
     inner: GenericKeyboard,
     payloads: BTreeMap<u8, Vec<u8>>,
+    names: BTreeMap<u8, String>,
     bindings_slot: u8,
 }
 
@@ -241,6 +248,7 @@ impl Apex7 {
         Self {
             inner: keyboard,
             payloads: BTreeMap::new(),
+            names: BTreeMap::new(),
             bindings_slot: Apex7::DEFAULT_BINDINGS_SLOT,
         }
     }
@@ -278,9 +286,61 @@ impl Apex7 {
         return None;
     }
 
-    /// The name the payload of one slot carries, which is what the device shows on its OLED.
+    /// The name one slot's payload carries, which is what the device shows on its OLED. `Config
+    /// {slot}` is the engine's own default spelling, the one the captures show (`Config 1` at
+    /// payload offset 2), and [`Self::set_payload_name`] replaces it for a slot.
     pub fn payload_name(&self, slot: u8) -> String {
-        return format!("Config {}", slot);
+        match self.names.get(&slot) {
+            Some(name) => {
+                return name.clone();
+            }
+            None => {
+                return format!("Config {}", slot);
+            }
+        }
+    }
+
+    /// Does a name fit the payload's name field? The field is the 24 octets at 2, which the
+    /// captures show left-justified and zero-padded, and it holds ASCII: the captures spell the
+    /// default `Config 1` (8 octets) and one capture set renames the profile to `Config Main`
+    /// (11), so a name is a free-form string rather than a `Config <number>` pattern, and an
+    /// octet outside ASCII is not something a name field has ever been seen to hold.
+    pub fn valid_name(&self, name: &str) -> bool {
+        return name.is_ascii() && name.len() >= 1 && name.len() <= PROFILE_NAME_LEN;
+    }
+
+    /// The reason a name does not fit the field, if it does not.
+    pub fn name_rule(&self, name: &str) -> Result<()> {
+        if !self.valid_name(name) {
+            return Err(Error::InvalidConfig(format!(
+                "a payload name is 1 to {} ASCII octets, the width of the payload's name field: a longer name is cut off by the field, and a non-ASCII name has never been seen in one",
+                PROFILE_NAME_LEN
+            )));
+        }
+        return Ok(());
+    }
+
+    /// Name one slot's payload, so a rewrite carries the profile's own name instead of the
+    /// default spelling. A name that does not fit the field is refused with the reason.
+    pub fn set_payload_name(&mut self, slot: u8, name: &str) -> Result<()> {
+        if !self.valid_slot(slot) {
+            return Err(Error::InvalidConfig(
+                "onboard profiles are numbered one-based, so a slot is 1 to 5, not any other byte".to_string(),
+            ));
+        }
+        match self.name_rule(name) {
+            Err(err) => {
+                return Err(err);
+            }
+            Ok(_) => {}
+        }
+        self.names.insert(slot, name.to_string());
+        return Ok(());
+    }
+
+    /// Forget one slot's name, so it goes back to the default spelling.
+    pub fn forget_payload_name(&mut self, slot: u8) {
+        self.names.remove(&slot);
     }
 
     // === The payload ===
@@ -307,7 +367,9 @@ impl Apex7 {
     /// A payload of the right length with nothing in it, except what the captures find in every
     /// payload: this fork's schema, a name, the wheel at rest, the SS key as the profile's meta
     /// toggle, the captures' guid, and identity bindings in every slot the table names. Building
-    /// one is the only honest "nothing remembered yet" state.
+    /// one is the only honest "nothing remembered yet" state. The name is written into the field
+    /// left-justified and zero-padded, and is truncated to the field if it is longer than it:
+    /// [`Self::named_payload`] is the checked entry point that refuses such a name.
     pub fn bare_payload(&self, name: &str) -> Vec<u8> {
         let mut payload = vec![0u8; PROFILE_PAYLOAD_LEN];
         let schema = PROFILE_SCHEMA.to_le_bytes();
@@ -335,6 +397,18 @@ impl Apex7 {
             }
         }
         return payload;
+    }
+
+    /// A payload this module built itself from nothing, under a name the caller may use: any ASCII
+    /// string that fits the payload's name field.
+    pub fn named_payload(&self, name: &str) -> Result<Vec<u8>> {
+        match self.name_rule(name) {
+            Err(err) => {
+                return Err(err);
+            }
+            Ok(_) => {}
+        }
+        return Ok(self.bare_payload(name));
     }
 
     /// The payload with its crc in: the crc covers the payload without its own four octets, which
@@ -882,14 +956,16 @@ impl Apex7 {
         }
     }
 
-    /// The payload of the slot a keybinding rewrite targets, remembered or built from nothing.
+    /// The payload of the slot a keybinding rewrite targets, remembered or built from nothing
+    /// under the slot's own name.
     pub fn current_payload(&self) -> Result<Vec<u8>> {
         match self.payload_of(self.bindings_slot) {
             Some(payload) => {
                 return Ok(payload);
             }
             None => {
-                return Ok(self.bare_payload(&self.payload_name(self.bindings_slot)));
+                let name = self.payload_name(self.bindings_slot);
+                return self.named_payload(&name);
             }
         }
     }
@@ -1279,5 +1355,82 @@ mod tests {
         assert_eq!(stm32crc(Vec::new()), 0xffff_ffff);
         assert_eq!(stm32crc(vec![0x41]), 0xca7a_d799);
         assert_eq!(stm32crc(vec![0x41, 0x42, 0x43, 0x44]), 0xcf53_4ae1);
+    }
+
+    #[test]
+    fn a_profile_name_is_any_ascii_that_fits_the_field() {
+        let mut device = apex7();
+        // The captures' default spelling, and the other spelling one capture set uses.
+        assert_eq!(device.payload_name(1), "Config 1");
+        assert_eq!(device.valid_name("Config Main"), true);
+        assert_eq!(device.valid_name("Main"), true);
+        assert_eq!(device.valid_name("24 ASCII octets, exactly"), true);
+        // The field is 24 octets at 2, so a 25th octet has nowhere to go, and an empty name has
+        // nothing to show on the OLED.
+        assert_eq!(device.valid_name("25 ASCII octets, exactly!"), false);
+        assert_eq!(device.valid_name(""), false);
+        assert_eq!(device.valid_name("Config Ω"), false);
+        // A rewrite names the payload it writes, so naming the slot a rewrite targets renames the
+        // payload that reaches the wire.
+        match device.set_payload_name(1, "Config Main") {
+            Err(_) => {
+                assert_eq!(false, true);
+            }
+            Ok(_) => {
+                assert_eq!(device.payload_name(1), "Config Main");
+                match device.current_payload() {
+                    Err(_) => {
+                        assert_eq!(false, true);
+                    }
+                    Ok(payload) => {
+                        assert_eq!(payload[1], 0);
+                        assert_eq!(payload[PROFILE_NAME_OFF], 0x43);
+                        assert_eq!(payload[PROFILE_NAME_OFF + 10], 0x6e);
+                        assert_eq!(payload[PROFILE_NAME_OFF + 11], 0);
+                    }
+                }
+            }
+        }
+        // A slot a rewrite does not target can be named as well, under any ASCII name: nothing
+        // about the payload written for slot 1 changes.
+        match device.set_payload_name(2, "Main") {
+            Err(_) => {
+                assert_eq!(false, true);
+            }
+            Ok(_) => {
+                assert_eq!(device.payload_name(2), "Main");
+                assert_eq!(device.payload_name(1), "Config Main");
+            }
+        }
+        // A name that does not fit is refused, and the slot keeps whatever name it had.
+        match device.set_payload_name(3, "Config Main, plus more than fits") {
+            Err(_) => {
+                assert_eq!(device.payload_name(3), "Config 3");
+            }
+            Ok(_) => {
+                assert_eq!(false, true);
+            }
+        }
+        match device.set_payload_name(3, "Config Ω") {
+            Err(_) => {
+                assert_eq!(device.payload_name(3), "Config 3");
+            }
+            Ok(_) => {
+                assert_eq!(false, true);
+            }
+        }
+        // Forgetting a name goes back to the default rather than to nothing.
+        device.forget_payload_name(1);
+        assert_eq!(device.payload_name(1), "Config 1");
+        device.forget_payload_name(2);
+        assert_eq!(device.payload_name(2), "Config 2");
+        // A slot outside the five the device has cannot be named, so the name table stays keyed
+        // to slots.
+        match device.set_payload_name(6, "Config Six") {
+            Err(_) => {}
+            Ok(_) => {
+                assert_eq!(false, true);
+            }
+        }
     }
 }
