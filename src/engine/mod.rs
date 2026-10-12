@@ -1822,7 +1822,7 @@ impl Inner {
         match bindings::bindings_from_profile(profile.bindings.as_ref()) {
             Ok(set) => {
                 // A keyboard whose own memory can hold the bindings gets them written there first:
-                // the Apex 7 (2023) rewrites its onboard profile FS object, and a
+                // the Apex 7 rewrites its onboard profile FS object, and a
                 // keyboard that did that answers the remapped keys itself, so the engine's own
                 // remapping - the evdev grab and the uinput replay - stays off for it. Other Apex
                 // keyboards have onboard profiles too, but this fork has no decoded payload for
@@ -1864,7 +1864,7 @@ impl Inner {
     }
 
     /// Push a profile's bindings into every connected keyboard this fork can write them into -
-    /// the ones whose onboard payload it has decoded, which so far is the Apex 7 (2023), see
+    /// the ones whose onboard payload it has decoded, which so far is the Apex 7, see
     /// [`keyboards::Keyboard::set_key_bindings`] - and report whether every connected keyboard
     /// did that: such a keyboard answers the remapped keys itself, so the engine's remapping can
     /// stay off for it. A keyboard this fork cannot write is not an error and is not counted:

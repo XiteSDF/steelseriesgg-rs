@@ -1,4 +1,4 @@
-//! The Apex 7 (2023): the Apex whose onboard profile this fork has decoded, bindings included.
+//! The Apex 7: the Apex whose onboard profile this fork has decoded, bindings included.
 //!
 //! Onboard profiles are a family feature, not this model's alone: the engine's own device
 //! descriptors carry the same `profile_1`..`profile_5`, `onboard_config_count` and
@@ -259,7 +259,7 @@ pub struct MappingLayers {
     pub wheel_meta: Vec<u8>,
 }
 
-/// The Apex 7 (2023): a `GenericKeyboard` plus the onboard payloads this device holds.
+/// The Apex 7: a `GenericKeyboard` plus the onboard payloads this device holds.
 ///
 /// `payloads` is the invariant the whole file rests on: each onboard slot the device has is
 /// keyed to the 2560-octet payload last seen there, so any payload read back for one of

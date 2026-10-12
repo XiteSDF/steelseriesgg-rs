@@ -237,7 +237,7 @@ pub fn keyboard_profile(product_id: u16) -> KeyboardProfile {
     let openrgb = |generation, wireless| ApexPerKey(ApexPerKeyProtocol::openrgb(generation, wireless));
     match product_id {
         APEX_5 => KeyboardProfile::new(Generic, openrgb(Gen1, false), Reference),
-        // The Apex 7 (2023) is the one model this crate can rewrite its own keybindings into:
+        // The Apex 7 is the one model this crate can rewrite its own keybindings into:
         // its onboard profile FS object is decoded here, and its lighting
         // stays the per-key family of the OpenRGB reference.
         APEX_7 => KeyboardProfile::new(Apex7, openrgb(Gen1, false), Reference),

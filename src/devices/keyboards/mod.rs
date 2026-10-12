@@ -91,7 +91,7 @@ pub trait Keyboard: Device + Configurable {
 
     /// Write a whole profile's keybindings into the keyboard's own memory.
     ///
-    /// Only one model is covered here: the Apex 7 (2023) keeps a whole profile, bindings
+    /// Only one model is covered here: the Apex 7 keeps a whole profile, bindings
     /// included, in an onboard FS object the engine rewrites (`src/devices/keyboards/apex_7.rs`). Other
     /// Apex keyboards have onboard profiles too - the
     /// engine's own descriptors give the legacy family the same `profile_1`..`profile_5`,
