@@ -6,6 +6,7 @@ pub mod fuzz;
 pub mod headsets;
 pub mod hid_reports;
 pub mod key_mapping;
+pub mod key_names;
 pub mod keyboards;
 pub mod mice;
 pub mod settings;

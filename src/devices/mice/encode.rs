@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use super::keys;
+use crate::devices::key_names::{keyboard_code, keyboard_names, multimedia_code, multimedia_names};
 use crate::rgb::Color;
 use crate::{Error, Result};
 
@@ -670,10 +670,10 @@ impl ButtonLayout {
             }
         }
         if self.multimedia.is_some() {
-            keys::multimedia_names().for_each(&mut push);
+            multimedia_names().for_each(&mut push);
         }
         if self.keyboard.is_some() {
-            keys::keyboard_names().for_each(&mut push);
+            keyboard_names().for_each(&mut push);
         }
         names
     }
@@ -716,9 +716,9 @@ pub fn encode_buttons(layout: &ButtonLayout, mapping: &BTreeMap<String, String>)
             (target.id, None)
         } else if let Some(code) = layout.special(&action) {
             (code, None)
-        } else if let (Some(prefix), Some(code)) = (layout.multimedia, keys::multimedia_code(&action)) {
+        } else if let (Some(prefix), Some(code)) = (layout.multimedia, multimedia_code(&action)) {
             (prefix, Some(code))
-        } else if let (Some(prefix), Some(code)) = (layout.keyboard, keys::keyboard_code(&action)) {
+        } else if let (Some(prefix), Some(code)) = (layout.keyboard, keyboard_code(&action)) {
             (prefix, Some(code))
         } else {
             return Err(invalid(format!("unknown button, key or action '{action}'")));

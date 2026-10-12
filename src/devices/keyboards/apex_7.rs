@@ -34,16 +34,21 @@
 //! - Bindings are 128 five-octet records at 85, in the device's own slot order: a slot is not a
 //!   HID usage, it is `HID_SLOT_TABLE[usage]`, and the eight slots the table never names (6, 7,
 //!   29, 69, 102, 103, 110, 111) get no record. The captures show the numbering byte for byte:
-//!   slot 0 carries `51 29` (space), slot 1 `51 35`, slot 2 `51 2b`, slot 4 `51 e1`, slot 5 `51
-//!   e0`, and the table sends those usages to those slots.
+//!   slot 0 carries `51 29` (escape: HID usage 0x29), slot 1 `51 35`, slot 2 `51 2b`, slot 4 `51 e1`,
+//!   slot 5 `51 e0`, and the table sends those usages to those slots.
 //! - Every slot the table names carries a record in the captures, unbound ones included: a bare
 //!   key bound to itself, `51 <its own usage>`. A zero record means the deactivating button
 //!   (`function` 0x00 of the `key_mapping` struct), so an unbound slot has to be written as its
 //!   identity or the key stops typing.
 //! - The wheel's two usages (0x6A/0x6B) get no slot; the wheel has its own two-record layer at
-//!   725, and the captures find it at rest bound to two media keys, `61 e9` and `61 ea`. Those
-//!   two octets are a vendor numbering this fork has no table for, so they are copied as the
-//!   payload's default and a `MediaKey` is never compiled into one.
+//!   725, one record per scroll direction, and the captures find it at rest bound to two media
+//!   keys, `61 e9` and `61 ea`. Those are volume up for scroll up and volume down for scroll down,
+//!   and the captures spell both at rest, so the wheel is the device's own volume control rather
+//!   than a key this fork binds. `e9`/`ea` are HID consumer-page usages: the media function codes
+//!   a consumer-page usage where the other functions spell a page-1 usage, and that numbering is
+//!   the one multimedia table in this fork (`devices/key_names.rs`) already carries, mute and all,
+//!   so a `MediaKey` does get compiled into a key slot. The wheel's own layer has one record per
+//!   scroll direction and nothing else, so it keeps its default.
 //! - The two meta layers (735 and 1375) are the same bindings with the SteelSeries key (usage
 //!   0xF0) held. The engine's binding model has no source key for it, because evdev invents no
 //!   code for the SS key, so this module preserves those layers and zeroes them only in a payload
@@ -75,13 +80,14 @@ use crate::devices::hid_reports::{
     HidCommand, HidDeviceType, KEYBOARD_REPORT_SIZE, stm32crc,
 };
 use crate::devices::key_mapping::{APEX_LED_TABLE, KeyAddress, KeyId, KeyMapping};
+use crate::devices::key_names::multimedia_code;
 use crate::devices::product_ids;
 use crate::devices::settings::{
     ChoiceOption, Configurable, SettingDescriptor, SettingKind, SettingValue, Verification,
 };
 use crate::devices::zone_mapping::{ZoneEffect, ZoneMapping};
 use crate::devices::{Device, DeviceInfo, DeviceType};
-use crate::input::{Action, Binding, BindingSet, InputKey};
+use crate::input::{Action, Binding, BindingSet, InputKey, MediaKey};
 use crate::rgb::{Color, PerKeyEffect};
 use crate::{Error, Result};
 use async_trait::async_trait;
@@ -152,9 +158,30 @@ pub const FUNCTION_META: u8 = 0x62;
 pub const FUNCTION_MACRO: u8 = 0x71;
 pub const FUNCTION_DEACTIVATED: u8 = 0x00;
 
-/// The wheel layer as the captures find it at rest: the wheel's two scroll directions bound to
-/// two media keys, in a vendor numbering this fork has no table for.
-pub const WHEEL_DEFAULT: [u8; PROFILE_WHEEL_LAYER_LEN] = [FUNCTION_MEDIA, 0xE9, 0, 0, 0, FUNCTION_MEDIA, 0xEA, 0, 0, 0];
+/// The two octets the media function (`0x61`) uses for the wheel's own volume control: volume up
+/// for scroll up and volume down for scroll down. The captures spell both at rest. These are HID
+/// consumer-page usages, the numbering `devices/key_names.rs`'s multimedia table carries, not the
+/// page-1 usages the other records spell.
+pub const WHEEL_VOLUME_UP: u8 = 0xE9;
+pub const WHEEL_VOLUME_DOWN: u8 = 0xEA;
+
+/// GG's media keys and the names the one multimedia table in `devices/key_names.rs` knows them
+/// by: the codes live there, since a consumer usage is a vendor fact and this list is only the glue
+/// between the engine's enum and that table. `MediaKey::Stop` is absent, because the table has no
+/// entry for it - the vendor's consumer page spells stop as a media *function*, not as a code.
+pub const MEDIA_NAMES: [(MediaKey, &str); 6] = [
+    (MediaKey::PlayPause, "playpause"),
+    (MediaKey::Next, "next"),
+    (MediaKey::Previous, "previous"),
+    (MediaKey::VolumeUp, "volumeup"),
+    (MediaKey::VolumeDown, "volumedown"),
+    (MediaKey::Mute, "mute"),
+];
+
+/// The wheel layer as the captures find it at rest: the wheel's two scroll directions bound to the
+/// two volume media keys.
+#[rustfmt::skip]
+pub const WHEEL_DEFAULT: [u8; PROFILE_WHEEL_LAYER_LEN] = [FUNCTION_MEDIA, WHEEL_VOLUME_UP, 0, 0, 0, FUNCTION_MEDIA, WHEEL_VOLUME_DOWN, 0, 0, 0];
 
 /// The SteelSeries key's own HID usage (`key_mapping.rs:389`), which is what byte 84 of the
 /// captures names as the profile's `meta_toggle_hid`.
@@ -164,7 +191,7 @@ pub const SS_KEY_USAGE: u8 = 0xF0;
 /// (`base_apex_legacy.lisp:186-219`), whose index is a HID usage in the page-folded numbering
 /// `APEX_LED_TABLE` and `KeyAddress::hid_code` use (0xE1 is left shift, 0xF0 the SS key) and
 /// whose value is the slot that key's bindings live in. `-1` marks a usage with no slot.
-/// The captures confirm the numbering byte for byte: slot 0 carries `51 29` (space), slot 1
+/// The captures confirm the numbering byte for byte: slot 0 carries `51 29` (escape), slot 1
 /// `51 35`, slot 2 `51 2b`, slot 4 `51 e1`, slot 5 `51 e0`.
 pub const HID_SLOT_TABLE: [i8; 256] = [
     -1, -1, -1, -1, 11, 52, 36, 27, 26, 35, 43, 51, 66, 59, 67, 75, 68, 60, 74, 82, 10, 34, 19, 42, 58, 44, 18, 28, 50,
@@ -620,7 +647,9 @@ impl Apex7 {
 
     /// The bindings a payload carries, read back as the engine's model: the device's own
     /// bindings as a `BindingSet`. An identity record is an unbound key, and a `BindingSet`
-    /// spells unbound keys by leaving them out, so it is skipped.
+    /// spells unbound keys by leaving them out, so it is skipped. A record whose function octet is
+    /// the media one is read back as a media action, since that is what it was written as; every
+    /// other function is read as the codes it spells, which is all this fork can say about it.
     pub fn bindings_of_payload(&self, payload: Vec<u8>) -> BindingSet {
         let mut out = BindingSet::new();
         match self.layers_of(payload) {
@@ -629,15 +658,21 @@ impl Apex7 {
                     match self.key_of_slot(slot) {
                         Some(source) => {
                             let record = self.record_of(&layers.button, slot);
-                            let skip = match self.usage_of_key(source) {
+                            let skip = match self.usage_of_slot(slot) {
                                 Some(usage) => self.identity_record_for(&record, usage),
                                 None => false,
                             };
                             if skip {
                                 continue;
                             }
-                            out.bindings
-                                .push(Binding::new(source, Action::Combo(self.combo_of_record(&record))));
+                            let action = match record[0] {
+                                FUNCTION_MEDIA => match self.media_key_of_code(record[1]) {
+                                    Some(media) => Action::Media(media),
+                                    None => Action::Combo(self.combo_of_record(&record)),
+                                },
+                                _ => Action::Combo(self.combo_of_record(&record)),
+                            };
+                            out.bindings.push(Binding::new(source, action));
                         }
                         None => {}
                     }
@@ -657,7 +692,8 @@ impl Apex7 {
     /// Slots the set says nothing about keep the identity record the payload already had, the
     /// meta layers keep whatever the payload had (a `BindingSet` has no source key for the SS
     /// key, so the meta layers are not something it can express), and the wheel layer keeps its
-    /// payload default, since evdev gives the volume wheel no code to bind from. Everywhere this
+    /// payload default - the device's own volume control, volume up on scroll up and volume down
+    /// on scroll down - since evdev gives the wheel no code to bind from. Everywhere this
     /// fork does not write a model's bindings onboard, a `BindingSet` is imposed on the wire by
     /// the input engine instead; here it becomes the device's own.
     pub fn compile_bindings(&self, payload: Vec<u8>, bindings: &BindingSet) -> Result<Vec<u8>> {
@@ -708,13 +744,45 @@ impl Apex7 {
         return Ok(out);
     }
 
+    /// The consumer usage the media function spells for one of GG's media keys: the vendor's own
+    /// numbering, kept once in `devices/key_names.rs`, and confirmed by the captures on the wheel's
+    /// own layer, which carries `61 e9` (volume up, scroll up) and `61 ea` (volume down, scroll
+    /// down).
+    pub fn media_code(&self, media: MediaKey) -> Option<u8> {
+        for entry in MEDIA_NAMES {
+            let (key, name) = entry;
+            if key == media {
+                return multimedia_code(name);
+            }
+        }
+        return None;
+    }
+
+    /// The media key one consumer usage spells, the other direction of the same list.
+    pub fn media_key_of_code(&self, code: u8) -> Option<MediaKey> {
+        for entry in MEDIA_NAMES {
+            let (key, name) = entry;
+            match multimedia_code(name) {
+                Some(known) => {
+                    if known == code {
+                        return Some(key);
+                    }
+                }
+                None => {}
+            }
+        }
+        return None;
+    }
+
     /// The record one binding compiles to, or `None` when no record can say it - and the two
     /// models disagree on the macro, which is the point of this module's caveat: the original
     /// engine wrote a macro's *steps* into the payload's `macro_data` and pointed a record at
     /// them, a layer this fork has no model for, so `Action::Macro` stays where it already
-    /// works, in software. `Action::Media` and `Action::MouseButton` are refused one level
-    /// down for the same kind of reason: their target usages (the wheel's `e9`/`ea`, the mouse
-    /// buttons) have no numbering in this fork to compile against.
+    /// works, in software. A media action does compile: its code is a HID consumer-page usage,
+    /// which is the numbering the one multimedia table in this fork (`devices/key_names.rs`) keeps,
+    /// and the wheel's own records confirm it (`61 e9` is volume up, `61 ea` is volume down). `Action::MouseButton` is still refused: the descriptors
+    /// list `01..08` as mouse buttons, but no capture has shown a record spelling one and this fork
+    /// has no table naming the eight, so which button is which cannot be picked without guessing.
     pub fn action_record(&self, source: InputKey, action: Action) -> Option<Vec<u8>> {
         match action {
             Action::Passthrough => match self.usage_of_key(source) {
@@ -753,9 +821,14 @@ impl Apex7 {
                 }
                 return Some(record);
             }
-            Action::Media(_) => {
-                return None;
-            }
+            Action::Media(media) => match self.media_code(media) {
+                None => {
+                    return None;
+                }
+                Some(code) => {
+                    return Some(vec![FUNCTION_MEDIA, code, 0, 0, 0]);
+                }
+            },
             Action::MouseButton(_) => {
                 return None;
             }
@@ -1344,6 +1417,74 @@ mod tests {
         assert_eq!(last.feature, false);
         assert_eq!(last.report[at], 0xeb);
         assert_eq!(last.report[at + 1], 1);
+    }
+
+    #[test]
+    fn a_media_binding_becomes_a_media_record_and_reads_back() {
+        let device = apex7();
+        // The wheel's own two codes are the numbering every media record uses, and mute has a code
+        // but no record of its own in a two-record layer.
+        assert_eq!(device.media_code(MediaKey::VolumeUp), Some(WHEEL_VOLUME_UP));
+        assert_eq!(device.media_code(MediaKey::VolumeDown), Some(WHEEL_VOLUME_DOWN));
+        assert_eq!(device.media_code(MediaKey::Mute), Some(0xe2));
+        assert_eq!(device.media_code(MediaKey::Stop), None);
+        assert_eq!(device.media_key_of_code(WHEEL_VOLUME_DOWN), Some(MediaKey::VolumeDown));
+        let bindings = BindingSet {
+            bindings: vec![Binding::new(InputKey::KEY_SPACE, Action::Media(MediaKey::Mute))],
+        };
+        match device.compile_bindings(device.bare_payload("Config 1"), &bindings) {
+            Err(_) => {
+                assert_eq!(false, true);
+            }
+            Ok(compiled) => {
+                let slot = match device.slot_of_key(InputKey::KEY_SPACE) {
+                    None => {
+                        assert_eq!(false, true);
+                        0
+                    }
+                    Some(found) => found,
+                };
+                // Space lives at whatever slot the engine's own offset table gives it, so the test
+                // asks for the record rather than assuming where it sits.
+                let layer = &compiled[PROFILE_BUTTON_OFF..(PROFILE_BUTTON_OFF + PROFILE_BUTTON_LAYER_LEN)];
+                let record = device.record_of(layer, slot);
+                assert_eq!(record[0], FUNCTION_MEDIA);
+                assert_eq!(record[1], 0xe2);
+                for index in 2..PROFILE_MAPPING_LEN {
+                    assert_eq!(record[index], 0);
+                }
+                // The wheel layer keeps its default, the device's own volume control.
+                for index in 0..WHEEL_DEFAULT.len() {
+                    assert_eq!(compiled[PROFILE_WHEEL_OFF + index], WHEEL_DEFAULT[index]);
+                }
+                let read = device.bindings_of_payload(compiled);
+                let mut media = 0;
+                for binding in &read.bindings {
+                    match &binding.action {
+                        Action::Media(MediaKey::Mute) => {
+                            media += 1;
+                        }
+                        _ => {}
+                    }
+                }
+                assert_eq!(media, 1);
+                // The same binding reads back as media on the key it was set for. A bare payload
+                // already reads back one phantom binding (see TODO.md), so the test looks for its
+                // own rather than counting.
+                assert_eq!(read.bindings.len(), 1);
+                let mut back = false;
+                for binding in &read.bindings {
+                    match &binding.action {
+                        Action::Media(MediaKey::Mute) => {
+                            assert_eq!(binding.source, InputKey::KEY_SPACE);
+                            back = true;
+                        }
+                        _ => {}
+                    }
+                }
+                assert_eq!(back, true);
+            }
+        }
     }
 
     #[test]

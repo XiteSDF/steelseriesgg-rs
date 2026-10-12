@@ -17,7 +17,6 @@
 mod device;
 pub mod dpi_tables;
 pub mod encode;
-mod keys;
 pub mod profile;
 pub mod profiles;
 
