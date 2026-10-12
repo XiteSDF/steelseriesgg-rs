@@ -1821,12 +1821,10 @@ impl Inner {
 
         match bindings::bindings_from_profile(profile.bindings.as_ref()) {
             Ok(set) => {
-                // A keyboard whose own memory can hold the bindings gets them written there first:
-                // the Apex 7 rewrites its onboard profile FS object, and a
-                // keyboard that did that answers the remapped keys itself, so the engine's own
-                // remapping - the evdev grab and the uinput replay - stays off for it. Other Apex
-                // keyboards have onboard profiles too, but this fork has no decoded payload for
-                // them, so they refuse and their bindings stay the engine's.
+                // A keyboard that can hold the bindings in its own memory gets them written there
+                // first: such a keyboard answers the remapped keys itself, so the engine's own
+                // remapping - the evdev grab and the uinput replay - stays off for it. A keyboard
+                // that refuses keeps its bindings the engine's.
                 let (onboard_errors, all_onboard) = self.write_bindings_to_keyboards(&set);
                 errors.extend(onboard_errors);
                 if all_onboard {
@@ -1863,19 +1861,18 @@ impl Inner {
         }
     }
 
-    /// Push a profile's bindings into every connected keyboard this fork can write them into -
-    /// the ones whose onboard payload it has decoded, which so far is the Apex 7, see
-    /// [`keyboards::Keyboard::set_key_bindings`] - and report whether every connected keyboard
-    /// did that: such a keyboard answers the remapped keys itself, so the engine's remapping can
-    /// stay off for it. A keyboard this fork cannot write is not an error and is not counted:
-    /// its bindings stay the engine's.
+    /// Push a profile's bindings into every connected keyboard that can hold them in its own memory
+    /// ([`keyboards::Keyboard::set_key_bindings`]) and report whether every connected keyboard did
+    /// that: such a keyboard answers the remapped keys itself, so the engine's remapping can stay
+    /// off for it. A keyboard that cannot is not an error and is not counted: its bindings stay
+    /// the engine's.
     ///
     /// The switch is one for the whole engine, not one per keyboard, so a mixed set of connected
     /// keyboards is a limitation rather than a success: a keyboard that took the set into its own
     /// memory also sees the engine's replay, and nothing here has watched a device do that twice.
     /// Such a set is reported in the errors so the user sees it.
     ///
-    /// TODO: check what the original Engine does for a binding this model cannot spell. A
+    /// TODO: check what the original Engine does for a binding a keyboard cannot hold onboard. A
     /// complex macro has no onboard record (`src/input/binding.rs::Action::Macro` has no function
     /// octet, and `compile_bindings` says so), so a profile that carries one still needs the
     /// engine's remapping turned back on for that keyboard - the original Engine only ever ran

@@ -91,15 +91,10 @@ pub trait Keyboard: Device + Configurable {
 
     /// Write a whole profile's keybindings into the keyboard's own memory.
     ///
-    /// Only one model is covered here: the Apex 7 keeps a whole profile, bindings
-    /// included, in an onboard FS object the engine rewrites (`src/devices/keyboards/apex_7.rs`). Other
-    /// Apex keyboards have onboard profiles too - the
-    /// engine's own descriptors give the legacy family the same `profile_1`..`profile_5`,
-    /// `onboard_config_count` and `profile_size` fields (`base_apex_legacy.lisp:1553`, `:1609`) -
-    /// but their payload has never been decoded from a capture, so this fork cannot write one
-    /// for them, and they refuse and say so: their bindings only ever live in the engine's
-    /// `InputState`, which imposes them by grabbing the device and replaying it through uinput
-    /// (`src/input/linux.rs`).
+    /// The default refuses and says why: a model whose onboard payload this fork has not decoded
+    /// cannot take a whole set of bindings into its own memory, and its bindings then live only in
+    /// the engine's `InputState`. Which models are covered, and how each payload is shaped, is the
+    /// device modules' to say (`crate::devices::keyboards::apex_7` is one of them).
     fn set_key_bindings(&mut self, bindings: &BindingSet) -> Result<()> {
         let _ = bindings;
         Err(
@@ -113,11 +108,9 @@ pub trait Keyboard: Device + Configurable {
     /// configuration's name as the device spells it, and the bindings it carries, so a configuration
     /// the device already has can become one of the engine's profiles.
     ///
-    /// The same one model is covered as for [`Self::Keyboard::set_key_bindings`]: reading that memory
-    /// means staging each window of the device's own buffer and asking for it (`macho-pull-payload`
-    /// and `macho-read-payload` in the engine's device code, spelled at
-    /// [`crate::devices::keyboards::apex_7::Apex7::fs_read_frames`]), and the payload of any other
-    /// Apex keyboard has never been decoded here, so it refuses and says so.
+    /// The default refuses: only a model whose payload this fork decodes can be read back, and the
+    /// geometry of that read - which buffer, which window, and how the answer is turned back into
+    /// bindings - belongs to the device module that decodes it.
     fn pull_key_bindings(&mut self) -> Result<OnboardConfig> {
         Err(
             Error::DeviceCommunication(
@@ -2043,7 +2036,7 @@ mod tests {
         assert_eq!(keyboard.apex_frame().color_of(KeyId::A), Some(Color::BLACK));
         assert_eq!(keyboard.apex_frame().color_of(KeyId::D), Some(Color::BLUE));
 
-        // Keys outside the model's mapping change nothing: the Apex 7 TKL has no numpad.
+        // Keys outside the model's mapping change nothing: a TKL form factor has no numpad.
         let mut tkl = keyboard_without_device(product_ids::APEX_7_TKL);
         assert!(matches!(
             tkl.update_key_frame(&[(KeyId::Num5, Color::RED)], false),

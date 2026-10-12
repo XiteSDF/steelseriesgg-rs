@@ -94,8 +94,8 @@ pub enum CommandCode {
     /// `PROTOCOL_NOTES.md`.
     RapidTap = 0x1A,
     /// One write chunk of one onboard FS object (`0x03`, `macho-write-payload` in the engine's
-    /// own descriptor). This is the write side of the Apex 7's onboard file
-    /// system, whose payloads carry the profile, its keybindings and its lighting.
+    /// own descriptor). A payload an onboard file system carries is a whole profile: its
+    /// keybindings and its lighting.
     ConfigWrite = 0x03,
     /// Wipe one onboard FS object before writing it back: body `88 00 <u16 fs_id>`.
     FsErase = 0x88,
