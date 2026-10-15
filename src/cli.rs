@@ -343,6 +343,10 @@ pub(crate) struct OnboardSchemaArgs {
     #[arg(long, default_value = "5")]
     pub(crate) gap_ms: u64,
 
+    /// Stop the probe after this many milliseconds per path group (0 removes the limit)
+    #[arg(long, default_value = "30000")]
+    pub(crate) deadline_ms: u64,
+
     /// Reject a pull answer on an unexpected report ID
     #[arg(long, default_value = "true")]
     pub(crate) strict: bool,

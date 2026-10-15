@@ -4,9 +4,11 @@
 //! and JSON live in [`crate::onboard_profile`], and the notes, including what the reference capture
 //! does and does not prove, live in docs/development/apex-7-onboard-profile-read.md.
 //!
-//! Status: reverse-engineered, never replayed on hardware from this crate. The sequence is read-only:
-//! the pacing frame, pulls and payload reads. Nothing in this path writes a profile, and the write
-//! command of this protocol family is deliberately not implemented here.
+//! Status: reverse-engineered. The sequence is read-only: the pacing frame, pulls and payload reads.
+//! On 2026-10-15 an Apex 7 (firmware `2.4.3`) accepted the pacing frame, the pull and the payload-read
+//! request on its `0xffc1` collection, and its answers arrive as input reports; a full profile read has
+//! not completed on hardware. Nothing in this path writes a profile, and the write command of this
+//! protocol family is deliberately not implemented here.
 
 use crate::devices::{
     list_hidraw_paths, read_feature_report_raw, read_input_report_raw, send_feature_report_raw, write_output_report_raw,
@@ -21,12 +23,22 @@ use tokio::time::sleep;
 
 /// Attempts for one transfer on one device path before that path is given up on.
 pub const STEP_ATTEMPTS: u8 = 3;
+/// Attempts used by the schema probe, which runs over every file and every path: one try each keeps a
+/// probe on a keyboard that does not answer to a few seconds instead of minutes.
+pub const PROBE_ATTEMPTS: u8 = 1;
 /// Device paths tried for one read: discovery's control collection first, then the other collections
 /// of the same vendor/product pair.
 pub const PATH_ATTEMPTS: usize = 4;
 /// Time to wait for a pull answer. GG's own pacing round-trips in about 5 ms; this is the ceiling, not
 /// the target.
 pub const ACK_TIMEOUT_MS: u64 = 300;
+/// Time to wait for a payload-read answer.
+pub const READ_TIMEOUT_MS: u64 = 1000;
+/// Largest input report the profile collection declares (`max_input_report` in its sysfs `uevent`):
+/// payload-read answers arrive as one input report of up to this size.
+pub const INPUT_REPORT_MAX_LEN: usize = 1024;
+/// Extra settle time after the pacing frame, which the keyboard applies to the transfers that follow.
+pub const PACING_SETTLE_MS: u64 = 100;
 
 /// Read the vendor and product of a hidraw node from its sysfs `uevent` (`HID_ID=0003:000001038:000001612`).
 ///
@@ -101,15 +113,30 @@ fn exchange(path: &str, step: &Step) -> Result<Vec<u8>> {
         }
         StepKind::Read => {
             send_feature_report_raw(path, &report, step.wire_len)?;
-            let want = step.reply_len.unwrap_or(READ_REPORT_LEN);
-            let reply = read_feature_report_raw(path, READ_REPLY_REPORT_ID, want)?;
-            if reply.len() <= 1 + READ_REPLY_HEADER_LEN {
-                return Err(Error::DeviceCommunication(format!(
-                    "payload read on {path} returned {} bytes, no payload behind the reply header",
-                    reply.len()
-                )));
+            // The answer arrives as one input report on the interrupt endpoint: this collection declares a
+            // 1024-byte maximum input report and never answers a control GET_REPORT, so a feature-report
+            // read here blocks for the kernel's 5-second control timeout.
+            match read_input_report_raw(path, INPUT_REPORT_MAX_LEN, READ_TIMEOUT_MS) {
+                Ok(reply) if reply.len() > 1 + READ_REPLY_HEADER_LEN => Ok(reply),
+                outcome => {
+                    let short = match &outcome {
+                        Ok(reply) => format!("{}/{} bytes", reply.len(), 1 + READ_REPLY_HEADER_LEN),
+                        Err(e) => e.to_string(),
+                    };
+                    tracing::debug!("payload read on {path} on the interrupt endpoint: {short}");
+                    // Fallback: the reference capture shows control GET_REPORT answers on Windows.
+                    let want = step.reply_len.unwrap_or(READ_REPORT_LEN);
+                    let reply = read_feature_report_raw(path, READ_REPLY_REPORT_ID, want)?;
+                    if reply.len() <= 1 + READ_REPLY_HEADER_LEN {
+                        return Err(Error::DeviceCommunication(format!(
+                            "payload read on {path} returned {} bytes, no payload behind the reply header \
+                             (interrupt endpoint: {short})",
+                            reply.len()
+                        )));
+                    }
+                    Ok(reply)
+                }
             }
-            Ok(reply)
         }
     }
 }
@@ -119,10 +146,10 @@ fn exchange(path: &str, step: &Step) -> Result<Vec<u8>> {
 /// In `strict` mode a payload-read reply whose header does not echo the request, and a pull answer on
 /// the wrong report ID, count as failed attempts. In lenient mode both are accepted and only tallied
 /// by [`ProfileImage::assemble`].
-async fn step_with_retries(path: &str, step: &Step, gap_ms: u64, strict: bool) -> Result<Vec<u8>> {
+async fn step_with_retries(path: &str, step: &Step, gap_ms: u64, strict: bool, attempts: u8) -> Result<Vec<u8>> {
     let mut last_error = None::<String>;
 
-    for attempt in 1..=STEP_ATTEMPTS {
+    for attempt in 1..=attempts {
         let task_path = path.to_string();
         let task_step = step.clone();
 
@@ -166,9 +193,8 @@ async fn step_with_retries(path: &str, step: &Step, gap_ms: u64, strict: bool) -
     }
 
     Err(Error::DeviceCommunication(format!(
-        "chunk {} on {path} did not yield a usable reply after {} attempts: {}",
+        "chunk {} on {path} did not yield a usable reply after {attempts} attempts: {}",
         step.chunk,
-        STEP_ATTEMPTS,
         last_error.unwrap_or_else(|| "no error recorded".to_string())
     )))
 }
@@ -184,7 +210,7 @@ async fn read_on_path(path: &str, config: &ReadConfig, strict: bool) -> Result<P
             Vec::with_capacity(config.resource_len / config.read_len);
 
         for step in steps.iter().filter(|s| s.chunk == chunk) {
-            let reply = step_with_retries(path, step, config.gap_ms, strict).await?;
+            let reply = step_with_retries(path, step, config.gap_ms, strict, STEP_ATTEMPTS).await?;
             match step.kind {
                 StepKind::Pull => {
                     ack = reply;
@@ -192,7 +218,9 @@ async fn read_on_path(path: &str, config: &ReadConfig, strict: bool) -> Result<P
                 StepKind::Read => {
                     reads.push(parse_read_reply(&reply, step.size)?);
                 }
-                StepKind::Config => {}
+                StepKind::Config => {
+                    sleep(Duration::from_millis(PACING_SETTLE_MS)).await;
+                }
             }
             sleep(Duration::from_millis(config.gap_ms)).await;
         }
@@ -263,7 +291,13 @@ pub const MAX_PROFILE_INDEX_FOR_READ: u8 = crate::onboard_profile::MAX_PROFILE_I
 /// Read only the schema word of one profile slot.
 ///
 /// Returns the schema word, the raw two bytes and the path they came from.
-pub async fn read_schema(paths: &[String], profile: u8, gap_ms: u64, strict: bool) -> Result<(u16, [u8; 2], String)> {
+pub async fn read_schema(
+    paths: &[String],
+    profile: u8,
+    gap_ms: u64,
+    strict: bool,
+    deadline: Option<Duration>,
+) -> Result<(u16, [u8; 2], String)> {
     if profile > MAX_PROFILE_INDEX_FOR_READ {
         return Err(Error::InvalidConfig(format!(
             "profile slot {profile} is above the highest slot {MAX_PROFILE_INDEX_FOR_READ}"
@@ -274,6 +308,7 @@ pub async fn read_schema(paths: &[String], profile: u8, gap_ms: u64, strict: boo
         crate::onboard_profile::PROFILE_FS_BASE + u16::from(profile),
         gap_ms,
         strict,
+        deadline,
     )
     .await
 }
@@ -287,6 +322,7 @@ pub async fn read_schema_file(
     fs_id: u16,
     gap_ms: u64,
     strict: bool,
+    deadline: Option<Duration>,
 ) -> Result<(u16, [u8; 2], String)> {
     if paths.is_empty() {
         return Err(Error::DeviceNotFound(
@@ -295,13 +331,25 @@ pub async fn read_schema_file(
     }
 
     let steps = crate::onboard_profile::schema_read_steps(fs_id);
+    let started = std::time::Instant::now();
     let mut last_error = None::<Error>;
 
     for path in paths.iter().take(PATH_ATTEMPTS) {
+        if let Some(limit) = deadline
+            && started.elapsed() > limit
+        {
+            return Err(Error::DeviceCommunication(format!(
+                "the schema probe stopped after {} ms without an answer (last: {})",
+                limit.as_millis(),
+                last_error
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "no attempt made".to_string())
+            )));
+        }
         let mut schema_bytes = [0u8; 2];
         let mut ok = true;
         for step in &steps {
-            match step_with_retries(path, step, gap_ms, strict).await {
+            match step_with_retries(path, step, gap_ms, strict, PROBE_ATTEMPTS).await {
                 Ok(reply) => {
                     if step.kind == StepKind::Read {
                         let parsed = parse_read_reply(&reply, step.size)?;
