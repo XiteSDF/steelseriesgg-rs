@@ -1,5 +1,8 @@
 use clap::{Parser, Subcommand};
 
+#[cfg(feature = "onboard")]
+use std::path::PathBuf;
+
 use steelseries_gg::devices::KeyId;
 use steelseries_gg::rgb::Color;
 use steelseries_gg::{Error, Result};
@@ -65,6 +68,13 @@ pub(crate) enum Commands {
     Pollrate {
         #[command(subcommand)]
         action: PollrateAction,
+    },
+
+    /// Read the on-board profile of a legacy Apex keyboard (experimental, reads only)
+    #[cfg(feature = "onboard")]
+    Onboard {
+        #[command(subcommand)]
+        action: OnboardAction,
     },
 
     /// Start the GameSense server
@@ -183,6 +193,182 @@ pub(crate) enum Commands {
         #[arg(short, long, default_value = "100")]
         delay: u64,
     },
+}
+
+/// [EXPERIMENTAL] Read the on-board profile of a legacy Apex keyboard.
+///
+/// `plan` and `decode` work on the wire format and on saved files only; they never touch a device.
+/// `read` and `schema` talk to a keyboard and need `--yes`.
+#[cfg(feature = "onboard")]
+#[derive(Subcommand)]
+pub(crate) enum OnboardAction {
+    /// Print the transfer plan of one profile read (no device, no hardware).
+    Plan(OnboardWireArgs),
+
+    /// Read one profile from a legacy Apex keyboard. Requires --yes.
+    Read(OnboardReadArgs),
+
+    /// Read the schema word of every profile slot and of the lighting files. Requires --yes.
+    Schema(OnboardSchemaArgs),
+
+    /// Decode a profile image saved by an earlier read (no device, no hardware).
+    Decode(OnboardDecodeArgs),
+}
+
+/// Wire tunables of one on-board profile read. Defaults are the values measured in the reference
+/// capture: the pacing frame's 1 ms gap and 500 ms USB timeout, a 1024-byte resource buffer, and
+/// 512-byte reads out of it.
+#[cfg(feature = "onboard")]
+#[derive(clap::Args)]
+pub(crate) struct OnboardWireArgs {
+    /// On-board profile slot (0-4)
+    #[arg(short, long, default_value = "0")]
+    pub(crate) profile: u8,
+
+    /// Resource-buffer length each pull fills, in bytes
+    #[arg(long, default_value = "1024")]
+    pub(crate) resource_len: usize,
+
+    /// Payload bytes asked for in each read
+    #[arg(long, default_value = "512")]
+    pub(crate) read_len: usize,
+
+    /// Pulls per profile file
+    #[arg(short, long, default_value = "12")]
+    pub(crate) chunks: usize,
+
+    /// Profile payload length (default: 11648, the schema A length)
+    #[arg(long)]
+    pub(crate) payload_len: Option<usize>,
+
+    /// First profile file id (0x0201 is profile 0 on the reference keyboard)
+    #[arg(long, value_parser = parse_hex_u16)]
+    pub(crate) fs_base: Option<u16>,
+
+    /// Skip the pacing frame (the capture shows GG sending it before the profile read)
+    #[arg(long)]
+    pub(crate) no_config_frame: bool,
+
+    /// File-access mode sent in the pacing frame
+    #[arg(long, default_value = "2")]
+    pub(crate) file_access: u32,
+
+    /// USB timeout sent in the pacing frame, in milliseconds
+    #[arg(long, default_value = "500")]
+    pub(crate) max_usb_timeout_ms: u32,
+
+    /// Time between commands sent in the pacing frame, in milliseconds
+    #[arg(long, default_value = "1")]
+    pub(crate) time_between_commands_ms: u32,
+
+    /// Gap between transfers, in milliseconds
+    #[arg(long, default_value = "5")]
+    pub(crate) gap_ms: u64,
+}
+
+#[cfg(feature = "onboard")]
+impl OnboardWireArgs {
+    /// Turn the tunables into a read plan. Defaults match the reference capture.
+    pub(crate) fn to_config(&self) -> steelseries_gg::onboard_profile::ReadConfig {
+        steelseries_gg::onboard_profile::ReadConfig {
+            profile: self.profile,
+            resource_len: self.resource_len,
+            read_len: self.read_len,
+            chunks: self.chunks,
+            payload_len: self
+                .payload_len
+                .unwrap_or(steelseries_gg::onboard_profile::PAYLOAD_LEN_A),
+            fs_base: self.fs_base.unwrap_or(steelseries_gg::onboard_profile::PROFILE_FS_BASE),
+            send_config: !self.no_config_frame,
+            file_access: self.file_access,
+            max_usb_timeout_ms: self.max_usb_timeout_ms,
+            time_between_commands_ms: self.time_between_commands_ms,
+            gap_ms: self.gap_ms,
+        }
+    }
+}
+
+#[cfg(feature = "onboard")]
+#[derive(clap::Args)]
+pub(crate) struct OnboardReadArgs {
+    #[command(flatten)]
+    pub(crate) wire: OnboardWireArgs,
+
+    /// Device as `vid:pid`, a sysfs prefix, or a `/dev/hidrawN` node (default: the control
+    /// collection of the first legacy Apex keyboard found)
+    #[arg(short, long)]
+    pub(crate) device: Option<String>,
+
+    /// Confirm the device read (required: experimental protocol code, talks to hardware)
+    #[arg(short, long)]
+    pub(crate) yes: bool,
+
+    /// Write the assembled profile image here
+    #[arg(short, long)]
+    pub(crate) out: Option<PathBuf>,
+
+    /// Write the JSON report here
+    #[arg(long)]
+    pub(crate) json: Option<PathBuf>,
+
+    /// Hex-dump the whole profile image to stdout
+    #[arg(long)]
+    pub(crate) hex: bool,
+
+    /// Read twice and compare the profile bytes
+    #[arg(long)]
+    pub(crate) verify: bool,
+
+    /// A reply header that disagrees with its request fails the read (research mode turns this off)
+    #[arg(long, default_value = "true")]
+    pub(crate) strict: bool,
+}
+
+#[cfg(feature = "onboard")]
+#[derive(clap::Args)]
+pub(crate) struct OnboardSchemaArgs {
+    /// Device as `vid:pid`, a sysfs prefix, or a `/dev/hidrawN` node
+    #[arg(short, long)]
+    pub(crate) device: Option<String>,
+
+    /// Confirm the device read (required: experimental protocol code, talks to hardware)
+    #[arg(short, long)]
+    pub(crate) yes: bool,
+
+    /// Write the JSON report here
+    #[arg(long)]
+    pub(crate) json: Option<PathBuf>,
+
+    /// Gap between transfers, in milliseconds
+    #[arg(long, default_value = "5")]
+    pub(crate) gap_ms: u64,
+
+    /// Reject a pull answer on an unexpected report ID
+    #[arg(long, default_value = "true")]
+    pub(crate) strict: bool,
+}
+
+#[cfg(feature = "onboard")]
+#[derive(clap::Args)]
+pub(crate) struct OnboardDecodeArgs {
+    /// Profile image file (assembled by `ssgg onboard read --out`)
+    pub(crate) file: PathBuf,
+
+    /// Write the JSON decode report here
+    #[arg(short, long)]
+    pub(crate) json: Option<PathBuf>,
+
+    /// Hex-dump profile bytes
+    #[arg(long)]
+    pub(crate) hex: bool,
+
+    /// First byte of the hex dump
+    #[arg(long, default_value = "0")]
+    pub(crate) hex_from: usize,
+
+    /// Number of bytes in the hex dump
+    #[arg(long, default_value = "64")]
+    pub(crate) hex_len: usize,
 }
 
 #[derive(Subcommand)]
@@ -509,6 +695,12 @@ pub(crate) fn require_color(s: &str) -> Result<Color> {
 pub(crate) fn parse_hex_u8(s: &str) -> std::result::Result<u8, String> {
     let s = s.trim_start_matches("0x");
     u8::from_str_radix(s, 16).map_err(|e| format!("Invalid hex value: {}", e))
+}
+
+#[cfg(feature = "onboard")]
+pub(crate) fn parse_hex_u16(s: &str) -> std::result::Result<u16, String> {
+    let s = s.trim_start_matches("0x");
+    u16::from_str_radix(s, 16).map_err(|e| format!("Invalid hex value: {}", e))
 }
 
 #[cfg(feature = "audio")]

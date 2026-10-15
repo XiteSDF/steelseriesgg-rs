@@ -47,6 +47,12 @@ use crate::cli::normalize_volume;
 #[cfg(feature = "sonar")]
 use crate::cli::{SonarAction, StreamerAction, parse_sonar_channel};
 
+#[cfg(feature = "onboard")]
+use crate::cli::OnboardAction;
+
+#[cfg(feature = "onboard")]
+use steelseries_gg::onboard_profile::{ReadConfig, decode, hex_of};
+
 #[cfg(feature = "audio")]
 use steelseries_gg::audio::AudioMixer;
 
@@ -143,6 +149,18 @@ async fn main() -> Result<()> {
 
         Commands::Pollrate { action } => {
             cmd_pollrate(action).await?;
+        }
+
+        #[cfg(feature = "onboard")]
+        Commands::Onboard { action } => {
+            match &action {
+                // Only the two device-reading subcommands enumerate hardware.
+                OnboardAction::Read(_) | OnboardAction::Schema(_) => {
+                    let mut manager = new_device_manager()?;
+                    cmd_onboard(Some(&mut manager), action).await?;
+                }
+                _ => cmd_onboard(None, action).await?,
+            }
         }
 
         Commands::Server { port } => {
@@ -788,6 +806,389 @@ async fn cmd_profile(action: ProfileAction) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// [EXPERIMENTAL] Read the on-board profile of a legacy Apex keyboard.
+///
+/// Reads only. The protocol is reverse-engineered from the GG USBPcap capture written up in
+/// docs/development/apex-7-onboard-profile-read.md and has never been replayed from this crate.
+#[cfg(feature = "onboard")]
+async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAction) -> Result<()> {
+    use steelseries_gg::STEELSERIES_VENDOR_ID;
+    use steelseries_gg::devices::keyboards::apex_legacy_onboard as hw;
+    use steelseries_gg::devices::product_ids::APEX_7;
+    use steelseries_gg::onboard_profile::{
+        self as wire, hex_dump, hex_of, payload_len_for_schema, plan_json, profile_json, schema_of, to_json,
+    };
+
+    match action {
+        OnboardAction::Plan(wire_args) => {
+            let config = wire_args.to_config();
+            config.validate()?;
+            println!("{}", plan_json(&config)?);
+            print_plan_summary(&config);
+        }
+
+        OnboardAction::Read(args) => {
+            let config = args.wire.to_config();
+            config.validate()?;
+            if !args.yes {
+                return require_yes("read the on-board profile");
+            }
+            let Some(manager) = manager.as_mut() else {
+                return Err(Error::Other("the on-board profile read needs a device".to_string()));
+            };
+            let paths = onboard_paths(manager, &args.device, STEELSERIES_VENDOR_ID, APEX_7)?;
+            print_onboard_banner();
+            println!(
+                "profile slot {} (file id {:04X}): {} pulls of {} bytes, {} reads of {} bytes, strict replies: {}",
+                config.profile,
+                config.fs_id(),
+                config.chunks,
+                config.resource_len,
+                config.chunks * (config.resource_len / config.read_len),
+                config.read_len,
+                args.strict
+            );
+            println!("device paths to try: {}", paths.join(", "));
+            println!();
+
+            if args.verify {
+                let (first, second, diff, path) = hw::read_profile_verify(&paths, &config, args.strict).await?;
+                print_onboard_image(&first, &path);
+                print_onboard_image(&second, &path);
+                match diff {
+                    Some(offset) => {
+                        println!("the two reads differ at profile byte {offset}: treat this pairing as unverified")
+                    }
+                    None => println!("the two reads agree on all {} profile bytes", first.data.len()),
+                }
+                if let Some(out) = args.out.as_ref() {
+                    secure_write_async(out.clone(), first.data.clone()).await?;
+                    let second_path = out.with_extension("second.bin");
+                    secure_write_async(second_path.clone(), second.data.clone()).await?;
+                    println!(
+                        "both profile images written: {} and {}",
+                        out.display(),
+                        second_path.display()
+                    );
+                }
+                if let Some(json) = args.json.as_ref() {
+                    secure_write_async(json.clone(), to_json(&first)?).await?;
+                    println!("JSON report of the first read written to {}", json.display());
+                }
+            } else {
+                let (image, path) = hw::read_profile(&paths, &config, args.strict).await?;
+                print_onboard_image(&image, &path);
+                if args.hex {
+                    print!("{}", hex_dump(&image.data, 0, image.data.len()));
+                }
+                if let Some(out) = args.out.as_ref() {
+                    secure_write_async(out.clone(), image.data.clone()).await?;
+                    println!("profile image written to {}", out.display());
+                }
+                if let Some(json) = args.json.as_ref() {
+                    secure_write_async(json.clone(), to_json(&image)?).await?;
+                    println!("JSON report written to {}", json.display());
+                }
+            }
+        }
+
+        OnboardAction::Schema(args) => {
+            if !args.yes {
+                return require_yes("read the on-board profile schema words");
+            }
+            let Some(manager) = manager.as_mut() else {
+                return Err(Error::Other("the on-board profile read needs a device".to_string()));
+            };
+            let paths = onboard_paths(manager, &args.device, STEELSERIES_VENDOR_ID, APEX_7)?;
+            print_onboard_banner();
+            println!("device paths to try: {}", paths.join(", "));
+            println!();
+
+            let mut rows: Vec<serde_json::Value> = Vec::new();
+            let mut failed = 0usize;
+
+            for slot in 0..=hw::MAX_PROFILE_INDEX_FOR_READ {
+                let fs_id = wire::PROFILE_FS_BASE + u16::from(slot);
+                match hw::read_schema(&paths, slot, args.gap_ms, args.strict).await {
+                    Ok((word, raw, path)) => {
+                        let payload = payload_len_for_schema(word).ok();
+                        println!(
+                            "profile slot {slot} (file {fs_id:04X}): schema {word:04X} raw {} -> {} ({path})  [EXPERIMENTAL]",
+                            hex_of(&raw),
+                            payload
+                                .map(|len| format!("{len} bytes"))
+                                .unwrap_or_else(|| "unknown schema".to_string())
+                        );
+                        rows.push(serde_json::json!({
+                            "fs_id": fs_id,
+                            "kind": "profile",
+                            "slot": slot,
+                            "schema_word": format!("{word:04X}"),
+                            "schema_raw_hex": hex_of(&raw),
+                            "payload_len": payload,
+                        }));
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        println!("profile slot {slot} (file {fs_id:04X}): no usable answer - {e}");
+                        rows.push(serde_json::json!({
+                            "fs_id": fs_id,
+                            "kind": "profile",
+                            "slot": slot,
+                            "error": e.to_string(),
+                        }));
+                    }
+                }
+            }
+
+            for fs_id in [wire::LIGHTING_FS_SHARED, wire::LIGHTING_FS_BASE] {
+                match hw::read_schema_file(&paths, fs_id, args.gap_ms, args.strict).await {
+                    Ok((word, raw, path)) => {
+                        println!(
+                            "lighting file {fs_id:04X}: schema {word:04X} raw {} ({path})  [EXPERIMENTAL]",
+                            hex_of(&raw)
+                        );
+                        rows.push(serde_json::json!({
+                            "fs_id": fs_id,
+                            "kind": "lighting",
+                            "schema_word": format!("{word:04X}"),
+                            "schema_raw_hex": hex_of(&raw),
+                        }));
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        println!("lighting file {fs_id:04X}: no usable answer - {e}");
+                        rows.push(serde_json::json!({
+                            "fs_id": fs_id,
+                            "kind": "lighting",
+                            "error": e.to_string(),
+                        }));
+                    }
+                }
+            }
+
+            if let Some(json) = args.json.as_ref() {
+                let text = serde_json::to_string_pretty(&serde_json::Value::Array(rows.clone()))
+                    .map_err(|e| Error::Other(format!("serialize schema report: {e}")))?;
+                secure_write_async(json.clone(), text).await?;
+                println!("JSON schema report written to {}", json.display());
+            }
+            if failed > 0 {
+                println!("{failed} file(s) never answered. An all-zero schema word is an unused slot, not a schema.");
+            }
+        }
+
+        OnboardAction::Decode(args) => {
+            let data = tokio::fs::read(&args.file)
+                .await
+                .map_err(|e| Error::Other(format!("read {}: {e}", args.file.display())))?;
+            println!("schema word: {:04X}", schema_of(&data));
+            let profile = decode(&data)?;
+            print_onboard_profile(&profile);
+            if args.hex {
+                let from = args.hex_from;
+                let to = (from + args.hex_len).min(data.len());
+                print!("{}", hex_dump(&data, from, to));
+            }
+            if let Some(json) = args.json.as_ref() {
+                secure_write_async(json.clone(), profile_json(&profile)?).await?;
+                println!("JSON decode report written to {}", json.display());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Device paths to try for a profile read: the control collection discovery ranked for this
+/// vendor/product pair first, then the other collections of the same device.
+#[cfg(feature = "onboard")]
+fn onboard_paths(
+    manager: &mut DeviceManager,
+    device: &Option<String>,
+    vendor_id: u16,
+    product_id: u16,
+) -> Result<Vec<String>> {
+    use steelseries_gg::devices::keyboards::apex_legacy_onboard::candidate_paths;
+
+    if let Some(path) = device.as_ref().filter(|d| d.starts_with('/')) {
+        let (vendor, product) = steelseries_gg::devices::keyboards::apex_legacy_onboard::hidraw_vendor_product(path)
+            .unwrap_or((vendor_id, product_id));
+        let paths = candidate_paths(Some(path), vendor, product);
+        if paths.is_empty() {
+            return Err(Error::DeviceNotFound(format!(
+                "{path} is not a hidraw node of a device with readable collections"
+            )));
+        }
+        return Ok(paths);
+    }
+
+    manager.refresh()?;
+
+    let (vendor, product) = match device.as_ref() {
+        Some(spec) => parse_vid_pid(spec).unwrap_or((vendor_id, product_id)),
+        None => (vendor_id, product_id),
+    };
+
+    let matching: Vec<&steelseries_gg::devices::DeviceInfo> = manager
+        .devices()
+        .into_iter()
+        .filter(|d| d.vendor_id == vendor && d.product_id == product)
+        .collect();
+
+    if matching.is_empty() {
+        return Err(Error::DeviceNotFound(format!(
+            "no device matching {vendor:04X}:{product:04X} found. Try 'ssgg devices'."
+        )));
+    }
+
+    let preferred = manager
+        .control_path(vendor, product)
+        .map(|p| p.to_string())
+        .or_else(|| matching.first().map(|d| d.path.clone()));
+
+    Ok(candidate_paths(preferred.as_deref(), vendor, product))
+}
+
+/// `vendor:pid` as used by `ssgg --device`.
+#[cfg(feature = "onboard")]
+fn parse_vid_pid(spec: &str) -> Option<(u16, u16)> {
+    let (vendor, product) = spec.split_once(':')?;
+    Some((
+        u16::from_str_radix(vendor.trim_start_matches("0x"), 16).ok()?,
+        u16::from_str_radix(product.trim_start_matches("0x"), 16).ok()?,
+    ))
+}
+
+#[cfg(feature = "onboard")]
+fn require_yes(what: &str) -> Result<()> {
+    println!("Refusing to {what} without --yes:");
+    println!("  this is experimental, reverse-engineered protocol code that has never been replayed on");
+    println!("  hardware, and it talks to a keyboard through a raw device node.");
+    println!("Add --yes when you accept that.");
+    Ok(())
+}
+
+#[cfg(feature = "onboard")]
+fn print_onboard_banner() {
+    println!("[EXPERIMENTAL] legacy Apex on-board profile read");
+    println!("  reverse-engineered from one GG USBPcap capture, never replayed from this crate; reads only.");
+    println!("  watch the keyboard while it runs: if lighting flickers, Ctrl-C stops the read.");
+    println!();
+}
+
+#[cfg(feature = "onboard")]
+fn print_plan_summary(config: &ReadConfig) {
+    use steelseries_gg::onboard_profile::StepKind;
+
+    let steps = config.steps();
+    let pulls = steps.iter().filter(|s| s.kind == StepKind::Pull).count();
+    let reads = steps.iter().filter(|s| s.kind == StepKind::Read).count();
+    let configs = steps.iter().filter(|s| s.kind == StepKind::Config).count();
+    let first_pull = steps.iter().find(|s| s.kind == StepKind::Pull);
+    let first_read = steps.iter().find(|s| s.kind == StepKind::Read);
+
+    println!();
+    println!(
+        "plan: {} pacing frame(s), {pulls} pulls, {reads} payload reads, {} transfers total",
+        configs,
+        steps.len()
+    );
+    if let Some(step) = first_pull {
+        println!("first pull:  {}", hex_of(&step.frame));
+    }
+    if let Some(step) = first_read {
+        println!("first read:  {}", hex_of(&step.frame));
+    }
+    println!(
+        "file ids {} .. {} (slot {}), {} bytes planned for {} payload bytes",
+        config.fs_base,
+        config.fs_base + u16::from(config.profile),
+        config.profile,
+        config.total_resource_len(),
+        config.payload_len
+    );
+}
+
+#[cfg(feature = "onboard")]
+fn print_onboard_image(image: &steelseries_gg::onboard_profile::ProfileImage, path: &str) {
+    use steelseries_gg::onboard_profile::decode;
+
+    println!("read {} profile bytes from {path}", image.data.len());
+    println!(
+        "transfers: {} payload reads over {} pulls; {} bytes covered, {} short read(s)",
+        image.stats.reads_read, image.stats.chunks_read, image.stats.covered_len, image.stats.short_reads
+    );
+    println!(
+        "replies: {} header mismatch(es), {} all-zero read(s), {} all-zero pull(s)",
+        image.stats.header_mismatches, image.stats.zero_reads, image.stats.zero_chunks
+    );
+    match decode(&image.data) {
+        Ok(profile) => print_onboard_profile(&profile),
+        Err(e) => println!("decode: {e}"),
+    }
+    println!();
+}
+
+#[cfg(feature = "onboard")]
+fn print_onboard_profile(profile: &steelseries_gg::onboard_profile::OnboardProfile) {
+    use steelseries_gg::onboard_profile::{Color, PAYLOAD_LEN_A, PAYLOAD_LEN_B, SCHEMA_B_FIRMWARE};
+
+    fn color(c: &Color) -> String {
+        format!("#{:02X}{:02X}{:02X}", c.r, c.g, c.b)
+    }
+
+    println!("schema: {} (0x{:04X})", profile.schema_name, profile.schema);
+    println!(
+        "checksum: stored {:08X}, computed {:08X} over {} bytes, match: {}",
+        profile.crc_stored, profile.crc_computed, profile.crc_region_len, profile.crc_ok
+    );
+    println!(
+        "known schema lengths: {} (schema A) and {} (schema B, firmware {})",
+        PAYLOAD_LEN_A, PAYLOAD_LEN_B, SCHEMA_B_FIRMWARE
+    );
+    println!("name: {:?} (raw bytes {})", profile.name, profile.name_hex);
+    println!("guid: {:?} (schema A padding {})", profile.guid, profile.guid_padding);
+    println!("META toggle HID code: 0x{:02X}", profile.meta_toggle_hid);
+    println!(
+        "mappings: {} buttons, {} wheels, {} button META, {} wheel META",
+        profile.button_mappings.len(),
+        profile.wheel_mappings.len(),
+        profile.button_meta_mappings.len(),
+        profile.wheel_meta_mappings.len()
+    );
+
+    let l = &profile.lighting;
+    println!(
+        "lighting [EXPERIMENTAL layout]: lock {} meta {} disabled win {}",
+        color(&l.lock_key_color),
+        color(&l.meta_key_color),
+        color(&l.disabled_win_key_color)
+    );
+    println!(
+        "  dimmers: META {}, idle mode {}; idle timeout {} ms; win HID 0x{:02X}; lock HID codes {}",
+        l.meta_key_background_dimmer, l.idle_mode_dimmer, l.idle_timeout_ms, l.win_key_hid_code, l.lock_key_hid_codes
+    );
+    println!("  OLED illumination options {}", l.oled_illumination_options);
+    println!("  META mapping mask {}", l.meta_mapped_elements);
+
+    match &profile.rapid_tap {
+        Some(rt) => println!(
+            "rapid tap [EXPERIMENTAL]: enable 0x{:02X}, {} key pairs",
+            rt.enable,
+            rt.pairs.len()
+        ),
+        None => println!("rapid tap: absent (schema A has no rapid-tap block)"),
+    }
+
+    for (label, block) in [("OLED", &profile.oled), ("macro", &profile.macro_data)] {
+        println!(
+            "{label}: {} bytes at offset {}, {} non-zero, FNV-1a {}, head {}",
+            block.len, block.offset, block.nonzero, block.fnv1a_64, block.head
+        );
+    }
 }
 
 async fn cmd_pollrate(action: PollrateAction) -> Result<()> {

@@ -32,6 +32,9 @@ required-features = ["sonar"]
 default = []
 audio = ["dep:libpulse-binding"]
 sonar = ["dep:reqwest"]
+# On-board profile read-back: the hardware I/O loop and its CLI subcommand. The wire format,
+# decode and JSON in `src/onboard_profile.rs` stay ungated so their tests run in every build.
+onboard = []
 
 [dependencies]
 anyhow = "1.0.104"
@@ -52,7 +55,7 @@ directories = "6.0.0"
 
 # Terminal UI
 indicatif = "0.18.6"
-libc = "0.2.190" # For root permission checks (geteuid)
+libc = "0.2.190" # Root permission checks (geteuid) and the hidraw feature-report ioctls
 libpulse-binding = { version = "2.30.1", optional = true }
 parking_lot = "0.12.5"
 

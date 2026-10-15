@@ -170,6 +170,9 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   SignalRGB research (it drives devices directly via its own plugins; no SteelSeries bytes in public docs).
 - Apex Pro TKL 2023 wired: GG capture, 84-key lighting table, 645-byte frame, interface-1 path, profile slot map
   (`WIRED_2023_PROFILE_SLOTS`), GG-engine warning. Committed in `f430380`.
+- Apex 7 on-board profile read: `onboard` feature, `src/onboard_profile.rs`,
+  `src/devices/keyboards/apex_legacy_onboard.rs`, `ssgg onboard` (2026-10-15). Read-only, `[EXPERIMENTAL]`,
+  hardware validation pending.
 - Old TODO items: clippy-ci / future-incompat errors (resolved, see Baseline); `ssgg_bug_report.json` triage
   (dropped: the file was never provided); issue #6 Arch compile (closed `not_planned`).
 - `docs/development/` consolidation (2026-10-15): capture-note "Transport" section matches the 645-byte /

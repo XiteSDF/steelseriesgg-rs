@@ -20,6 +20,10 @@ Protocol work has three states. Never mix them up or upgrade a status without ha
 | `Apex8ZoneBrightnessCommand` | `0x23` | Experimental — Apex 3 TKL brightness, from OpenRGB, untested |
 | `CommandCode::ProfileChunk` / `ProfileChunkCommand` | `0x03` (`03 01 80`) | Experimental — profile upload chunk; checksum matches captures; never sent (no read-back) |
 | `CommandCode::ActuationControl` | `0x2D` | Experimental — firmware command unknown |
+| `onboard_profile::CMD_PULL_PAYLOAD` (legacy Apex) | `0x85` | Experimental — resource-buffer pull; 121 frames seen in the 2026-10-15 GG capture, request side inferred, never sent from `ssgg` |
+| `onboard_profile::CMD_READ_PAYLOAD` (legacy Apex) | `0x83` | Experimental — payload read; 241 replies (642 bytes, header + 636 payload) seen in the same capture, never sent from `ssgg` |
+| `onboard_profile::config_frame` (legacy Apex) | pacing frame on feature report `0x00` | Experimental — `01 00 00 00 02 00 00 00 f4 01 00 00` (1 ms, read/write, 500 ms), pacing values from the capture, request layout inferred |
+| `onboard_profile::CMD_PUSH_PAYLOAD` (legacy Apex) | `0x05` | Placeholder — named for completeness; nothing sends it, there is no read-back for on-board writes |
 
 ## Rules
 
@@ -30,4 +34,5 @@ Protocol work has three states. Never mix them up or upgrade a status without ha
 **Never:** State experimental protocol as production-ready in docs or user-facing output. The `experimental-apex-2023`
 feature flag was removed on 2026-10-15; experimental paths are labelled in code and docs instead of feature-gated.
 Writes that could change persistent device state (the on-board profile) stay unwired until a read-back exists and the
-user approves the first write.
+user approves the first write. The same rule covers the legacy Apex family: `ssgg onboard` reads the
+on-board profile and writes nothing, `read` and `schema` require `--yes`, and `CMD_PUSH_PAYLOAD` stays unsent.
