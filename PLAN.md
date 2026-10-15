@@ -172,21 +172,55 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   (`WIRED_2023_PROFILE_SLOTS`), GG-engine warning. Committed in `f430380`.
 - Apex 7 on-board profile read: `onboard` feature, `src/onboard_profile.rs`,
   `src/devices/keyboards/apex_legacy_onboard.rs`, `ssgg onboard` (2026-10-15). Read-only, `[EXPERIMENTAL]`.
-  Hardware validation on 2026-10-15 got the pacing frame, the pull and the payload-read request accepted on
-  the `0xFFC1` collection, then stalled: the code asked the kernel for a 643-byte feature report, the device's
-  report is 642, so the control read never completed (the 5-second `ETIMEDOUT` in the log). Fixed: replies are
-  read as a 642-byte feature report (matching the capture's `GET_REPORT wLength 642`) with the interrupt
-  endpoint as fallback, `--device` / every collection of the same `vid:pid` is tried in interface order, the
-  probe is one attempt per step and stops after `--deadline-ms`, a page starting `FF FF FF FF` counts as
-  `garbage_reads`, and the pacing frame gets a settle gap.
-  Re-decoding the capture's URBs (not `reports.csv`, which only holds responses) settled the request shapes:
-  pull and pacing frame are output reports (`wValue 0x0200`, report number 0, 13 and 64 bytes), the payload
-  read is a feature report (`wValue 0x0300`, 642 bytes, size 512), and the answers arrive on the same control
-  pipe with a 20-byte framing block before the payload. That anchor is `--reply-header` (default 20) and
-  `ssgg onboard schema --sweep` probes it on real hardware. Not settled: the checksum region (GG's own
-  assembly does not match CRC-32/STM32 at any candidate offset) and the name offset (2 vs 18).
-  Next step needs the keyboard: `ssgg --debug onboard schema --yes --sweep`, then
-  `ssgg --debug onboard read --yes --reply-header <offset>` with the file the sweep found.
+  Hardware validation on 2026-10-15 got a pacing frame, a pull and the payload-read request accepted on
+  the `0xFFC1` collection, then stalled: the code asked the kernel for a 643-byte feature report, the
+  device's report is 642, so the control read never completed (the 5-second `ETIMEDOUT` in the log).
+  Fixed: replies are read as a 642-byte feature report (matching the capture's `GET_REPORT wLength 642`)
+  with the interrupt endpoint as fallback, `--device` / every collection of the same `vid:pid` is tried in
+  interface order, the probe is one attempt per step and stops after `--deadline-ms`, a page starting
+  `FF FF FF FF` counts as `garbage_reads`, and the chain gets a settle gap.
+  Re-decoding the capture's URBs (not `reports.csv`, which only holds responses, and not the text exports,
+  which prefix every row with the capture's own header) settled the request shapes: the pull is a 64-byte
+  output report (`wValue 0x0200`, report number 0), the payload read is a 642-byte feature report
+  (`wValue 0x0300`, size 512, 2 for the schema probe), and Step 1 of `summary.md` is six 64-byte output
+  reports 11 ms apart - `90 00`, `90 01`, `f4 00`, `6c 00 01`, `90 00`, `90 01` - answered on the
+  interrupt endpoint with the ASCII firmware version for the `90` polls. Implemented 2026-10-16 as
+  `hid_reports::ONBOARD_INIT_CHAIN` (it moved to `src/devices/hid_reports.rs` on 2026-10-17, see below):
+  the read path sends the chain once per run and prints the version,
+  `--no-init-chain` compares the same read without it, `--gap-ms` paces it (11 ms = the capture, 1 ms =
+  the old pacing word). The 13-byte "pacing frame" (`01 00 00 02 00 f4 01 60 00`) is not on the wire: it
+  came from the text export and `config_frame` was deleted.
+  The answers are 643-byte `GET_REPORT` replies, report-ID byte `03`, payload directly behind it: framing
+  0 is `READ_REPLY_FRAMING_LEN` and the `--reply-header` default (the old default 20 was the export
+  prefix). Measured from the replies: the schema word is payload offset 0 (`0b 00` = schema B) and the
+  name offset 2, and the payload-read reply is a file head, not a window - 241 reads return 33 distinct
+  payloads (179 all-zero, `0b 00` in 6, one each of `Config 1`..`Config 5`), the requested buffer and file
+  offsets do not change the answer, so no image can be assembled (CRC-32/STM32 matches nothing at any
+  candidate offset) and only the schema probe is trustworthy.
+  Windows GG vs the ssgg run of 2026-10-15 (`linux-read.pcapng`, usbmon, 1428 URBs, bus 1 device 24,
+  compared 2026-10-16): the chain, the chain answers (`4.16.8`, `00 01`, none for `6c 00 01`), the pull
+  header and the `83` header all match, and ssgg's framing (report ID = command byte, so `wValue 0x0290`/
+  `0x0285`/`0x0383` and one byte more in `wLength`) is answered exactly like GG's. The decisive difference:
+  GG issues `GET_REPORT 0xa1 0x01 wValue 0x0300 wIndex 1 wLength 642` after every one of its 241 read
+  requests and reads the window from that 643-byte control-IN data stage; the ssgg run sent **no**
+  GET_REPORT, its 612 control completes all carry zero bytes, and all it collected is 64-byte interrupt
+  status. Secondary differences, neither a blocker: ssgg sprays the chain and the pulls over interfaces
+  0-4 (GG uses interface 1 only) and its 17 read requests are byte-identical, so it never varies file or
+  window. Table: `docs/development/apex-7-onboard-profile-read.md`.
+  Done in code 2026-10-17 (hard-constraint 1 work: buffer creation moved to `src/devices/hid_reports.rs`):
+  `OnboardInitCommand` + `ONBOARD_INIT_CHAIN`, `OnboardPullCommand`, `OnboardReadCommand` and
+  `ONBOARD_OUTPUT_REPORT_SIZE` / `ONBOARD_FEATURE_REPORT_SIZE` / `ONBOARD_REPLY_REPORT_SIZE` are the only
+  place these frames are built, `apex_legacy_onboard` sends them through `HidReportBuilder::build_report`,
+  every buffer starts with report number **0** (`wValue 0x0200 wLength 64`, `wValue 0x0300 wLength 642` -
+  GG's shape, replacing `0x0290`/`0x0285`/`0x0383`), the read-back asks report number 0
+  (`READ_REPLY_ID = 0x00`, `wValue 0x0300`) and `onboard_profile` keeps plan/parse/decode only.
+  Next step (keyboard): ask the read-back of the collection that declares it - interface 1 (`0xFFC0`): the
+  kernel validates GET_REPORT against the interface's report descriptor, and interface 1 answered `EPIPE` to
+  the 2026-10-15 report-ID-framed writes. Then
+  with the keyboard: `ssgg --debug onboard schema --yes --sweep`, `ssgg --debug onboard read --yes
+  --reply-header <offset>`, and check in the capture that a control-IN transfer with 642 bytes of data
+  appears; `--no-init-chain` and `--gap-ms 1` measure what the 2026-10-15 acceptance of `83`/`85` proves
+  (GG runs the chain before every read session).
 - Old TODO items: clippy-ci / future-incompat errors (resolved, see Baseline); `ssgg_bug_report.json` triage
   (dropped: the file was never provided); issue #6 Arch compile (closed `not_planned`).
 - `docs/development/` consolidation (2026-10-15): capture-note "Transport" section matches the 645-byte /

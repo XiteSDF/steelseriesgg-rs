@@ -914,7 +914,7 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
 
             if args.sweep {
                 println!("reply framing sweep on profile slot 0 (which framing length exposes a real schema word):");
-                for header in [0usize, 5, 6, 14, 19, 20, 21, 36] {
+                for header in [0usize, 1, 2, 5, 6, 14, 19, 20, 21, 36] {
                     let probe = hw::read_schema_probe(
                         &paths,
                         wire::PROFILE_FS_BASE,
@@ -1122,16 +1122,18 @@ fn print_plan_summary(config: &ReadConfig) {
     let steps = config.steps();
     let pulls = steps.iter().filter(|s| s.kind == StepKind::Pull).count();
     let reads = steps.iter().filter(|s| s.kind == StepKind::Read).count();
-    let configs = steps.iter().filter(|s| s.kind == StepKind::Config).count();
+    let init = steps.iter().filter(|s| s.kind == StepKind::Init).count();
     let first_pull = steps.iter().find(|s| s.kind == StepKind::Pull);
     let first_read = steps.iter().find(|s| s.kind == StepKind::Read);
 
     println!();
     println!(
-        "plan: {} pacing frame(s), {pulls} pulls, {reads} payload reads, {} transfers total",
-        configs,
+        "plan: {init} opening-chain frame(s), {pulls} pulls, {reads} payload reads, {} transfers total",
         steps.len()
     );
+    for step in steps.iter().filter(|s| s.kind == StepKind::Init) {
+        println!("init frame: {}", hex_of(&step.frame[..3]));
+    }
     if let Some(step) = first_pull {
         println!("first pull:  {}", hex_of(&step.frame));
     }
@@ -1153,6 +1155,10 @@ fn print_onboard_image(image: &steelseries_gg::onboard_profile::ProfileImage, pa
     use steelseries_gg::onboard_profile::decode;
 
     println!("read {} profile bytes from {path}", image.data.len());
+    match image.firmware.as_deref() {
+        Some(firmware) => println!("firmware:  {firmware} (answered the opening-chain 0x90 poll)"),
+        None => println!("firmware:  no answer to the opening-chain 0x90 poll"),
+    }
     println!(
         "transfers: {} payload reads over {} pulls; {} bytes covered, {} short read(s)",
         image.stats.reads_read, image.stats.chunks_read, image.stats.covered_len, image.stats.short_reads
