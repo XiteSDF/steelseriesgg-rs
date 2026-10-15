@@ -171,8 +171,13 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
 - Apex Pro TKL 2023 wired: GG capture, 84-key lighting table, 645-byte frame, interface-1 path, profile slot map
   (`WIRED_2023_PROFILE_SLOTS`), GG-engine warning. Committed in `f430380`.
 - Apex 7 on-board profile read: `onboard` feature, `src/onboard_profile.rs`,
-  `src/devices/keyboards/apex_legacy_onboard.rs`, `ssgg onboard` (2026-10-15). Read-only, `[EXPERIMENTAL]`,
-  hardware validation pending.
+  `src/devices/keyboards/apex_legacy_onboard.rs`, `ssgg onboard` (2026-10-15). Read-only, `[EXPERIMENTAL]`.
+  Hardware validation on 2026-10-15: `onboard plan` works; `onboard schema` reached the keyboard (the pacing
+  frame, the pull and the 643-byte payload-read request were accepted on the `0xFFC1` collection) and then
+  looped, because the code read the answer with a control feature-report read - the Apex 7 answers on the
+  interrupt endpoint, so every read burned the kernel's 5-second control timeout. Unvalidated fix: answers
+  are read as input reports (max 1024), the probe is one attempt per step and stops after `--deadline-ms`,
+  a page starting `FF FF FF FF` is counted as `garbage_reads`, and the pacing frame gets a settle gap.
 - Old TODO items: clippy-ci / future-incompat errors (resolved, see Baseline); `ssgg_bug_report.json` triage
   (dropped: the file was never provided); issue #6 Arch compile (closed `not_planned`).
 - `docs/development/` consolidation (2026-10-15): capture-note "Transport" section matches the 645-byte /

@@ -59,6 +59,14 @@ The read reply header is `[0x83][reserved u8][buffer offset u16 LE][size u16 LE]
 follows at byte 6: 642 − 6 = 636 usable payload bytes per read, which is why GG splits a 1024-byte
 pull into two 512-byte reads.
 
+**Linux reply channel (measured 2026-10-15, Apex 7 wired, firmware `2.4.3`).** The answer arrives as one
+**input report** on the interrupt endpoint, not as a control read-back. Reading it as a feature report works
+on Windows; on Linux the same request blocks for the kernel's 5-second control timeout
+(`Connection timed out (os error 110)`) because the keyboard answers nothing on the control endpoint. So
+`apex_legacy_onboard.rs` reads the interrupt endpoint first (up to `INPUT_REPORT_MAX_LEN` = 1024, the
+collection's declared maximum input report) with a 1-second ceiling, and keeps the feature-report read as a
+fallback. Both channels carry the same `[id][reserved][offset][size]` frame.
+
 ## Procedure
 
 ```
@@ -141,3 +149,31 @@ keyboard in a state GG itself cannot repair. `read` and `schema` require `--yes`
   are not decoded, so `ssgg onboard read` only records the ack's report ID and first bytes.
 - Schema words of the five slots: `onboard schema` is the first thing to run on hardware; if a slot
   answers with a schema word the decode supports, the layout table above can be confirmed byte by byte.
+
+## Linux collection map (measured 2026-10-15)
+
+From the kernel's own hidraw `uevent` files for a wired Apex 7 (firmware `2.4.3`). Each USB interface shows
+up as its own hidraw node, and the profile-capable collection is the vendor page `0xFFC1`:
+
+| Node | Interface | Usage page | Max feature | Max input | Max output | 12-byte pacing frame |
+|------|-----------|------------|-------------|-----------|------------|----------------------|
+| `hidraw3` | 4 | `0xFFC1` | 644 | 1024 | 64 | accepted |
+| `hidraw2` | 1 | `0xFFC0` | not captured | — | — | `EPIPE` on the 13-byte write |
+| `hidraw4`, `hidraw5` | 2, 3 | `0x0001`, `0x000C` | — | — | — | `EPIPE` |
+
+Measured on `hidraw3`: the pacing frame (report id `0x00`, 12 payload bytes) is accepted; the pull (output
+report, 64 bytes) is accepted and a 64-byte input report arrives immediately behind it; the 643-byte
+`SET_REPORT` of the payload-read frame is accepted; the control read-back times out while the interrupt
+endpoint carries the answer. That collection is where the profile protocol lives, and `ssgg onboard` tries
+it first.
+
+Two behaviours of the reference implementation are implemented even though a capture cannot show them:
+
+- the first page read of a profile often comes back blanked, so `ssgg onboard read` reads both pages of a
+  pull and lets the assembled image stand on the reads that did answer;
+- a page whose first four payload bytes are `FF FF FF FF` is garbage: it is replaced with zeroes and counted
+  in `garbage_reads`.
+
+The schema probe uses one attempt per step per path (`PROBE_ATTEMPTS`) and stops after `--deadline-ms`
+(30000 ms default), so a keyboard that never answers finishes in a few seconds per path group instead of
+running for minutes.

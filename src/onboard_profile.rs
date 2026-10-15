@@ -9,15 +9,16 @@
 //! them is visible in one Windows USBPcap capture of the official GG talking to an Apex 7 (firmware
 //! 4.16.8, 2026-10-15, `ssgg-capture-1612-20261015-004400`): the capture contains 121 pulls
 //! (report `0x85`, 64-byte replies) and 241 payload reads (report `0x83`, 642-byte replies) that form
-//! the `pull, read, read` pattern described here. Nothing in this path has been replayed on hardware
-//! from this crate, and nothing here writes a profile. Treat every constant as unverified until the
-//! first Linux read-back.
+//! the `pull, read, read` pattern described here. On 2026-10-15 an Apex 7 accepted the pacing frame, the
+//! pull and the payload-read request on its vendor collection, and answered on the interrupt endpoint; the
+//! full read has not completed on hardware, and nothing here writes a profile. Treat every constant as
+//! unverified until the first Linux read-back.
 //!
 //! # Wire format
 //!
-//! All transfers run on the single HID collection of the keyboard (usage page `0xffc0`, usage
-//! `0x0001`, USB interface 1). Report numbers are embedded in the payload, so in `hidapi` terms the
-//! first byte of every buffer is the report ID.
+//! All transfers run on the keyboard's vendor collection (the Apex 7 exposes it as usage page `0xffc1` on
+//! USB interface 4, and usage page `0xffc0` on interface 1 holds the same protocol family). Report numbers
+//! are embedded in the payload, so in `hidapi` terms the first byte of every buffer is the report ID.
 //!
 //! * pacing (`HIDCONFIG`, feature report ID `0x00`, 12 bytes on the wire):
 //!   `00 | time_between_commands u32 LE | file_access u32 LE | max_usb_timeout u32 LE`,
@@ -28,8 +29,10 @@
 //!   The keyboard answers with input report `0x85` (64 bytes, contents not interpreted here).
 //! * payload read (`HIDFEATURE`, feature report ID `0x00`, 643 bytes on the wire):
 //!   `00 | 83 | 00 | offset u16 LE | size u16 LE | 00…`
-//!   — returns `size` bytes of the resource buffer. The keyboard answers with feature report `0x83`
-//!   carrying `offset` and `size` back in its header, payload from byte 6.
+//!   — returns `size` bytes of the resource buffer. The keyboard answers with a report that carries
+//!   `offset` and `size` back in its header, payload from byte 6: on Linux that answer arrives as one
+//!   input report (the collection declares a 1024-byte maximum input report); the reference capture shows
+//!   it as a 642-byte control answer.
 //!
 //! A profile file is read as `ceil((payload_len + 1023) / 1024)` resource-buffer fills
 //! ([`RESOURCE_BUFFER_LEN`] each); every fill is drained with two [`READ_LEN`]-byte payload reads at
@@ -398,6 +401,9 @@ pub struct ReadReply {
     pub data: Vec<u8>,
     /// True when every payload byte is zero.
     pub all_zero: bool,
+    /// True when the payload starts with four `FF` bytes: the reference implementation treats such a page as
+    /// garbage and replaces it with zeroes.
+    pub all_ff: bool,
 }
 
 /// Parse a payload-read reply (`reply` starts with the report ID byte) and extract its payload.
@@ -419,6 +425,7 @@ pub fn parse_read_reply(reply: &[u8], requested_size: u16) -> Result<ReadReply> 
         .min(1 + READ_REPLY_HEADER_LEN + MAX_READ_LEN);
     let data = reply[1 + READ_REPLY_HEADER_LEN..end].to_vec();
     let all_zero = data.iter().all(|b| *b == 0);
+    let all_ff = data.len() >= 4 && data[..4].iter().all(|b| *b == 0xFF);
     Ok(ReadReply {
         report_id: reply[0],
         reserved: reply[1],
@@ -426,6 +433,7 @@ pub fn parse_read_reply(reply: &[u8], requested_size: u16) -> Result<ReadReply> 
         size,
         data,
         all_zero,
+        all_ff,
     })
 }
 
@@ -498,6 +506,8 @@ pub struct ReadStats {
     pub zero_chunks: usize,
     /// Reads that returned fewer bytes than requested.
     pub short_reads: usize,
+    /// Reads whose payload started with four `FF` bytes and was stored as zeroes.
+    pub garbage_reads: usize,
     /// File bytes covered by the pulls.
     pub covered_len: usize,
 }
@@ -529,6 +539,7 @@ impl ProfileImage {
         let mut zero_reads = 0usize;
         let mut zero_chunks = 0usize;
         let mut short_reads = 0usize;
+        let mut garbage_reads = 0usize;
 
         for record in &chunks {
             if record.all_zero() {
@@ -559,13 +570,21 @@ impl ProfileImage {
                     continue;
                 }
                 let end = cursor + reply.data.len();
-                if end > config.payload_len {
+                if reply.all_ff {
+                    // A page whose first four bytes are FF is garbage from the device's point of view; the
+                    // reference implementation replaces it with zeroes and so do we.
+                    garbage_reads += 1;
+                    let room = config.payload_len.saturating_sub(cursor);
+                    data[cursor..cursor + room].fill(0);
+                    cursor += room;
+                } else if end > config.payload_len {
                     let room = config.payload_len.saturating_sub(cursor);
                     data[cursor..cursor + room].copy_from_slice(&reply.data[..room]);
+                    cursor += room;
                 } else {
                     data[cursor..end].copy_from_slice(&reply.data);
+                    cursor = end;
                 }
-                cursor = end;
             }
         }
 
@@ -585,6 +604,7 @@ impl ProfileImage {
                 zero_reads,
                 zero_chunks,
                 short_reads,
+                garbage_reads,
                 covered_len,
             },
             chunks,
@@ -1208,6 +1228,16 @@ mod tests {
         assert_eq!(parsed.data.len(), 512);
         assert_eq!(parsed.data[0], 1);
         assert!(!parsed.all_zero);
+        assert!(!parsed.all_ff);
+    }
+
+    #[test]
+    fn a_page_starting_with_four_ff_bytes_is_counted_as_garbage() {
+        let mut reply = vec![0x83u8, 0x00, 0x00, 0x00, 0x00, 0x04];
+        reply.extend([0xFFu8, 0xFF, 0xFF, 0xFF, 0x01, 0x02]);
+        let parsed = parse_read_reply(&reply, 6).unwrap();
+        assert!(parsed.all_ff);
+        assert!(!parsed.all_zero);
     }
 
     fn reply_report(prefix: [u8; 6], fill: u8, len: usize) -> Vec<u8> {
@@ -1266,6 +1296,7 @@ mod tests {
                         size: config.read_len as u16,
                         data: vec![(chunk * 8 + read + 1) as u8; config.read_len],
                         all_zero: false,
+                        all_ff: false,
                     })
                     .collect(),
             })
@@ -1306,6 +1337,7 @@ mod tests {
                     size: 512,
                     data: vec![0xAA_u8; 512],
                     all_zero: false,
+                    all_ff: false,
                 })
                 .collect(),
         };
@@ -1456,6 +1488,7 @@ mod tests {
                                     offset: (read * READ_LEN) as u16,
                                     size: READ_LEN as u16,
                                     all_zero: data_slice.iter().all(|b| *b == 0),
+                                    all_ff: false,
                                     data: data_slice,
                                 }
                             })
@@ -1500,6 +1533,7 @@ mod tests {
                     size: READ_LEN as u16,
                     data: vec![if i == 3 { first } else { 0u8 }; READ_LEN],
                     all_zero: i != 3,
+                    all_ff: false,
                 })
                 .collect(),
         };

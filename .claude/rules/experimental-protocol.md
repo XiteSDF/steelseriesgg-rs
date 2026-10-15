@@ -20,9 +20,9 @@ Protocol work has three states. Never mix them up or upgrade a status without ha
 | `Apex8ZoneBrightnessCommand` | `0x23` | Experimental — Apex 3 TKL brightness, from OpenRGB, untested |
 | `CommandCode::ProfileChunk` / `ProfileChunkCommand` | `0x03` (`03 01 80`) | Experimental — profile upload chunk; checksum matches captures; never sent (no read-back) |
 | `CommandCode::ActuationControl` | `0x2D` | Experimental — firmware command unknown |
-| `onboard_profile::CMD_PULL_PAYLOAD` (legacy Apex) | `0x85` | Experimental — resource-buffer pull; 121 frames seen in the GG capture, request side inferred, never sent from `ssgg` |
-| `onboard_profile::CMD_READ_PAYLOAD` (legacy Apex) | `0x83` | Experimental — payload read; 241 replies (642 bytes, header + 636 payload) seen in the same capture, never sent from `ssgg` |
-| `onboard_profile::config_frame` (legacy Apex) | pacing frame on feature report `0x00` | Experimental — `01 00 00 …` (1 ms, read/write, 500 ms), pacing values from the capture, request layout inferred |
+| `onboard_profile::CMD_PULL_PAYLOAD` (legacy Apex) | `0x85` | Experimental — resource-buffer pull; 121 frames seen in the GG capture, request side inferred; accepted on an Apex 7 `0xFFC1` collection on 2026-10-15 (ack read on the interrupt endpoint) |
+| `onboard_profile::CMD_READ_PAYLOAD` (legacy Apex) | `0x83` | Experimental — payload read; 241 replies (642 bytes, header + 636 payload) seen in the same capture; request accepted on an Apex 7 on 2026-10-15, answer arrives as an input report (control read-back times out on Linux); full read never completed on hardware |
+| `onboard_profile::config_frame` (legacy Apex) | pacing frame on feature report `0x00` | Experimental — `01 00 00 …` (1 ms, read/write, 500 ms), pacing values from the capture, request layout inferred; accepted on the Apex 7 `0xFFC1` collection on 2026-10-15, `EPIPE` on the other collections |
 | `onboard_profile::CMD_PUSH_PAYLOAD` (legacy Apex) | `0x05` | Placeholder — named for completeness; nothing sends it, there is no read-back for on-board writes |
 
 ## Rules

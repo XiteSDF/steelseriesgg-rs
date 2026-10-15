@@ -902,8 +902,14 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
                 return Err(Error::Other("the on-board profile read needs a device".to_string()));
             };
             let paths = onboard_paths(manager, &args.device, STEELSERIES_VENDOR_ID, APEX_7)?;
+            let deadline = (args.deadline_ms > 0).then(|| Duration::from_millis(args.deadline_ms));
             print_onboard_banner();
             println!("device paths to try: {}", paths.join(", "));
+            println!(
+                "probing with a {} ms budget per group of files{}",
+                args.deadline_ms,
+                if deadline.is_some() { "" } else { " (no limit)" }
+            );
             println!();
 
             let mut rows: Vec<serde_json::Value> = Vec::new();
@@ -911,7 +917,7 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
 
             for slot in 0..=hw::MAX_PROFILE_INDEX_FOR_READ {
                 let fs_id = wire::PROFILE_FS_BASE + u16::from(slot);
-                match hw::read_schema(&paths, slot, args.gap_ms, args.strict).await {
+                match hw::read_schema(&paths, slot, args.gap_ms, args.strict, deadline).await {
                     Ok((word, raw, path)) => {
                         let payload = payload_len_for_schema(word).ok();
                         println!(
@@ -944,7 +950,7 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
             }
 
             for fs_id in [wire::LIGHTING_FS_SHARED, wire::LIGHTING_FS_BASE] {
-                match hw::read_schema_file(&paths, fs_id, args.gap_ms, args.strict).await {
+                match hw::read_schema_file(&paths, fs_id, args.gap_ms, args.strict, deadline).await {
                     Ok((word, raw, path)) => {
                         println!(
                             "lighting file {fs_id:04X}: schema {word:04X} raw {} ({path})  [EXPERIMENTAL]",
@@ -1122,8 +1128,8 @@ fn print_onboard_image(image: &steelseries_gg::onboard_profile::ProfileImage, pa
         image.stats.reads_read, image.stats.chunks_read, image.stats.covered_len, image.stats.short_reads
     );
     println!(
-        "replies: {} header mismatch(es), {} all-zero read(s), {} all-zero pull(s)",
-        image.stats.header_mismatches, image.stats.zero_reads, image.stats.zero_chunks
+        "replies: {} header mismatch(es), {} all-zero read(s), {} all-zero pull(s), {} garbage page(s)",
+        image.stats.header_mismatches, image.stats.zero_reads, image.stats.zero_chunks, image.stats.garbage_reads
     );
     match decode(&image.data) {
         Ok(profile) => print_onboard_profile(&profile),
