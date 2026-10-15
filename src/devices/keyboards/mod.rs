@@ -1,6 +1,8 @@
 //! Keyboard device support (Apex series).
 
 pub mod apex;
+#[cfg(feature = "onboard")]
+pub mod apex_legacy_onboard;
 pub mod apex_pro_tkl_2023;
 pub mod apex_pro_tkl_2023_profile;
 

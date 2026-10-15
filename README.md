@@ -327,6 +327,30 @@ Run HID report fuzzing (development tool):
 ssgg fuzz
 ```
 
+### On-board profile read (feature `onboard`, `[EXPERIMENTAL]`)
+
+Reads the profile a legacy Apex keyboard keeps in its own flash (Apex 7, Apex Raw, Apex 2014).
+The protocol is reverse-engineered from a GG capture and has never been replayed on hardware,
+so the two subcommands that touch the keyboard require `--yes`. The code reads only: it never writes the
+on-board profile. Format and open questions: [docs/development/apex-7-onboard-profile-read.md](docs/development/apex-7-onboard-profile-read.md).
+
+```bash
+cargo build --release --features onboard
+
+# no hardware touched: prints the 37-transfer plan of one profile read
+ssgg onboard plan
+
+# no hardware touched: decode a profile image saved by an earlier read
+ssgg onboard decode /tmp/p0.bin --json /tmp/p0.json
+
+# talk to the keyboard (experimental, needs confirmation)
+ssgg onboard schema --yes
+ssgg onboard read --yes --profile 0 --out /tmp/p0.bin --json /tmp/p0.json
+```
+
+On Linux the read needs write access to the keyboard's control-collection `/dev/hidraw` node (the udev
+rule in `assets/99-steelseries.rules` grants it to the `input` group).
+
 ## Configuration
 
 Configuration is stored in `~/.config/ssgg/config.toml`:
@@ -351,6 +375,8 @@ debug = false
 
 - `audio` - Enable audio mixer with PulseAudio/PipeWire support
 - `sonar` - Enable SteelSeries Sonar API integration
+- `onboard` - Enable the `[EXPERIMENTAL]` read of the on-board profile of a legacy Apex keyboard (Apex 7
+ , Apex Raw, Apex 2014); adds `ssgg onboard`. Read-only, never writes the profile
 
 By default, no optional features are enabled. The Arch package ships with default features only.
 

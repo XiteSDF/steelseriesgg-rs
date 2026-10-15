@@ -70,7 +70,7 @@ Lighting is the only part replayed from `ssgg` so far (one solid red, 2026-10-14
 Writing the profile is blocked on the checksum at blob offset 12320..12323.
 
 1. ~~**Solve the checksum.**~~ Solved 2026-10-15: STM32 CRC-32 over `0..12320` as LE words, 26/26 blobs match
-   (capture note, "Checksum"). Original notes follow. Inputs: `C:\Users\Ven0m0\gg-capture-artifacts\blobs.bin` (13 blobs) and `blobs3.bin`
+   (capture note, "Checksum"). Original notes follow. Inputs: `the artifact kit's blobs.bin` (13 blobs) and `blobs3.bin`
    (19 blobs), 12,500 bytes each. Already ruled out: 10 common CRC32 polynomials (all init/xor/reflection),
    Adler-32, byte sum, over ranges starting 0/1/2/4/9 and ending 12320/12324/12500. Next approaches, in order:
    - Static RE of `C:\Program Files\SteelSeries\GG\apps\engine\SteelSeriesEngine.exe` (Go) and `SSEdevice.dll`:
@@ -170,6 +170,9 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   SignalRGB research (it drives devices directly via its own plugins; no SteelSeries bytes in public docs).
 - Apex Pro TKL 2023 wired: GG capture, 84-key lighting table, 645-byte frame, interface-1 path, profile slot map
   (`WIRED_2023_PROFILE_SLOTS`), GG-engine warning. Committed in `f430380`.
+- Apex 7 on-board profile read: `onboard` feature, `src/onboard_profile.rs`,
+  `src/devices/keyboards/apex_legacy_onboard.rs`, `ssgg onboard` (2026-10-15). Read-only, `[EXPERIMENTAL]`,
+  hardware validation pending.
 - Old TODO items: clippy-ci / future-incompat errors (resolved, see Baseline); `ssgg_bug_report.json` triage
   (dropped: the file was never provided); issue #6 Arch compile (closed `not_planned`).
 - `docs/development/` consolidation (2026-10-15): capture-note "Transport" section matches the 645-byte /

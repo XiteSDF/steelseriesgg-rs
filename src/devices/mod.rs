@@ -303,14 +303,262 @@ pub fn send_feature_report_raw(hidraw_path: &str, data: &[u8], report_len: usize
 }
 
 #[cfg(unix)]
+/// Read a HID feature report by opening the hidraw device path directly.
+///
+/// `HIDIOCGFEATURE` is `_IOWR('H', 0x07, size)`, so the write path above and this read use the same
+/// direction bits. hidapi 2.6.7 exposes no feature-report getter on Linux at all, so the ioctl is the
+/// only way to collect a reply for a 645-byte feature report.
+///
+/// `report_len` includes the leading report-ID byte, which the kernel expects to find in `buf[0]`
+/// and returns unchanged.
+pub fn read_feature_report_raw(hidraw_path: &str, report_id: u8, report_len: usize) -> Result<Vec<u8>> {
+    use std::fs::OpenOptions;
+    use std::os::unix::io::AsRawFd;
+    use tracing::debug;
+
+    if report_len < 2 {
+        return Err(Error::DeviceCommunication(format!(
+            "Feature report size {report_len} cannot hold a report ID byte and any data"
+        )));
+    }
+
+    let mut report = vec![report_id; report_len];
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(hidraw_path)
+        .map_err(|e| Error::DeviceCommunication(format!("Failed to open {hidraw_path}: {e}")))?;
+
+    let fd = file.as_raw_fd();
+    // HIDIOCGFEATURE = _IOWR('H', 0x07, size) = (3 << 30) | (size << 16) | ('H' << 8) | 0x07
+    let ioctl_code: libc::c_ulong =
+        (3 << 30) | ((report_len as libc::c_ulong) << 16) | ((b'H' as libc::c_ulong) << 8) | 0x07;
+
+    // Safety: `report` is exactly `report_len` bytes and that size is encoded in the ioctl, so the
+    // kernel writes within the buffer; `file` keeps the descriptor alive for the call.
+    let received = unsafe { libc::ioctl(fd, ioctl_code, report.as_mut_ptr()) };
+    if received < 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(Error::DeviceCommunication(format!(
+            "HID feature report read on {hidraw_path} failed: {err}"
+        )));
+    }
+
+    let len = usize::try_from(received).unwrap_or(report_len).min(report_len);
+    report.truncate(len);
+    debug!(
+        "Read HID feature report via {}: requested={}, received={}",
+        hidraw_path, report_len, len
+    );
+
+    Ok(report)
+}
+
+#[cfg(unix)]
+/// Send an output report on a hidraw path.
+///
+/// `data[0]` is the report ID the kernel expects (0 for the legacy Apex collections), so the report on
+/// the wire is `data.len() - 1` bytes.
+pub fn write_output_report_raw(hidraw_path: &str, data: &[u8]) -> Result<()> {
+    use std::fs::OpenOptions;
+    use std::io::Write as _;
+    use tracing::debug;
+
+    if data.len() < 2 {
+        return Err(Error::DeviceCommunication(format!(
+            "output report of {} bytes has no room for a report ID byte and any payload",
+            data.len()
+        )));
+    }
+
+    debug!(
+        "Sending HID output report via {}: len={}, cmd={:#04x}",
+        hidraw_path,
+        data.len() - 1,
+        data[1]
+    );
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(hidraw_path)
+        .map_err(|e| Error::DeviceCommunication(format!("Failed to open {hidraw_path}: {e}")))?;
+    file.write_all(data)
+        .map_err(|e| Error::DeviceCommunication(format!("Output report write on {hidraw_path} failed: {e}")))?;
+
+    Ok(())
+}
+
+#[cfg(unix)]
+/// Read one input report from a hidraw path, waiting up to `timeout_ms`.
+///
+/// `poll` gates the blocking read; hidraw returns one report per `read` call, prefixed with the report
+/// ID byte.
+pub fn read_input_report_raw(hidraw_path: &str, report_len: usize, timeout_ms: u64) -> Result<Vec<u8>> {
+    use std::fs::File;
+    use std::os::unix::io::AsRawFd;
+    use tracing::debug;
+
+    let mut buffer = vec![0u8; report_len.max(1)];
+
+    let file = File::open(hidraw_path)
+        .map_err(|e| Error::DeviceCommunication(format!("Failed to open {hidraw_path}: {e}")))?;
+    let fd = file.as_raw_fd();
+
+    let mut poll_fd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout = i32::try_from(timeout_ms).unwrap_or(i32::MAX);
+
+    // Safety: `poll` only reads and writes `poll_fd`, `fd` is a live descriptor owned by `file`, and
+    // `poll` never touches the descriptor itself.
+    let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout) };
+    if ready < 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(Error::DeviceCommunication(format!(
+            "poll on {hidraw_path} failed: {err}"
+        )));
+    }
+    if ready == 0 {
+        return Err(Error::DeviceCommunication(format!(
+            "no input report on {hidraw_path} within {timeout_ms} ms"
+        )));
+    }
+
+    // Safety: reading into `buffer`, whose length is passed to `read`.
+    let received = unsafe { libc::read(fd, buffer.as_mut_ptr().cast::<libc::c_void>(), buffer.len()) };
+    if received < 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(Error::DeviceCommunication(format!(
+            "input report read on {hidraw_path} failed: {err}"
+        )));
+    }
+
+    let len = usize::try_from(received).unwrap_or(buffer.len()).min(buffer.len());
+    buffer.truncate(len);
+    debug!(
+        "Read HID input report via {}: requested={}, received={}",
+        hidraw_path, report_len, len
+    );
+
+    Ok(buffer)
+}
+
+#[cfg(unix)]
+/// List the hidraw nodes of one vendor/product pair, ordered by USB interface number.
+///
+/// Used to probe which collection answers the vendor feature-report protocol when discovery's control
+/// collection does not.
+pub fn list_hidraw_paths(vendor_id: u16, product_id: u16) -> Vec<String> {
+    use std::fs;
+
+    let target_hid_id = format!("0003:{:08X}:{:08X}", vendor_id as u32, product_id as u32);
+    let mut found: Vec<(u32, String)> = Vec::new();
+
+    let Ok(dir) = fs::read_dir("the device sysfs path") else {
+        return Vec::new();
+    };
+    for entry in dir.flatten() {
+        let uevent_path = entry.path().join("device/uevent");
+        let Ok(content) = fs::read_to_string(&uevent_path) else {
+            continue;
+        };
+        if !content.lines().any(|l| {
+            l.strip_prefix("HID_ID=")
+                .is_some_and(|v| v.eq_ignore_ascii_case(&target_hid_id))
+        }) {
+            continue;
+        }
+        let interface = content
+            .lines()
+            .find_map(|l| l.strip_prefix("HID_PHYS="))
+            .and_then(interface_from_phys)
+            .unwrap_or(u32::MAX);
+        let name = entry.file_name();
+        found.push((interface, format!("/dev/{}", name.to_string_lossy())));
+    }
+
+    found.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    found.into_iter().map(|(_, path)| path).collect()
+}
+
+/// Parse the USB interface number out of a hidraw `HID_PHYS` string
+/// (`"usb-0:1.91:1.0/input7/1"` -> `1`). Linux appends the interface after the `input` node.
+#[cfg(unix)]
+fn interface_from_phys(phys: &str) -> Option<u32> {
+    let last = phys.rsplit('/').next()?;
+    if let Some(number) = last.strip_prefix("input") {
+        return number.parse().ok();
+    }
+    last.parse().ok()
+}
+
+#[cfg(not(unix))]
+/// List the HID device nodes of one vendor/product pair, ordered the way discovery picks a control
+/// collection: vendor-defined usage pages first (`STEELSERIES_CONTROL_USAGE_PAGE` above other
+/// vendor pages), then by interface number.
+pub fn list_hidraw_paths(vendor_id: u16, product_id: u16) -> Vec<String> {
+    let Ok(api) = hidapi::HidApi::new() else {
+        return Vec::new();
+    };
+
+    let mut found: Vec<(u32, u32, String)> = Vec::new();
+    for dev_info in api.device_list() {
+        if dev_info.vendor_id() != vendor_id || dev_info.product_id() != product_id {
+            continue;
+        }
+        let Some(path) = dev_info.path().to_str().map(str::to_owned) else {
+            continue;
+        };
+        found.push((
+            usage_page_score(dev_info.usage_page()),
+            dev_info.interface_number(),
+            path,
+        ));
+    }
+
+    found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)).then_with(|| a.2.cmp(&b.2)));
+    found.into_iter().map(|(_, _, path)| path).collect()
+}
+
+#[cfg(not(unix))]
+fn usage_page_score(usage_page: u16) -> u32 {
+    if usage_page == STEELSERIES_CONTROL_USAGE_PAGE {
+        2
+    } else if usage_page >= 0xFF00 {
+        1
+    } else {
+        0
+    }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn interface_from_phys_reads_the_trailing_interface() {
+    assert_eq!(interface_from_phys("usb-0:1.91:1.0/input7/1"), Some(1));
+    assert_eq!(interface_from_phys("usb-0:1.91:1.0/input7/3"), Some(3));
+    assert_eq!(interface_from_phys("usb-0:1.91:1.0/input7"), Some(7));
+    assert_eq!(interface_from_phys("usb-0:1.91:1.0/input7/x"), None);
+}
+
+#[cfg(all(test, not(unix)))]
+#[test]
+fn usage_page_score_prefers_the_control_page() {
+    assert!(usage_page_score(STEELSERIES_CONTROL_USAGE_PAGE) > usage_page_score(0xFFC1));
+    assert!(usage_page_score(0xFFC1) > usage_page_score(0x01));
+}
+
+#[cfg(unix)]
 /// Find the hidraw device path for a specific USB interface of a device.
-/// Scans /sys/class/hidraw/ to match vendor_id, product_id, and input number.
+/// Scans the device sysfs path to match vendor_id, product_id, and input number.
 pub fn find_hidraw_for_interface(vendor_id: u16, product_id: u16, interface: usize) -> Option<String> {
     use std::fs;
     let target_phys_suffix = format!("/input{interface}");
     let target_hid_id = format!("0003:{:08X}:{:08X}", vendor_id as u32, product_id as u32);
 
-    for entry in fs::read_dir("/sys/class/hidraw").ok()? {
+    for entry in fs::read_dir("the device sysfs path").ok()? {
         let Ok(entry) = entry else { continue };
         let uevent_path = entry.path().join("device/uevent");
         let Ok(content) = fs::read_to_string(&uevent_path) else {
@@ -410,6 +658,42 @@ pub fn send_feature_report_raw(device_path: &str, data: &[u8], report_len: usize
         .send_feature_report(&report)
         .map_err(|e| Error::DeviceCommunication(format!("Feature report failed on {device_path}: {e}")))?;
     Ok(())
+}
+
+#[cfg(not(unix))]
+/// Read a HID feature report using hidapi.
+/// On Linux the raw ioctl path is used instead; hidapi's Windows backend reads feature reports
+/// correctly. `report_len` includes the leading report-ID byte, seeded into `buf[0]`.
+pub fn read_feature_report_raw(device_path: &str, report_id: u8, report_len: usize) -> Result<Vec<u8>> {
+    use std::ffi::CString;
+    use tracing::debug;
+
+    if report_len < 2 {
+        return Err(Error::DeviceCommunication(format!(
+            "Feature report size {report_len} cannot hold a report ID byte and any data"
+        )));
+    }
+
+    let api = hidapi::HidApi::new().map_err(|e| Error::DeviceCommunication(format!("Failed to init HID API: {e}")))?;
+    let path =
+        CString::new(device_path).map_err(|e| Error::DeviceCommunication(format!("Invalid device path: {e}")))?;
+    let device = api
+        .open_path(&path)
+        .map_err(|e| Error::DeviceCommunication(format!("Failed to open {device_path}: {e}")))?;
+
+    let mut report = vec![report_id; report_len];
+    let received = device
+        .get_feature_report(&mut report)
+        .map_err(|e| Error::DeviceCommunication(format!("Feature report read on {device_path}: {e}")))?;
+
+    let len = received.min(report_len);
+    report.truncate(len);
+    debug!(
+        "Read HID feature report via hidapi {}: requested={}, received={}",
+        device_path, report_len, len
+    );
+
+    Ok(report)
 }
 
 /// HID vendor-defined usage page used by the SteelSeries control (RGB/actuation) collection.
@@ -637,6 +921,75 @@ pub fn zone_count_for_product_id(product_id: u16) -> usize {
         APEX_PRO | APEX_PRO_TKL | APEX_5 | APEX_7 | APEX_7_TKL | APEX_150 => 1,
         _ => 1,
     }
+}
+
+#[cfg(not(unix))]
+/// Send an output report using hidapi. On Linux the hidraw write path is used instead.
+///
+/// `data[0]` is the report ID, matching hidapi's output-report convention.
+pub fn write_output_report_raw(device_path: &str, data: &[u8]) -> Result<()> {
+    use std::ffi::CString;
+    use tracing::debug;
+
+    if data.len() < 2 {
+        return Err(Error::DeviceCommunication(format!(
+            "output report of {} bytes has no room for a report ID byte and any payload",
+            data.len()
+        )));
+    }
+
+    debug!(
+        "Sending HID output report via hidapi {}: len={}, cmd={:#04x}",
+        device_path,
+        data.len() - 1,
+        data[1]
+    );
+
+    let api = hidapi::HidApi::new().map_err(|e| Error::DeviceCommunication(format!("Failed to init HID API: {e}")))?;
+    let path =
+        CString::new(device_path).map_err(|e| Error::DeviceCommunication(format!("Invalid device path: {e}")))?;
+    let device = api
+        .open_path(&path)
+        .map_err(|e| Error::DeviceCommunication(format!("Failed to open {device_path}: {e}")))?;
+    let written = device
+        .write(data)
+        .map_err(|e| Error::DeviceCommunication(format!("Output report write on {device_path} failed: {e}")))?;
+    if written != data.len() {
+        return Err(Error::DeviceCommunication(format!(
+            "output report write on {device_path} accepted {written} of {} bytes",
+            data.len()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+/// Read one input report using hidapi with a timeout. On Linux the hidraw read path is used instead.
+pub fn read_input_report_raw(device_path: &str, report_len: usize, timeout_ms: u64) -> Result<Vec<u8>> {
+    use std::ffi::CString;
+    use tracing::debug;
+
+    let api = hidapi::HidApi::new().map_err(|e| Error::DeviceCommunication(format!("Failed to init HID API: {e}")))?;
+    let path =
+        CString::new(device_path).map_err(|e| Error::DeviceCommunication(format!("Invalid device path: {e}")))?;
+    let device = api
+        .open_path(&path)
+        .map_err(|e| Error::DeviceCommunication(format!("Failed to open {device_path}: {e}")))?;
+
+    let mut buffer = vec![0u8; report_len.max(1)];
+    let timeout = i32::try_from(timeout_ms).unwrap_or(i32::MAX);
+    let received = device
+        .read_timeout(&mut buffer, timeout)
+        .map_err(|e| Error::DeviceCommunication(format!("input report read on {device_path} failed: {e}")))?;
+
+    let len = received.min(buffer.len());
+    buffer.truncate(len);
+    debug!(
+        "Read HID input report via hidapi {}: requested={}, received={}",
+        device_path, report_len, len
+    );
+
+    Ok(buffer)
 }
 
 #[cfg(test)]

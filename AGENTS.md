@@ -162,8 +162,8 @@ was replayed from `ssgg` (one solid colour, see below).
 ### Windows reverse-engineering environment
 
 - Tools: Wireshark (`C:\Program Files\Wireshark\tshark.exe`), USBPcap (`C:\Program Files\USBPcap\USBPcapCMD.exe`).
-  `USBPcapCMD` without arguments is interactive and hangs; always pass `-d \\.\USBPcap1 -o <file> -A`.
-- The keyboard was USB device address 3 in past captures; re-check with tshark after changing ports.
+  `USBPcapCMD` without arguments is interactive and hangs; always pass `-d \\.\<capture device> -o <file> -A`.
+- The keyboard was the captured USB address in past captures; re-check with tshark after changing ports.
 - Useful tshark fields: `-e frame.time_epoch -e usb.data_fragment`; filter
   `usb.setup.bRequest==9 && usb.bmRequestType==0x21 && usb.setup.wValue==0x0300` (or `0x0200` for output reports).
 - Stop GG: kill every `SteelSeries*` process, or the engine respawns. Restart from `C:\Program Files\SteelSeries\GG`
@@ -171,9 +171,9 @@ was replayed from `ssgg` (one solid colour, see below).
   (`SteelSeriesGG.exe` alone exits with code 2).
 - Do not launch GUI capture prompters with `-WindowStyle Hidden`; it hides the form.
 - `ctx_execute_file` refuses paths outside the project; run analysis scripts with `python -I <script> <args>`.
-- Capture artifacts (outside the repo) in `C:\Users\Ven0m0\gg-capture-artifacts\`: `blobs.bin` / `blobs3.bin`
+- Capture artifacts (outside the repo) in the artifact kit: `blobs.bin` / `blobs3.bin`
   (reassembled 12,500-byte profile blobs, 13 each, 8 distinct) and `profile_crc_check.py <blob files>`. The original
-  pcaps (`run2.pcap`, `run3.pcap`), step CSVs, `an*.py` scripts and capture prompters were gone on 2026-10-15; the
+  pcaps (engine capture 2, engine capture 3), step CSVs, `an*.py` scripts and capture prompters were gone on 2026-10-15; the
   blobs were recovered from an old session scratchpad.
 
 ---
