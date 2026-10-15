@@ -35,8 +35,10 @@ wIndex 1 wLength 642` after every read request and takes the window from that co
 run sent none, so it collected nothing but 64-byte interrupt status. That is step 1a.
 
 1. **[HW] Path probe (Linux, Apex 7, GG stopped):** `ssgg onboard schema --yes`. It answers "is the
-   profile protocol on the control collection?" If every candidate path times out, the protocol is on a
-   different collection and the ranking in `apex_legacy_onboard::candidate_paths` is wrong.
+   profile protocol on the interface-1 collection GG uses?" (`apex_legacy_onboard::candidate_paths` tries
+   the discovery path, then interface 1). If every candidate path times out, this box answers elsewhere -
+   the 2026-10-15 probe answered on interface 4 (`the hidraw node`, `0xFFC1`) - and the probe needs an
+   explicit `--device /dev/hidrawN`.
 1a. **[HW] Feature-report read-back:** the read path must ask for the reply the way GG does — report
    number **0**, 642 bytes, on the interface-1 collection. `HIDIOCGFEATURE` builds `wValue` from the
    buffer's first byte, and since 2026-10-17 every report buffer built in `src/devices/hid_reports.rs`

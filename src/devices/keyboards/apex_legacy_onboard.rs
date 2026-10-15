@@ -46,9 +46,10 @@
 
 use std::time::{Duration, Instant};
 
+use crate::devices::find_hidraw_for_interface;
 #[cfg(unix)]
 use crate::devices::{
-    list_hidraw_paths, read_feature_report_raw, read_input_report_raw, send_feature_report_raw, write_output_report_raw,
+    read_feature_report_raw, read_input_report_raw, send_feature_report_raw, write_output_report_raw,
 };
 
 /// Windows/macOS transport: hidapi has the same control transfers, so the frames and replies are
@@ -63,16 +64,6 @@ mod wire_shim {
             .map_err(|_| Error::InvalidConfig("device path contains a NUL byte".to_string()))?;
         api.open_path(&c_path)
             .map_err(|e| Error::DeviceCommunication(format!("cannot open {path}: {e}")))
-    }
-
-    pub fn list_hidraw_paths(vendor_id: u16, product_id: u16) -> Vec<String> {
-        let Ok(api) = hidapi::HidApi::new() else {
-            return Vec::new();
-        };
-        api.device_paths()
-            .filter(|info| info.vendor_id() == vendor_id && info.product_id() == product_id)
-            .map(|info| info.path().to_string_lossy().into_owned())
-            .collect()
     }
 
     pub fn write_output_report_raw(path: &str, buffer: &[u8]) -> Result<()> {
@@ -118,9 +109,7 @@ use crate::onboard_profile::{
     SCHEMA_READ_LEN, hex_of, parse_firmware_version, parse_read_reply_at, reply_mismatch, schema_of,
 };
 #[cfg(not(unix))]
-use wire_shim::{
-    list_hidraw_paths, read_feature_report_raw, read_input_report_raw, send_feature_report_raw, write_output_report_raw,
-};
+use wire_shim::{read_feature_report_raw, read_input_report_raw, send_feature_report_raw, write_output_report_raw};
 
 /// Highest profile slot this read supports.
 pub const MAX_PROFILE_INDEX_FOR_READ: u8 = MAX_PROFILE_INDEX;
@@ -546,15 +535,21 @@ fn write_feature_command<C: HidCommand>(path: &str, command: C) -> Result<()> {
     send_feature_report_raw(path, &buffer, ONBOARD_FEATURE_REPORT_SIZE)
 }
 
-/// Device paths to try for a profile read: the caller's preferred collection first, then every other
-/// collection of the same device, ordered by USB interface number.
+/// USB interface the profile transfers run on: every `SET_REPORT` and `GET_REPORT` of the reference
+/// capture carries `wIndex 1`, the control collection (`0xFFC0`) GG opens for profile traffic.
+const PROFILE_INTERFACE: usize = 1;
+
+/// Device paths to try for a profile read: the caller's preferred collection first, then the
+/// [`PROFILE_INTERFACE`] collection of the same device, which is where the capture shows the profile
+/// transfers running. On Windows the interface number cannot pick a collection, so
+/// [`find_hidraw_for_interface`] ranks by usage page there and returns the control collection.
 #[must_use]
 pub fn candidate_paths(preferred: Option<&str>, vendor_id: u16, product_id: u16) -> Vec<String> {
     let mut paths: Vec<String> = Vec::new();
     if let Some(path) = preferred {
         paths.push(path.to_string());
     }
-    for path in list_hidraw_paths(vendor_id, product_id) {
+    if let Some(path) = find_hidraw_for_interface(vendor_id, product_id, PROFILE_INTERFACE) {
         if !paths.contains(&path) {
             paths.push(path);
         }

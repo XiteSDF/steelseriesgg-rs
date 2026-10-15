@@ -21,8 +21,11 @@ traffic; the counts below are from that file. On the Linux box used for the hard
 (same keyboard family, firmware `2.4.3`) the collection that accepts the same frames is
 `the hidraw node`, usage page `0xFFC1`, interface 4, `max_report_size 644`, `max_input_report 1024`,
 `max_output_report 64`. `/dev/hidrawN` numbers are not enumeration order, so `ssgg onboard` takes a
-`--device` node first, then every other collection of the same `vid:pid`, ordered by interface number,
-and stops at the first one that answers.
+`--device` node first, then the **interface 1** collection of the same `vid:pid` (every profile transfer
+in the capture carries `wIndex 1`), and stops at the first one that answers. That 2026-10-15 box accepted
+the frames on interface 4, so a box whose frames are accepted on another collection needs an explicit
+`--device /dev/hidrawN`; on Windows the interface number cannot pick a collection and
+`find_hidraw_for_interface` ranks by usage page (`0xFFC0` first) there.
 
 | Transfer | Control setup (from the capture) | Frame bytes (data stage) |
 |----------|------------------------------|------------------------|

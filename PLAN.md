@@ -213,7 +213,12 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   place these frames are built, `apex_legacy_onboard` sends them through `HidReportBuilder::build_report`,
   every buffer starts with report number **0** (`wValue 0x0200 wLength 64`, `wValue 0x0300 wLength 642` -
   GG's shape, replacing `0x0290`/`0x0285`/`0x0383`), the read-back asks report number 0
-  (`READ_REPLY_ID = 0x00`, `wValue 0x0300`) and `onboard_profile` keeps plan/parse/decode only.
+  (`READ_REPLY_ID = 0x00`, `wValue 0x0300`) and `onboard_profile` keeps plan/parse/decode only. Same day:
+  `devices::list_hidraw_paths` is gone (it existed in three copies) and `candidate_paths` asks
+  `find_hidraw_for_interface(vid, pid, PROFILE_INTERFACE = 1)`, so the probe no longer sprays frames over
+  interfaces 0-4. `find_hidraw_for_interface` on Unix now compares the interface number `interface_from_phys`
+  reads from `HID_PHYS` (its old `ends_with("/input{N}")` test never matched a multi-collection phys string,
+  so interface 1 resolved to nothing).
   Next step (keyboard): ask the read-back of the collection that declares it - interface 1 (`0xFFC0`): the
   kernel validates GET_REPORT against the interface's report descriptor, and interface 1 answered `EPIPE` to
   the 2026-10-15 report-ID-framed writes. Then
