@@ -1039,7 +1039,8 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
 }
 
 /// Device paths to try for a profile read: the control collection discovery ranked for this
-/// vendor/product pair first, then the other collections of the same device.
+/// vendor/product pair (or the `--device` node) first, then the interface-1 collection of the same
+/// device, where the reference capture shows every profile transfer running.
 #[cfg(feature = "onboard")]
 fn onboard_paths(
     manager: &mut DeviceManager,

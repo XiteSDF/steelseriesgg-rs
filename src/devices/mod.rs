@@ -446,44 +446,6 @@ pub fn read_input_report_raw(hidraw_path: &str, report_len: usize, timeout_ms: u
     Ok(buffer)
 }
 
-#[cfg(unix)]
-/// List the hidraw nodes of one vendor/product pair, ordered by USB interface number.
-///
-/// Used to probe which collection answers the vendor feature-report protocol when discovery's control
-/// collection does not.
-pub fn list_hidraw_paths(vendor_id: u16, product_id: u16) -> Vec<String> {
-    use std::fs;
-
-    let target_hid_id = format!("0003:{:08X}:{:08X}", vendor_id as u32, product_id as u32);
-    let mut found: Vec<(u32, String)> = Vec::new();
-
-    let Ok(dir) = fs::read_dir("/sys/class/hidraw") else {
-        return Vec::new();
-    };
-    for entry in dir.flatten() {
-        let uevent_path = entry.path().join("device/uevent");
-        let Ok(content) = fs::read_to_string(&uevent_path) else {
-            continue;
-        };
-        if !content.lines().any(|l| {
-            l.strip_prefix("HID_ID=")
-                .is_some_and(|v| v.eq_ignore_ascii_case(&target_hid_id))
-        }) {
-            continue;
-        }
-        let interface = content
-            .lines()
-            .find_map(|l| l.strip_prefix("HID_PHYS="))
-            .and_then(interface_from_phys)
-            .unwrap_or(u32::MAX);
-        let name = entry.file_name();
-        found.push((interface, format!("/dev/{}", name.to_string_lossy())));
-    }
-
-    found.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    found.into_iter().map(|(_, path)| path).collect()
-}
-
 /// Parse the USB interface number out of a hidraw `HID_PHYS` string
 /// (`"usb-0:1.91:1.0/input7/1"` -> `1`). Linux appends the interface after the `input` node.
 #[cfg(unix)]
@@ -495,45 +457,6 @@ fn interface_from_phys(phys: &str) -> Option<u32> {
     last.parse().ok()
 }
 
-#[cfg(not(unix))]
-/// List the HID device nodes of one vendor/product pair, ordered the way discovery picks a control
-/// collection: vendor-defined usage pages first (`STEELSERIES_CONTROL_USAGE_PAGE` above other
-/// vendor pages), then by interface number.
-pub fn list_hidraw_paths(vendor_id: u16, product_id: u16) -> Vec<String> {
-    let Ok(api) = hidapi::HidApi::new() else {
-        return Vec::new();
-    };
-
-    let mut found: Vec<(u32, u32, String)> = Vec::new();
-    for dev_info in api.device_list() {
-        if dev_info.vendor_id() != vendor_id || dev_info.product_id() != product_id {
-            continue;
-        }
-        let Some(path) = dev_info.path().to_str().map(str::to_owned) else {
-            continue;
-        };
-        found.push((
-            usage_page_score(dev_info.usage_page()),
-            dev_info.interface_number(),
-            path,
-        ));
-    }
-
-    found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)).then_with(|| a.2.cmp(&b.2)));
-    found.into_iter().map(|(_, _, path)| path).collect()
-}
-
-#[cfg(not(unix))]
-fn usage_page_score(usage_page: u16) -> u32 {
-    if usage_page == STEELSERIES_CONTROL_USAGE_PAGE {
-        2
-    } else if usage_page >= 0xFF00 {
-        1
-    } else {
-        0
-    }
-}
-
 #[cfg(all(test, unix))]
 #[test]
 fn interface_from_phys_reads_the_trailing_interface() {
@@ -543,39 +466,34 @@ fn interface_from_phys_reads_the_trailing_interface() {
     assert_eq!(interface_from_phys("usb-0:1.91:1.0/input7/x"), None);
 }
 
-#[cfg(all(test, not(unix)))]
-#[test]
-fn usage_page_score_prefers_the_control_page() {
-    assert!(usage_page_score(STEELSERIES_CONTROL_USAGE_PAGE) > usage_page_score(0xFFC1));
-    assert!(usage_page_score(0xFFC1) > usage_page_score(0x01));
-}
-
 #[cfg(unix)]
-/// Find the hidraw device path for a specific USB interface of a device.
-/// Scans /sys/class/hidraw/ to match vendor_id, product_id, and input number.
+/// Find the hidraw node of one USB interface of a device: scans `/sys/class/hidraw` for the node whose
+/// `device/uevent` carries this vendor/product pair in `HID_ID` and a `HID_PHYS` whose interface number
+/// ([`interface_from_phys`]) is `interface`.
 pub fn find_hidraw_for_interface(vendor_id: u16, product_id: u16, interface: usize) -> Option<String> {
     use std::fs;
-    let target_phys_suffix = format!("/input{interface}");
+
+    let interface = u32::try_from(interface).ok()?;
     let target_hid_id = format!("0003:{:08X}:{:08X}", vendor_id as u32, product_id as u32);
 
     for entry in fs::read_dir("/sys/class/hidraw").ok()? {
         let Ok(entry) = entry else { continue };
-        let uevent_path = entry.path().join("device/uevent");
-        let Ok(content) = fs::read_to_string(&uevent_path) else {
+        let Ok(content) = fs::read_to_string(entry.path().join("device/uevent")) else {
             continue;
         };
 
-        let has_hid_id = content.lines().any(|l| {
-            l.strip_prefix("HID_ID=")
-                .is_some_and(|v| v.eq_ignore_ascii_case(&target_hid_id))
-        });
-        let has_phys = content
-            .lines()
-            .any(|l| l.starts_with("HID_PHYS=") && l.ends_with(&target_phys_suffix));
+        let mut has_hid_id = false;
+        let mut phys_interface = None;
+        for line in content.lines() {
+            if let Some(value) = line.strip_prefix("HID_ID=") {
+                has_hid_id |= value.eq_ignore_ascii_case(&target_hid_id);
+            } else if let Some(value) = line.strip_prefix("HID_PHYS=") {
+                phys_interface = interface_from_phys(value);
+            }
+        }
 
-        if has_hid_id && has_phys {
-            let name = entry.file_name();
-            return Some(format!("/dev/{}", name.to_string_lossy()));
+        if has_hid_id && phys_interface == Some(interface) {
+            return Some(format!("/dev/{}", entry.file_name().to_string_lossy()));
         }
     }
     None
@@ -585,10 +503,11 @@ pub fn find_hidraw_for_interface(vendor_id: u16, product_id: u16, interface: usi
 /// Find a HID device path for a specific USB interface of a device.
 ///
 /// Windows splits one USB HID interface into several device nodes, one per top-level
-/// collection, all sharing the same VID/PID/interface number. The `interface` parameter alone
-/// cannot disambiguate them, so this matches on usage page instead: prefer the confirmed
-/// SteelSeries control page (`STEELSERIES_CONTROL_USAGE_PAGE`), then any other vendor-defined
-/// page (`>= 0xFF00`), tie-broken by lowest interface number.
+/// collection, all sharing the same VID/PID/interface number, so `interface` cannot disambiguate
+/// them and is ignored: this matches on usage page instead, preferring the confirmed SteelSeries
+/// control page (`STEELSERIES_CONTROL_USAGE_PAGE`) over any other vendor-defined page
+/// (`>= 0xFF00`), tie-broken by lowest interface number. That control collection is the one the
+/// reference capture shows carrying the profile traffic on `wIndex 1`.
 pub fn find_hidraw_for_interface(vendor_id: u16, product_id: u16, _interface: usize) -> Option<String> {
     let api = hidapi::HidApi::new().ok()?;
 
