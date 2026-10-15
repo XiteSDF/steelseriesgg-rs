@@ -2,7 +2,7 @@
 //!
 //! Frame construction, reply parsing, payload geometry and decoding live in [`crate::onboard_profile`].
 //! This module only moves bytes: it opens the collection that carries profile traffic, sends the
-//! pacing, pull and read frames the read plan describes, collects replies and assembles a
+//! opening-chain, pull and read frames the read plan describes, collects replies and assembles a
 //! [`crate::onboard_profile::ProfileImage`].
 //!
 //! Wire facts confirmed from the 2026-10-15 Windows USBPcap capture of official GG on an Apex 7
@@ -10,19 +10,26 @@
 //! `ssgg-capture-1612-20261015-004400/hub-2.pcap` URB by URB:
 //!
 //! - every profile transfer runs on USB interface 1 (`wIndex 1`), the usage-page-`0xffc0` collection;
-//! - the pacing frame is `SET_REPORT wValue 0x0200 wLength 13` with `00 01 00 00 02 00 f4 01 60 00`
-//!   in front of the pull: report number 0, output type, 12 frame bytes;
+//! - the read opens with a six-frame chain, each one `SET_REPORT wValue 0x0200 wIndex 1 wLength 64`
+//!   (report number 0, output type, 64 data bytes): `90 00`, `90 01`, `f4 00`, `6c 00 01`, then
+//!   `90 00` and `90 01` again, 11 ms apart. The two `90` polls are answered on the interrupt endpoint
+//!   with the ASCII firmware version (`34 2e 31 36 2e 38 00…` = `4.16.8`), `f4 00` with
+//!   `00 01 00…`, `6c 00 01` with nothing. The meanings of `f4` and `6c` are unknown. The capture
+//!   contains no 13-byte transfer at all, so the pacing frame this module sent before is not on GG's
+//!   wire;
 //! - the pull frame is `SET_REPORT wValue 0x0200 wLength 64` carrying
 //!   `[85][00][file selector u16 LE][file offset u32 LE][size u16 LE]`, 10 frame bytes;
 //! - the payload-read request is `SET_REPORT wValue 0x0300 wLength 642` — a **feature** report, not an
 //!   output report — carrying `[83][00][resource-buffer offset u16 LE][size u16 LE]`, 6 frame bytes;
-//! - the answer is a **feature-report reply** (`GET_REPORT wValue 0x0300`): 634 payload bytes, the
-//!   requested bytes starting at byte 0 of the report data (byte 1 counting the report-ID byte).
-//!   GG issued 241 of these; 180 answers were all zero, the rest carried profile data, and the
+//! - the answer is a **feature-report reply** (`GET_REPORT wValue 0x0300 wIndex 1 wLength 642`): 643
+//!   bytes, report ID `0x03` and the requested bytes from data byte 0 — the 2-byte probe of file
+//!   `0x0201` answers `03 0b 00` and the 512-byte read at buffer offset 0 answers
+//!   `03 0b 00 43 6f 6e 66 69 67 20 31 …` (schema word, then the ASCII profile name at payload offset
+//!   2). GG issued 241 of these; 180 answers were all zero, the rest carried profile data, and the
 //!   submit-to-completion latency was 1-3 ms.
 //! - GG read 122 file groups: 12 pulls of 1024 bytes per file at offsets `0, 1024, …, 11264` for each
 //!   of the ten files `0x0201`-`0x0205` and `0x0301`-`0x0305`, plus a 2-byte probe on the profile file
-//!   of slot 0 and on the lighting file; no pacing frame in front of the other pulls.
+//!   of slot 0 and on the lighting file; the opening chain runs once, in front of the first pull.
 //!
 //! GG's own read-back is unusable, which is why this command reports checksum words as
 //! "stored/computed" pairs and never claims a profile is verified: in the capture the assembled
@@ -101,11 +108,14 @@ mod wire_shim {
     }
 }
 
+use crate::devices::hid_reports::{
+    CommandCode, HidCommand, HidDeviceType, HidReportBuilder, ONBOARD_FEATURE_REPORT_SIZE, ONBOARD_INIT_CHAIN,
+    ONBOARD_OUTPUT_REPORT_SIZE, ONBOARD_REPLY_REPORT_SIZE, OnboardPullCommand, OnboardReadCommand,
+};
 use crate::error::{Error, Result};
 use crate::onboard_profile::{
-    CONFIG_REPORT_LEN, ChunkRecord, FILE_ACCESS_READWRITE, MAX_PROFILE_INDEX, MAX_USB_TIMEOUT_MS, PROFILE_FS_BASE,
-    PULL_REPORT_LEN, ProfileImage, READ_REPORT_LEN, ReadConfig, ReadReply, SCHEMA_READ_LEN, TIME_BETWEEN_COMMANDS_MS,
-    config_frame, hex_of, parse_read_reply_at, pull_frame, read_frame, reply_mismatch, schema_of,
+    ChunkRecord, INIT_REPLY_LEN, MAX_PROFILE_INDEX, PROFILE_FS_BASE, ProfileImage, ReadConfig, ReadReply,
+    SCHEMA_READ_LEN, hex_of, parse_firmware_version, parse_read_reply_at, reply_mismatch, schema_of,
 };
 #[cfg(not(unix))]
 use wire_shim::{
@@ -114,12 +124,18 @@ use wire_shim::{
 
 /// Highest profile slot this read supports.
 pub const MAX_PROFILE_INDEX_FOR_READ: u8 = MAX_PROFILE_INDEX;
-/// Report number of the payload-read reply (`GET_REPORT wValue 0x0300`).
-const READ_REPLY_ID: u8 = 0x03;
-/// Length to request for the payload reply. The kernel forwards this number to the device as
-/// `wLength`, and the device's report is 642 bytes: asking for more makes the control read never
+/// Report number to ask for when reading a payload read back: **0**, which is the
+/// `GET_REPORT wValue 0x0300 wIndex 1` control read the reference capture shows. The kernel writes the
+/// device's own report-ID byte into byte 0 of the buffer, so the reply's leading `03` arrives there
+/// whatever we ask for. Earlier builds asked `0x83` (the command byte as a report number), which
+/// produced `wValue 0x0383` in the 2026-10-15 Linux capture - a report number the keyboard never
+/// declared - and that run answered nothing.
+/// `[EXPERIMENTAL]`
+const READ_REPLY_ID: u8 = 0x00;
+/// Length to request for the payload reply (see [`ONBOARD_REPLY_REPORT_SIZE`]). The kernel forwards
+/// this number to the device as `wLength`: 642 answers, asking for more makes the control read never
 /// complete, which is what `Connection timed out` meant on 2026-10-15.
-const READ_REPLY_WIRE_LEN: usize = 642;
+const READ_REPLY_WIRE_LEN: usize = ONBOARD_REPLY_REPORT_SIZE;
 /// Poll acknowledges and status reports the reply collector skips.
 const ACK_REPORT_IDS: [u8; 2] = [0x0B, 0x12];
 /// Wire length of the pull answer the capture shows (64 bytes on report `0x85`).
@@ -132,6 +148,8 @@ const REPLY_BUDGET_MS: u64 = 2_000;
 const REPLY_INPUT_ATTEMPTS: u32 = 20;
 /// Polls allowed for one pull answer.
 const PULL_ACK_ATTEMPTS: u32 = 4;
+/// Polls allowed for one opening-chain answer.
+const CHAIN_REPLY_ATTEMPTS: u32 = 3;
 /// Largest input report a profile collection can return (Apex 7 profile collections report 1024).
 const INPUT_REPORT_MAX_LEN: usize = 1024;
 
@@ -238,7 +256,8 @@ async fn read_schema_words(
     Ok((schema_of(&raw), raw, path))
 }
 
-/// Read plan for a schema-only probe: one pull of 2 bytes, drained by one 2-byte payload read.
+/// Read plan for a schema-only probe: the opening chain, one pull of 2 bytes, drained by one 2-byte
+/// payload read.
 #[must_use]
 pub fn schema_config(fs_base: u16, profile: u8, gap_ms: u64) -> ReadConfig {
     ReadConfig {
@@ -249,10 +268,7 @@ pub fn schema_config(fs_base: u16, profile: u8, gap_ms: u64) -> ReadConfig {
         read_len: SCHEMA_READ_LEN,
         payload_len: SCHEMA_READ_LEN,
         gap_ms,
-        time_between_commands_ms: TIME_BETWEEN_COMMANDS_MS,
-        file_access: FILE_ACCESS_READWRITE,
-        max_usb_timeout_ms: MAX_USB_TIMEOUT_MS,
-        send_config: true,
+        send_init_chain: true,
         reply_header: crate::onboard_profile::READ_REPLY_FRAMING_LEN,
     }
 }
@@ -285,7 +301,7 @@ fn read_on_first_path(
     )))
 }
 
-/// Runs one read plan (pacing frame, then pulls with their payload reads) on one path.
+/// Runs one read plan (the opening chain, then pulls with their payload reads) on one path.
 fn read_image(path: &str, config: &ReadConfig, strict: bool, deadline: Option<Duration>) -> Result<ProfileImage> {
     config.validate()?;
     let fs_id = config.fs_id();
@@ -293,28 +309,21 @@ fn read_image(path: &str, config: &ReadConfig, strict: bool, deadline: Option<Du
     let read_len = u16::try_from(config.read_len).unwrap_or(u16::MAX);
     let overall = deadline.map(|d| Instant::now() + d);
 
-    if config.send_config {
-        let frame = config_frame(
-            config.time_between_commands_ms,
-            config.file_access,
-            config.max_usb_timeout_ms,
-        );
-        // GG sends this pacing frame once, before the first pull. A collection that rejects it still
-        // answers the pull, so a failure here is logged and the read continues.
-        if let Err(e) = write_frame(path, &frame, CONFIG_REPORT_LEN) {
-            tracing::debug!("onboard pacing frame on {path} rejected: {e}");
-        }
-    }
+    let firmware = if config.send_init_chain {
+        send_init_chain(path, config.gap_ms)
+    } else {
+        None
+    };
 
     let mut chunks: Vec<ChunkRecord> = Vec::with_capacity(config.chunks);
     for chunk in 0..config.chunks {
         let file_offset = (chunk * config.resource_len) as u32;
-        let pull = pull_frame(
+        let pull = OnboardPullCommand {
             fs_id,
             file_offset,
-            u16::try_from(config.resource_len).unwrap_or(u16::MAX),
-        );
-        write_frame(path, &pull, PULL_REPORT_LEN).map_err(|e| {
+            size: u16::try_from(config.resource_len).unwrap_or(OnboardPullCommand::MAX_SIZE),
+        };
+        write_output_command(path, pull).map_err(|e| {
             Error::DeviceCommunication(format!(
                 "onboard pull frame for chunk {chunk} (file {fs_id:04X} offset {file_offset}) on \
                  {path} rejected: {e}"
@@ -332,8 +341,11 @@ fn read_image(path: &str, config: &ReadConfig, strict: bool, deadline: Option<Du
         let mut reads: Vec<ReadReply> = Vec::with_capacity(reads_per_pull);
         for read in 0..reads_per_pull {
             let buffer_offset = (read * config.read_len) as u16;
-            let frame = read_frame(buffer_offset, read_len);
-            write_read_request(path, &frame).map_err(|e| {
+            let command = OnboardReadCommand {
+                buffer_offset,
+                size: read_len,
+            };
+            write_feature_command(path, command).map_err(|e| {
                 Error::DeviceCommunication(format!(
                     "onboard read request for chunk {chunk} buffer offset {buffer_offset} on \
                      {path} rejected: {e}"
@@ -370,7 +382,39 @@ fn read_image(path: &str, config: &ReadConfig, strict: bool, deadline: Option<Du
         }
     }
 
-    ProfileImage::assemble(chunks, *config)
+    ProfileImage::assemble(chunks, *config).map(|image| image.with_firmware(firmware))
+}
+
+/// Sends GG's opening chain and returns the firmware version the `0x90` poll answered with.
+///
+/// Every frame is a 64-byte output report, in the capture's order: `90 00`, `90 01`, `f4 00`,
+/// `6c 00 01`, `90 00`, `90 01`. The answers arrive on the interrupt endpoint and carry no report-ID
+/// byte, so a frame that expects one is polled briefly; `6c 00 01` is not answered at all in the
+/// capture. A collection that rejects a frame is logged and the chain continues: the chain is GG's,
+/// and we have not measured on hardware which of its frames a keyboard requires.
+fn send_init_chain(path: &str, gap_ms: u64) -> Option<String> {
+    let mut version: Option<String> = None;
+    for frame in ONBOARD_INIT_CHAIN {
+        if let Err(e) = write_output_command(path, frame) {
+            tracing::debug!("onboard opening-chain frame {} on {path} rejected: {e}", frame.command);
+            continue;
+        }
+        if frame.expects_reply {
+            if let Some(report) = read_interrupt_report(path, INIT_REPLY_LEN, CHAIN_REPLY_ATTEMPTS) {
+                tracing::debug!(
+                    "onboard opening-chain answer on {path}: {}",
+                    hex_of(&report[..report.len().min(8)])
+                );
+                if matches!(frame.command, CommandCode::FirmwareVersion) {
+                    version = version.or_else(|| parse_firmware_version(&report));
+                }
+            }
+        }
+        if gap_ms > 0 {
+            std::thread::sleep(Duration::from_millis(gap_ms));
+        }
+    }
+    version
 }
 
 /// Collects one payload reply: the feature-report reply the capture shows, then the interrupt
@@ -441,12 +485,17 @@ fn read_reply_report(path: &str, payload_len: usize, overall: Option<Instant>) -
 
 /// Reads the pull answer (the capture shows a 64-byte report on report `0x85` after each pull).
 fn read_pull_ack(path: &str) -> Option<Vec<u8>> {
-    for _ in 0..PULL_ACK_ATTEMPTS {
-        match read_input_report_raw(path, PULL_ACK_LEN + 1, REPLY_POLL_MS as u64) {
+    read_interrupt_report(path, PULL_ACK_LEN, PULL_ACK_ATTEMPTS)
+}
+
+/// Polls the interrupt endpoint for one non-empty report of at most `len` bytes.
+fn read_interrupt_report(path: &str, len: usize, attempts: u32) -> Option<Vec<u8>> {
+    for _ in 0..attempts {
+        match read_input_report_raw(path, len + 1, REPLY_POLL_MS as u64) {
             Ok(report) if !report.is_empty() => return Some(report),
             Ok(_) => {}
             Err(e) => {
-                tracing::debug!("onboard pull answer poll on {path}: {e}");
+                tracing::debug!("onboard input-report poll on {path}: {e}");
                 break;
             }
         }
@@ -467,22 +516,34 @@ fn is_ack(report: &[u8]) -> bool {
     report.first().is_some_and(|id| ACK_REPORT_IDS.contains(id))
 }
 
-/// Sends a pacing or pull frame as an output report on report number 0: `[0][frame][zeros]`,
-/// `wire_len + 1` bytes in the buffer, `wire_len` bytes on the wire.
-fn write_frame(path: &str, frame: &[u8], wire_len: usize) -> Result<()> {
-    // The kernel strips data[0] (the report number), so the buffer is one byte longer than the wire.
-    let mut buffer = vec![0u8; wire_len + 1];
-    let len = frame.len().min(wire_len);
-    buffer[..len].copy_from_slice(&frame[..len]);
+/// Serializes a command through [`HidReportBuilder`] and sends it as an output report: report number
+/// 0 plus the 64-byte data stage, i.e. `SET_REPORT wValue 0x0200 wLength 64` as the reference capture
+/// shows (the kernel takes the report number out of the data stage, so the buffer is one byte longer
+/// than the wire).
+fn write_output_command<C: HidCommand>(path: &str, command: C) -> Result<()> {
+    let mut buffer = [0u8; ONBOARD_OUTPUT_REPORT_SIZE];
+    let len = HidReportBuilder::new(HidDeviceType::Keyboard).build_report(command, &mut buffer)?;
+    if len != buffer.len() {
+        return Err(Error::DeviceCommunication(format!(
+            "onboard output report built {len} of {} bytes",
+            buffer.len()
+        )));
+    }
     write_output_report_raw(path, &buffer)
 }
 
-/// Sends a payload-read request as a **feature** report (`wValue 0x0300`, 642 wire bytes).
-fn write_read_request(path: &str, frame: &[u8]) -> Result<()> {
-    let mut buffer = vec![0u8; READ_REPORT_LEN];
-    let len = frame.len().min(READ_REPORT_LEN);
-    buffer[..len].copy_from_slice(&frame[..len]);
-    send_feature_report_raw(path, &buffer, READ_REPORT_LEN)
+/// Serializes a command through [`HidReportBuilder`] and sends it as a feature report on report number
+/// 0 (`SET_REPORT wValue 0x0300 wLength 642` in the capture).
+fn write_feature_command<C: HidCommand>(path: &str, command: C) -> Result<()> {
+    let mut buffer = [0u8; ONBOARD_FEATURE_REPORT_SIZE];
+    let len = HidReportBuilder::new(HidDeviceType::Keyboard).build_report(command, &mut buffer)?;
+    if len != buffer.len() {
+        return Err(Error::DeviceCommunication(format!(
+            "onboard feature report built {len} of {} bytes",
+            buffer.len()
+        )));
+    }
+    send_feature_report_raw(path, &buffer, ONBOARD_FEATURE_REPORT_SIZE)
 }
 
 /// Device paths to try for a profile read: the caller's preferred collection first, then every other
@@ -528,8 +589,8 @@ mod tests {
         let config = schema_config(PROFILE_FS_BASE, 2, 5);
         assert_eq!(config.fs_id(), PROFILE_FS_BASE + 2);
         assert_eq!(config.total_resource_len(), SCHEMA_READ_LEN);
-        // pacing frame + one pull + one payload read
-        assert_eq!(config.steps().len(), 3);
+        // opening chain + one pull + one payload read
+        assert_eq!(config.steps().len(), 8);
         config.validate().expect("schema probe plan is valid");
     }
 
@@ -546,20 +607,6 @@ mod tests {
         assert!(!reply_carries_payload(&[0x0B, 0x0a, 0x00, 0x00], 2));
         assert!(!reply_carries_payload(&[0x12, 0x00], 2));
         assert!(!reply_carries_payload(&[], 2));
-    }
-
-    #[test]
-    fn pull_frame_matches_the_captured_layout() {
-        assert_eq!(
-            pull_frame(0x0201, 4096, 1024),
-            [0x85, 0x00, 0x01, 0x02, 0x00, 0x10, 0x00, 0x00, 0x00, 0x04]
-        );
-    }
-
-    #[test]
-    fn read_frame_matches_the_captured_layout() {
-        assert_eq!(read_frame(512, 512), [0x83, 0x00, 0x00, 0x02, 0x00, 0x02]);
-        assert_eq!(read_frame(0, 2), [0x83, 0x00, 0x00, 0x00, 0x02, 0x00]);
     }
 
     #[test]

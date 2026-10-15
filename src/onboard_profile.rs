@@ -11,10 +11,10 @@
 //! 120 pulls of 1024 bytes at file offsets 0..11264, each drained by reads at buffer offsets 0 and 512,
 //! 100 of them on file `0x0201` (profile slot 0) plus one schema probe; 241 payload reads, every one of
 //! them answering with the first payload byte `0x0B`, i.e. schema [`SCHEMA_B`]. On 2026-10-15 an Apex 7
-//! accepted the pacing frame, the pull and the payload-read request on its interface-4 vendor collection
-//! and answered a pull on the interrupt endpoint; the payload read timed out there, which is why the
-//! reply is read on the control endpoint first. The full read has not completed on hardware, and nothing
-//! here writes a profile. Treat the payload struct offsets as unverified until the first Linux read-back.
+//! accepted a pull and a payload-read request on its interface-4 vendor collection and answered a pull
+//! on the interrupt endpoint; the payload read timed out there, which is why the reply is read on the
+//! control endpoint first. The full read has not completed on hardware, and nothing here writes a
+//! profile. Treat the payload struct offsets as unverified until the first Linux read-back.
 //!
 //! # Wire format
 //!
@@ -24,10 +24,15 @@
 //! on). Report numbers are embedded in the payload, so in `hidapi` terms the first byte of every buffer
 //! is the report ID.
 //!
-//! * pacing (`HIDCONFIG`, feature report ID `0x00`, 12 bytes on the wire):
-//!   `time_between_commands u32 LE | file_access u32 LE | max_usb_timeout u32 LE`,
-//!   GG reads a profile with `1 | 2 | 500`. The reference capture contains no 12-byte frame at all,
-//!   so GG's profile read does not need it and `ReadConfig::default` skips it.
+//! * opening chain (`HIDINIT`, output report ID `0x00`, 64 data bytes on the wire, `SET_REPORT wValue
+//!   0x0200 wIndex 1 wLength 64`): GG starts the profile read with `90 00`, `90 01`, `f4 00`,
+//!   `6c 00 01` and then `90 00`, `90 01` again, 11 ms apart. The two `0x90` polls are answered on the
+//!   interrupt endpoint with the ASCII firmware version (`34 2e 31 36 2e 38 00…` = `4.16.8`, see
+//!   [`parse_firmware_version]), `f4 00` is answered with `00 01 00…`, and `6c 00 01` is not answered at
+//!   all. The meanings of `0xf4` and `0x6c` are unknown. See [`ONBOARD_INIT_CHAIN`]. The capture
+//!   contains no
+//!   13-byte transfer anywhere, so the pacing frame earlier versions of this module sent is not part of
+//!   GG's read.
 //! * pull (`HIDIO`, output report ID `0x00`, 64 bytes on the wire, `SET_REPORT wValue 0x0200 wIndex 1`):
 //!   `85 | 00 | file_id u16 LE | offset u32 LE | size u16 LE | 00…` (10 frame bytes, 11-byte report buffer)
 //!   — copies `size` bytes of the profile file into the device's resource buffer at buffer offset 0.
@@ -36,9 +41,11 @@
 //! * payload read (`HIDFEATURE`, feature report ID `0x00`, 642 bytes on the wire, `SET_REPORT wValue
 //!   0x0300 wIndex 1`): `83 | 00 | offset u16 LE | size u16 LE | 00…` (6 frame bytes, 643-byte report buffer)
 //!   — returns `size` bytes of the resource buffer. GG reads the answer with `GET_REPORT wValue 0x0300
-//!   wIndex 1 wLength 642`, and that answer carries no header: the payload starts at byte 1. Some
-//!   firmware echoes the request header instead, with the payload from byte 6; [`parse_read_reply`]
-//!   accepts both.
+//!   wIndex 1 wLength 642`, and that answer carries no header: the payload starts at byte 1. The 2-byte
+//!   probe of file `0x0201` answers `03 | 0b 00` and the first 512-byte read of the same file answers
+//!   `03 | 0b 00 43 6f 6e 66 69 67 20 31 …`, i.e. the schema word at payload offset 0 and the profile
+//!   name at payload offset 2. Some firmware echoes the request header instead, with the payload from
+//!   byte 6; [`parse_read_reply`] accepts both.
 //!
 //! A profile file is read as `ceil((payload_len + 1023) / 1024)` resource-buffer fills
 //! ([`RESOURCE_BUFFER_LEN`] each); every fill is drained with two [`READ_LEN`]-byte payload reads at
@@ -53,6 +60,9 @@
 //! leading constant id byte that is not part of the file, so `dest` in [`Step`] is the file offset and
 //! the assembled image is [`ReadConfig::payload_len`] bytes with no id byte.
 
+use crate::devices::hid_reports::{
+    ONBOARD_FEATURE_REPORT_SIZE, ONBOARD_INIT_CHAIN, ONBOARD_OUTPUT_REPORT_SIZE, OnboardPullCommand, OnboardReadCommand,
+};
 use crate::devices::keyboards::apex_pro_tkl_2023_profile::profile_checksum;
 use crate::error::{Error, Result};
 use serde::Serialize;
@@ -87,11 +97,9 @@ pub const LIGHTING_FS_SHARED: u16 = 0x0102;
 /// Macro data block inside a profile payload, in bytes.
 pub const MACRO_DATA_LEN: usize = 9600;
 
-/// Command byte of the payload read (`HIDFEATURE`).
-pub const CMD_READ_PAYLOAD: u8 = 0x83;
-/// Command byte of the pull (`HIDIO`).
-pub const CMD_PULL_PAYLOAD: u8 = 0x85;
-/// Command byte of the push (profile write); defined for completeness, nothing here sends it.
+/// Command byte of the push (profile write); defined for completeness, nothing here sends it. The
+/// read path has no command bytes of its own: they are [`CommandCode`] variants and every frame is
+/// built by a typed command in [`crate::devices::hid_reports`] (see [`OnboardPullCommand`]).
 pub const CMD_PUSH_PAYLOAD: u8 = 0x05;
 /// Report ID of every request frame.
 pub const REQUEST_REPORT_ID: u8 = 0x00;
@@ -101,47 +109,53 @@ pub const READ_REPLY_REPORT_ID: u8 = 0x83;
 pub const PULL_REPLY_REPORT_ID: u8 = 0x85;
 /// Report ID of a lighting-config payload-read reply.
 pub const LIGHTING_READ_REPLY_REPORT_ID: u8 = 0x03;
-/// Report buffer length of a payload read, report ID byte included: the reference capture shows
-/// `SET_REPORT wValue 0x0300 wLength 642`, i.e. one less byte on the wire.
-pub const READ_REPORT_LEN: usize = 643;
-/// Report buffer length of a pull, report ID byte included (`SET_REPORT wValue 0x0200 wLength 64`).
-pub const PULL_REPORT_LEN: usize = 65;
-/// Report buffer length of the pacing frame, report ID byte included.
-pub const CONFIG_REPORT_LEN: usize = 13;
+/// Report buffer length of a payload read, report number byte included (see
+/// [`ONBOARD_FEATURE_REPORT_SIZE`]).
+pub const READ_REPORT_LEN: usize = ONBOARD_FEATURE_REPORT_SIZE;
+/// Report buffer length of a pull, report number byte included (see [`ONBOARD_OUTPUT_REPORT_SIZE`]).
+pub const PULL_REPORT_LEN: usize = ONBOARD_OUTPUT_REPORT_SIZE;
+/// Data-stage length of the 64-byte output reports of this protocol (`SET_REPORT wValue 0x0200
+/// wIndex 1 wLength 64`): the opening chain and every pull. The report number the transport prefixes
+/// is not part of it.
+pub const OUTPUT_REPORT_DATA_LEN: usize = ONBOARD_OUTPUT_REPORT_SIZE - 1;
+/// Report buffer length of an opening-chain frame, report number byte included.
+pub const INIT_REPORT_LEN: usize = ONBOARD_OUTPUT_REPORT_SIZE;
+/// Length of the interrupt-endpoint answer to an opening-chain frame.
+pub const INIT_REPLY_LEN: usize = OUTPUT_REPORT_DATA_LEN;
 /// Header of a header-echoing payload-read reply, report ID byte excluded: `reserved, offset u16, size u16`.
 pub const READ_REPLY_HEADER_LEN: usize = 5;
-/// Framing bytes the 2026-10-15 capture puts between the report-ID byte and the payload of a
-/// payload-read reply (`GET_REPORT wValue 0x0300 wIndex 1`): the reply starts `ff ff 00 00 00 00
-/// 08 00 01 02 00 07 00 80 02 82 02 00 00 03`, then the file bytes. 20 of the 241 replies were
-/// captured with the schema word at this offset (`0b 00` for the 2-byte probe of file `0x0201`),
-/// and the 512-byte replies of the same file carry the profile name 16 bytes later, so the anchor
-/// is measured, not derived. `ssgg onboard read --reply-header` changes it.
-pub const READ_REPLY_FRAMING_LEN: usize = 20;
-/// Frame length of a pull command (`85, reserved, file id u16, offset u32, size u16`);
-/// `request_buffer` prefixes the report ID byte.
-pub const PULL_FRAME_LEN: usize = 10;
-/// Frame length of a payload-read command (`83, reserved, offset u16, size u16`); `request_buffer`
-/// prefixes the report ID byte.
-pub const READ_FRAME_LEN: usize = 6;
-/// Pacing frame length in the wire buffer: the 9 bytes the capture shows plus the padding GG pads to.
-/// See [`config_frame`].
-///
-/// The report-ID byte (report number 0) that `request_buffer` prefixes is not part of it.
-pub const CONFIG_FRAME_LEN: usize = 12;
-/// Trailing word every pacing frame in the capture carries (`60 00` = 96). Its meaning is unknown; GG
-/// sends it, so `ssgg` sends it.
-pub const PACING_TRAILER_U16: u16 = 96;
+/// Framing bytes between the report-ID byte and the payload of a payload-read reply (`GET_REPORT
+/// wValue 0x0300 wIndex 1 wLength 642`): the report-ID byte, and nothing else — the payload starts
+/// directly behind it, so the framing length is 0. In the 2026-10-15 capture every one of the 241
+/// replies answers `03` as its first byte: the 2-byte probe of file `0x0201` answers `03 0b 00`
+/// (schema [`SCHEMA_B`]) and the 512-byte read at buffer offset 0 answers
+/// `03 0b 00 43 6f 6e 66 69 67 20 31 …`, the profile name 2 bytes behind the schema word, the offset the
+/// Windows engine decoder documents. An earlier version of this constant said 20: that many bytes sit
+/// between the payload and the report bytes in the capture's **text** export, which prefixes every
+/// report with the USBPcap header, and 20 of 241 replies matched by accident. The 2026-10-15 hardware
+/// probe accepted 6; `ssgg onboard read --reply-header` changes it.
+pub const READ_REPLY_FRAMING_LEN: usize = 0;
 /// Bytes in a profile schema word, and the size of a schema-only payload read.
 pub const SCHEMA_READ_LEN: usize = 2;
-/// `file_access` value GG uses for a profile read (read/write file access).
-pub const FILE_ACCESS_READWRITE: u32 = 2;
-/// `max_usb_timeout` value GG uses for a profile read, in milliseconds.
-pub const MAX_USB_TIMEOUT_MS: u32 = 500;
-/// `time_between_commands` value GG uses for a profile read, in milliseconds.
-pub const TIME_BETWEEN_COMMANDS_MS: u32 = 1;
 /// Median gap between two device replies during a GG profile read in the reference capture, in
-/// milliseconds. Used as the default pacing between our own transfers.
+/// milliseconds. Used as the default pacing between our own transfers; the opening-chain frames GG
+/// sends are 11 ms apart.
 pub const GG_GAP_MS: u64 = 5;
+
+/// Firmware version an opening-chain [`CommandCode::FirmwareVersion`] answer carries: the printable
+/// ASCII run
+/// from the first byte, which the capture shows NUL padded (`34 2e 31 36 2e 38 00…` = `4.16.8`).
+/// Returns `None` when the answer starts with non-printable bytes, which is how a keyboard that frames
+/// its answer with a header, or does not answer the poll at all, shows up.
+#[must_use]
+pub fn parse_firmware_version(reply: &[u8]) -> Option<String> {
+    let text = reply
+        .iter()
+        .take_while(|b| **b >= 0x20 && **b < 0x7F)
+        .map(|&b| char::from(b))
+        .collect::<String>();
+    (!text.is_empty()).then_some(text)
+}
 
 /// Largest payload a payload-read reply can carry: the reply report (643 bytes, report ID byte included)
 /// minus that byte. Header-echoing replies can carry 636 bytes; the capture's payload-only answers the
@@ -153,19 +167,20 @@ pub const MAX_READ_LEN: usize = READ_REPORT_LEN - 1 - READ_REPLY_HEADER_LEN;
 pub struct Step {
     /// Transfer kind.
     pub kind: StepKind,
-    /// Pull this step belongs to (`0` for the pacing frame).
+    /// Pull this step belongs to (`0` for the opening chain).
     pub chunk: usize,
     /// Frame bytes after the report ID byte.
     pub frame: Vec<u8>,
     /// Total report length on the wire, report ID byte included.
     pub wire_len: usize,
-    /// Report ID expected in the reply, `None` for transfers GG does not read back.
+    /// Report ID expected in the reply, `None` for transfers GG does not read back. The opening-chain
+    /// answers are interrupt reports whose first byte is payload, not a report ID.
     pub reply_report_id: Option<u8>,
     /// Reply report length to read, report ID byte included.
     pub reply_len: Option<usize>,
-    /// File offset the payload of a read lands at; `None` for pulls and the pacing frame.
+    /// File offset the payload of a read lands at; `None` for pulls and opening-chain frames.
     pub dest: Option<usize>,
-    /// Resource-buffer offset a read asks for; `None` for pulls and the pacing frame.
+    /// Resource-buffer offset a read asks for; `None` for pulls and opening-chain frames.
     pub buffer_offset: Option<u16>,
     /// Payload size requested by a read.
     pub size: u16,
@@ -175,8 +190,8 @@ pub struct Step {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StepKind {
-    /// Pacing frame (feature report ID `0x00`, 12 bytes).
-    Config,
+    /// One frame of the opening chain (output report, 64 data bytes, 65-byte report buffer).
+    Init,
     /// Pull into the resource buffer (output report, 65 bytes).
     Pull,
     /// Payload read out of the resource buffer (feature report, 643 bytes).
@@ -186,7 +201,7 @@ pub enum StepKind {
 impl std::fmt::Display for StepKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self {
-            StepKind::Config => "config",
+            StepKind::Init => "init",
             StepKind::Pull => "pull",
             StepKind::Read => "read",
         };
@@ -211,17 +226,11 @@ pub struct ReadConfig {
     pub payload_len: usize,
     /// Pacing between our transfers, in milliseconds.
     pub gap_ms: u64,
-    /// `time_between_commands` for the pacing frame, in milliseconds.
-    pub time_between_commands_ms: u32,
-    /// `file_access` for the pacing frame.
-    pub file_access: u32,
-    /// `max_usb_timeout` for the pacing frame, in milliseconds.
-    pub max_usb_timeout_ms: u32,
-    /// Send the pacing frame before the pull loop. GG always sends it; turning it off is a probe.
-    pub send_config: bool,
+    /// Send [`ONBOARD_INIT_CHAIN`] before the pull loop. GG always runs it; turning it off is a probe.
+    pub send_init_chain: bool,
     /// Framing bytes between the report-ID byte and the payload of a payload-read reply;
-    /// [`READ_REPLY_FRAMING_LEN`] matches the 2026-10-15 capture, `0` suits a keyboard that answers
-    /// with no framing.
+    /// [`READ_REPLY_FRAMING_LEN`] (0) matches the 2026-10-15 capture, 5 suits a keyboard that echoes
+    /// the request header.
     pub reply_header: usize,
 }
 
@@ -235,10 +244,7 @@ impl Default for ReadConfig {
             read_len: READ_LEN,
             payload_len: PAYLOAD_LEN_A,
             gap_ms: GG_GAP_MS,
-            time_between_commands_ms: TIME_BETWEEN_COMMANDS_MS,
-            file_access: FILE_ACCESS_READWRITE,
-            max_usb_timeout_ms: MAX_USB_TIMEOUT_MS,
-            send_config: true,
+            send_init_chain: true,
             reply_header: READ_REPLY_FRAMING_LEN,
         }
     }
@@ -304,19 +310,10 @@ impl ReadConfig {
 
     /// Full transfer sequence for one profile read, in wire order.
     pub fn steps(&self) -> Vec<Step> {
-        let mut steps = Vec::with_capacity(1 + self.chunks * (1 + self.resource_len / self.read_len));
-        if self.send_config {
-            steps.push(Step {
-                kind: StepKind::Config,
-                chunk: 0,
-                frame: config_frame(self.time_between_commands_ms, self.file_access, self.max_usb_timeout_ms).to_vec(),
-                wire_len: CONFIG_REPORT_LEN,
-                reply_report_id: None,
-                reply_len: None,
-                dest: None,
-                buffer_offset: None,
-                size: 0,
-            });
+        let mut steps =
+            Vec::with_capacity(ONBOARD_INIT_CHAIN.len() + 1 + self.chunks * (1 + self.resource_len / self.read_len));
+        if self.send_init_chain {
+            steps.extend(init_steps());
         }
         let reads_per_pull = self.resource_len / self.read_len;
         for chunk in 0..self.chunks {
@@ -324,10 +321,16 @@ impl ReadConfig {
             steps.push(Step {
                 kind: StepKind::Pull,
                 chunk,
-                frame: pull_frame(self.fs_id(), file_offset as u32, self.resource_len as u16).to_vec(),
+                frame: OnboardPullCommand {
+                    fs_id: self.fs_id(),
+                    file_offset: file_offset as u32,
+                    size: self.resource_len as u16,
+                }
+                .data_stage()
+                .to_vec(),
                 wire_len: PULL_REPORT_LEN,
                 reply_report_id: Some(PULL_REPLY_REPORT_ID),
-                reply_len: Some(64),
+                reply_len: Some(INIT_REPLY_LEN),
                 dest: None,
                 buffer_offset: None,
                 size: self.resource_len as u16,
@@ -337,9 +340,14 @@ impl ReadConfig {
                 steps.push(Step {
                     kind: StepKind::Read,
                     chunk,
-                    frame: read_frame(buffer_offset as u16, self.read_len as u16).to_vec(),
+                    frame: OnboardReadCommand {
+                        buffer_offset: buffer_offset as u16,
+                        size: self.read_len as u16,
+                    }
+                    .data_stage()
+                    .to_vec(),
                     wire_len: READ_REPORT_LEN,
-                    reply_report_id: Some(READ_REPLY_REPORT_ID),
+                    reply_report_id: Some(REQUEST_REPORT_ID),
                     reply_len: Some(READ_REPORT_LEN),
                     dest: Some(file_offset + buffer_offset),
                     buffer_offset: Some(buffer_offset as u16),
@@ -356,32 +364,28 @@ impl ReadConfig {
 /// understands one of them still answers.
 pub const SCHEMA_PULL_SIZES: [u16; 2] = [2, 0];
 
-/// Transfer sequence for a schema-only read: one pull, one payload read of 2 bytes.
+/// Transfer sequence for a schema-only read: the opening chain, one pull, one payload read of 2 bytes.
 pub fn schema_read_steps(fs_id: u16) -> Vec<Step> {
     schema_read_steps_with(fs_id, SCHEMA_PULL_SIZES[0])
 }
 
 /// Transfer sequence for a schema-only read with a chosen pull size (see [`SCHEMA_PULL_SIZES`]).
 pub fn schema_read_steps_with(fs_id: u16, pull_size: u16) -> Vec<Step> {
-    vec![
-        Step {
-            kind: StepKind::Config,
-            chunk: 0,
-            frame: config_frame(TIME_BETWEEN_COMMANDS_MS, FILE_ACCESS_READWRITE, MAX_USB_TIMEOUT_MS).to_vec(),
-            wire_len: CONFIG_REPORT_LEN,
-            reply_report_id: None,
-            reply_len: None,
-            dest: None,
-            buffer_offset: None,
-            size: 0,
-        },
+    let mut steps = init_steps();
+    steps.extend([
         Step {
             kind: StepKind::Pull,
             chunk: 0,
-            frame: pull_frame(fs_id, 0, pull_size).to_vec(),
+            frame: OnboardPullCommand {
+                fs_id,
+                file_offset: 0,
+                size: pull_size,
+            }
+            .data_stage()
+            .to_vec(),
             wire_len: PULL_REPORT_LEN,
             reply_report_id: Some(PULL_REPLY_REPORT_ID),
-            reply_len: Some(64),
+            reply_len: Some(INIT_REPLY_LEN),
             dest: None,
             buffer_offset: None,
             size: pull_size,
@@ -389,7 +393,12 @@ pub fn schema_read_steps_with(fs_id: u16, pull_size: u16) -> Vec<Step> {
         Step {
             kind: StepKind::Read,
             chunk: 0,
-            frame: read_frame(0, SCHEMA_READ_LEN as u16).to_vec(),
+            frame: OnboardReadCommand {
+                buffer_offset: 0,
+                size: SCHEMA_READ_LEN as u16,
+            }
+            .data_stage()
+            .to_vec(),
             wire_len: READ_REPORT_LEN,
             reply_report_id: Some(READ_REPLY_REPORT_ID),
             reply_len: Some(READ_REPORT_LEN),
@@ -397,44 +406,29 @@ pub fn schema_read_steps_with(fs_id: u16, pull_size: u16) -> Vec<Step> {
             buffer_offset: Some(0),
             size: SCHEMA_READ_LEN as u16,
         },
-    ]
+    ]);
+    steps
 }
 
-/// Pacing frame, laid out as the 2026-10-15 capture shows it: `time u8 | reserved u16 | file_access
-/// u16 LE | max_usb_timeout u16 LE | 96 u16 LE`, padded with three zero bytes to the 12 payload bytes
-/// GG writes (`wLength 13` counts the report-number byte). The capture's own frame is
-/// `01 00 00 02 00 f4 01 60 00` for 1 ms, read/write access and a 500 ms USB timeout; its last three
-/// padding bytes were not captured, and the meaning of the trailing `96` is unknown.
-pub fn config_frame(
-    time_between_commands_ms: u32,
-    file_access: u32,
-    max_usb_timeout_ms: u32,
-) -> [u8; CONFIG_FRAME_LEN] {
-    let mut frame = [0u8; CONFIG_FRAME_LEN];
-    frame[0] = time_between_commands_ms.min(255) as u8;
-    frame[3..5].copy_from_slice(&(file_access.min(u16::MAX as u32) as u16).to_le_bytes());
-    frame[5..7].copy_from_slice(&(max_usb_timeout_ms.min(u16::MAX as u32) as u16).to_le_bytes());
-    frame[7..9].copy_from_slice(&PACING_TRAILER_U16.to_le_bytes());
-    frame
-}
-
-/// Pull frame: `85, reserved, file_id u16, file offset u32, size u16`.
-pub fn pull_frame(fs_id: u16, file_offset: u32, size: u16) -> [u8; PULL_FRAME_LEN] {
-    let mut frame = [0u8; PULL_FRAME_LEN];
-    frame[0] = CMD_PULL_PAYLOAD;
-    frame[2..4].copy_from_slice(&fs_id.to_le_bytes());
-    frame[4..8].copy_from_slice(&file_offset.to_le_bytes());
-    frame[8..10].copy_from_slice(&size.to_le_bytes());
-    frame
-}
-
-/// Payload-read frame: `83, reserved, resource-buffer offset u16, size u16`.
-pub fn read_frame(buffer_offset: u16, size: u16) -> [u8; READ_FRAME_LEN] {
-    let mut frame = [0u8; READ_FRAME_LEN];
-    frame[0] = CMD_READ_PAYLOAD;
-    frame[2..4].copy_from_slice(&buffer_offset.to_le_bytes());
-    frame[4..6].copy_from_slice(&size.to_le_bytes());
-    frame
+/// The opening chain as plan steps: every [`ONBOARD_INIT_CHAIN`] frame as a 64-data-byte output
+/// report. The
+/// answers GG reads back are interrupt reports whose first byte is payload, so no reply report ID is
+/// claimed for them.
+fn init_steps() -> Vec<Step> {
+    ONBOARD_INIT_CHAIN
+        .iter()
+        .map(|frame| Step {
+            kind: StepKind::Init,
+            chunk: 0,
+            frame: frame.data_stage().to_vec(),
+            wire_len: INIT_REPORT_LEN,
+            reply_report_id: None,
+            reply_len: frame.expects_reply.then_some(INIT_REPLY_LEN),
+            dest: None,
+            buffer_offset: None,
+            size: 0,
+        })
+        .collect()
 }
 
 /// Parsed header of a payload-read reply.
@@ -475,8 +469,9 @@ pub fn parse_read_reply(reply: &[u8], requested_size: u16) -> Result<ReadReply> 
 }
 
 /// [`parse_read_reply`] with an explicit payload anchor: the payload starts at
-/// `1 + framing_len` (byte 0 is the report ID). The capture's replies frame the payload behind 20
-/// bytes; a keyboard that answers without framing needs `0`.
+/// `1 + framing_len` (byte 0 is the report ID). The capture's replies put the payload behind the
+/// report-ID byte alone; a keyboard that answers with a header needs `5`, one that answers with 20
+/// framing bytes needs `20`.
 ///
 /// # Errors
 ///
@@ -599,6 +594,9 @@ pub struct ProfileImage {
     pub data: Vec<u8>,
     /// Aggregated reply statistics.
     pub stats: ReadStats,
+    /// Firmware version the opening chain answered with (`None` when the chain was skipped or the
+    /// keyboard did not answer the `0x90` poll).
+    pub firmware: Option<String>,
 }
 
 impl ProfileImage {
@@ -685,7 +683,15 @@ impl ProfileImage {
             },
             chunks,
             data,
+            firmware: None,
         })
+    }
+
+    /// Record the firmware version the opening chain answered with.
+    #[must_use]
+    pub fn with_firmware(mut self, firmware: Option<String>) -> Self {
+        self.firmware = firmware;
+        self
     }
 
     /// Schema word of the assembled profile.
@@ -1157,6 +1163,7 @@ pub fn to_json(image: &ProfileImage) -> Result<String> {
         "fs_id": format!("0x{:04X}", image.config.fs_id()),
         "schema": format!("0x{schema:04X}"),
         "schema_decoded": decoded,
+        "firmware": image.firmware,
         "data_len": payload.len(),
         "sha_like_fnv1a_64": fnv1a_64(payload),
         "stats": image.stats,
@@ -1178,11 +1185,13 @@ pub fn plan_json(config: &ReadConfig) -> Result<String> {
         "payload_len": config.payload_len,
         "covered_len": config.total_resource_len(),
         "gap_ms": config.gap_ms,
-        "pacing": {
-            "time_between_commands_ms": config.time_between_commands_ms,
-            "file_access": config.file_access,
-            "max_usb_timeout_ms": config.max_usb_timeout_ms,
-            "sent": config.send_config,
+        "reply_framing_len": config.reply_header,
+        "init_chain": {
+            "sent": config.send_init_chain,
+            "frames": ONBOARD_INIT_CHAIN
+            .iter()
+            .map(|f| hex_of(&f.data_stage()))
+            .collect::<Vec<String>>(),
         },
         "transfers": steps,
     });
@@ -1192,6 +1201,7 @@ pub fn plan_json(config: &ReadConfig) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::devices::hid_reports::CommandCode;
 
     fn synthetic_payload(schema: u16) -> Vec<u8> {
         let len = payload_len_for_schema(schema).unwrap();
@@ -1224,32 +1234,79 @@ mod tests {
     }
 
     #[test]
-    fn frames_match_the_documented_wire_layout() {
-        assert_eq!(
-            config_frame(1, FILE_ACCESS_READWRITE, 500),
-            [0x01, 0, 0, 0x02, 0, 0xF4, 0x01, 0x60, 0, 0, 0, 0]
-        );
-        assert_eq!(
-            pull_frame(PROFILE_FS_BASE, 1024, 1024),
-            [0x85, 0x00, 0x01, 0x02, 0x00, 0x04, 0x00, 0x00, 0x00, 0x04]
-        );
-        assert_eq!(read_frame(512, 512), [0x83, 0x00, 0x00, 0x02, 0x00, 0x02]);
-        assert_eq!(read_frame(0, 2), [0x83, 0x00, 0x00, 0x00, 0x02, 0x00]);
-    }
-
-    #[test]
-    fn plan_is_pacing_then_pull_read_read() {
+    fn plan_frames_come_from_the_typed_commands() {
         let config = ReadConfig::default();
         config.validate().unwrap();
         let steps = config.steps();
-        assert_eq!(steps.len(), 1 + 12 * 3);
-        assert_eq!(steps[0].kind, StepKind::Config);
-        assert_eq!(steps[1].kind, StepKind::Pull);
-        assert_eq!(steps[2].kind, StepKind::Read);
-        assert_eq!(steps[3].kind, StepKind::Read);
-        assert_eq!(steps[2].dest, Some(0));
-        assert_eq!(steps[3].dest, Some(512));
-        assert_eq!(steps[5].dest, Some(1024));
+        let pull = steps.iter().find(|s| s.kind == StepKind::Pull).unwrap();
+        assert_eq!(
+            pull.frame,
+            OnboardPullCommand {
+                fs_id: PROFILE_FS_BASE,
+                file_offset: 0,
+                size: RESOURCE_BUFFER_LEN as u16,
+            }
+            .data_stage()
+            .to_vec(),
+            "the plan frame is the bytes the typed command serializes"
+        );
+        assert_eq!(pull.wire_len, PULL_REPORT_LEN);
+        let read = steps.iter().find(|s| s.kind == StepKind::Read).unwrap();
+        assert_eq!(
+            read.frame,
+            OnboardReadCommand {
+                buffer_offset: 0,
+                size: READ_LEN as u16,
+            }
+            .data_stage()
+            .to_vec()
+        );
+        assert_eq!(read.wire_len, READ_REPORT_LEN);
+        assert_eq!(
+            steps[3].frame,
+            ONBOARD_INIT_CHAIN[3].data_stage().to_vec(),
+            "the opening-chain frames come from the same source"
+        );
+    }
+
+    #[test]
+    fn opening_chain_answer_carries_the_firmware_version() {
+        let reply = [0x34u8, 0x2e, 0x31, 0x36, 0x2e, 0x38, 0x00, 0x00, 0x36, 0x34, 0x36, 0x34];
+        assert_eq!(
+            parse_firmware_version(&reply).as_deref(),
+            Some("4.16.8"),
+            "the capture's answer stops at the first NUL"
+        );
+        assert_eq!(parse_firmware_version(&[0x00, 0x01, 0x00, 0x00]), None);
+        assert_eq!(parse_firmware_version(&[]), None);
+    }
+
+    #[test]
+    fn plan_is_init_chain_then_pull_read_read() {
+        let config = ReadConfig::default();
+        config.validate().unwrap();
+        let steps = config.steps();
+        assert_eq!(steps.len(), ONBOARD_INIT_CHAIN.len() + 12 * 3);
+        assert!(
+            steps[..ONBOARD_INIT_CHAIN.len()]
+                .iter()
+                .all(|s| s.kind == StepKind::Init),
+            "the read opens with GG's chain"
+        );
+        assert_eq!(steps[0].wire_len, INIT_REPORT_LEN, "64 data bytes plus report ID");
+        assert_eq!(steps[3].frame[0], CommandCode::OpenFiles as u8);
+        assert_eq!(steps[3].reply_len, None, "6c is not answered");
+        assert_eq!(steps[ONBOARD_INIT_CHAIN.len()].kind, StepKind::Pull);
+        assert_eq!(steps[ONBOARD_INIT_CHAIN.len() + 1].kind, StepKind::Read);
+        assert_eq!(steps[ONBOARD_INIT_CHAIN.len() + 2].kind, StepKind::Read);
+        let no_chain = ReadConfig {
+            send_init_chain: false,
+            ..ReadConfig::default()
+        };
+        assert_eq!(no_chain.steps().len(), 12 * 3);
+        assert_eq!(steps[7].dest, Some(0));
+        assert_eq!(steps[8].dest, Some(512));
+        assert_eq!(steps[10].dest, Some(1024));
         let last = steps.last().unwrap();
         assert_eq!(last.kind, StepKind::Read);
         assert_eq!(last.dest, Some(11 * 1024 + 512));
@@ -1281,18 +1338,18 @@ mod tests {
     #[test]
     fn schema_read_is_one_pull_of_two_bytes() {
         let steps = schema_read_steps(0x0203);
-        assert_eq!(steps.len(), 3);
-        let pull = &steps[1];
+        assert_eq!(steps.len(), ONBOARD_INIT_CHAIN.len() + 2);
+        let pull = &steps[ONBOARD_INIT_CHAIN.len()];
+        assert_eq!(pull.kind, StepKind::Pull);
         assert_eq!(pull.size, 2);
         assert_eq!(
             u32::from_le_bytes([pull.frame[4], pull.frame[5], pull.frame[6], pull.frame[7]]),
             0,
             "the schema pull reads from the file head"
         );
-        assert_eq!(steps[2].size, 2);
-        assert_eq!(steps[2].dest, Some(0));
+        assert_eq!(steps[steps.len() - 1].size, 2);
+        assert_eq!(steps[steps.len() - 1].dest, Some(0));
     }
-
     #[test]
     fn reply_header_is_echoed_and_payload_starts_at_six() {
         let mut reply = vec![0x83u8, 0x00, 0x00, 0x02, 0x00, 0x02];
@@ -1305,6 +1362,22 @@ mod tests {
         assert_eq!(parsed.data[0], 1);
         assert!(!parsed.all_zero);
         assert!(!parsed.all_ff);
+    }
+
+    #[test]
+    fn capture_reply_payload_starts_behind_the_report_id_byte() {
+        // The GET_REPORT 0x0300 answer to `83 00 00 00 00 02` on file 0x0201 in the 2026-10-15 capture:
+        // report ID 03, then the schema word 0x000B, then the ASCII profile name 2 bytes behind it.
+        let mut reply = vec![0x03u8, 0x0b, 0x00];
+        reply.extend(b"Config 1");
+        reply.resize(READ_REPORT_LEN, 0);
+        let parsed = parse_read_reply(&reply, 512).unwrap();
+        assert_eq!(parsed.report_id, 0x03, "no header is echoed");
+        assert!(!parsed.header);
+        assert_eq!(schema_of(&parsed.data), SCHEMA_B);
+        assert_eq!(&parsed.data[2..10], b"Config 1");
+        assert_eq!(parsed.data.len(), 512);
+        assert!(!parsed.all_zero);
     }
 
     #[test]
@@ -1589,7 +1662,12 @@ mod tests {
         let plan = plan_json(&ReadConfig::default()).unwrap();
         let value: serde_json::Value = serde_json::from_str(&plan).unwrap();
         assert_eq!(value["pulls"], 12);
-        assert_eq!(value["transfers"].as_array().unwrap().len(), 37);
+        assert_eq!(value["transfers"].as_array().unwrap().len(), 42);
+        assert_eq!(value["reply_framing_len"], READ_REPLY_FRAMING_LEN);
+        assert!(
+            value["init_chain"]["sent"].as_bool().unwrap_or(false),
+            "the plan starts with the opening chain"
+        );
     }
 
     #[test]

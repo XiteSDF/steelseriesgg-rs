@@ -216,8 +216,8 @@ pub(crate) enum OnboardAction {
 }
 
 /// Wire tunables of one on-board profile read. Defaults are the values measured in the reference
-/// capture: the pacing frame's 1 ms gap and 500 ms USB timeout, a 1024-byte resource buffer, and
-/// 512-byte reads out of it.
+/// capture: GG's six-frame opening chain 11 ms apart, a 1024-byte resource buffer, and 512-byte
+/// reads out of it.
 #[cfg(feature = "onboard")]
 #[derive(clap::Args)]
 pub(crate) struct OnboardWireArgs {
@@ -245,29 +245,21 @@ pub(crate) struct OnboardWireArgs {
     #[arg(long, value_parser = parse_hex_u16)]
     pub(crate) fs_base: Option<u16>,
 
-    /// Skip the pacing frame (the capture shows GG sending it before the profile read)
+    /// Skip GG's opening chain (`90 00`, `90 01`, `f4 00`, `6c 00 01`, `90 00`, `90 01`). The capture
+    /// shows GG running it in front of every profile read, and the `90` poll is what answers the
+    /// firmware version; turning it off is a probe.
     #[arg(long)]
-    pub(crate) no_config_frame: bool,
+    pub(crate) no_init_chain: bool,
 
-    /// File-access mode sent in the pacing frame
-    #[arg(long, default_value = "2")]
-    pub(crate) file_access: u32,
-
-    /// USB timeout sent in the pacing frame, in milliseconds
-    #[arg(long, default_value = "500")]
-    pub(crate) max_usb_timeout_ms: u32,
-
-    /// Time between commands sent in the pacing frame, in milliseconds
-    #[arg(long, default_value = "1")]
-    pub(crate) time_between_commands_ms: u32,
-
-    /// Gap between transfers, in milliseconds
-    #[arg(long, default_value = "5")]
+    /// Gap between transfers, in milliseconds (11 is the spacing the capture shows between the
+    /// opening-chain frames)
+    #[arg(long, default_value = "11")]
     pub(crate) gap_ms: u64,
 
-    /// Framing bytes between the report-ID byte and the payload in a payload-read reply (20 matches
-    /// the capture; 0 suits a keyboard that answers with no framing)
-    #[arg(long, default_value = "20")]
+    /// Framing bytes between the report-ID byte and the payload in a payload-read reply (0 matches the
+    /// capture, where every answer puts the payload directly behind the report-ID byte; 6 is
+    /// what the Apex 7 accepted on 2026-10-15, 5 suits a keyboard that echoes the request header)
+    #[arg(long, default_value = "0")]
     pub(crate) reply_header: usize,
 }
 
@@ -284,10 +276,7 @@ impl OnboardWireArgs {
                 .payload_len
                 .unwrap_or(steelseries_gg::onboard_profile::PAYLOAD_LEN_A),
             fs_base: self.fs_base.unwrap_or(steelseries_gg::onboard_profile::PROFILE_FS_BASE),
-            send_config: !self.no_config_frame,
-            file_access: self.file_access,
-            max_usb_timeout_ms: self.max_usb_timeout_ms,
-            time_between_commands_ms: self.time_between_commands_ms,
+            send_init_chain: !self.no_init_chain,
             gap_ms: self.gap_ms,
             reply_header: self.reply_header,
         }
