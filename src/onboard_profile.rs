@@ -5,34 +5,40 @@
 //! hardware loop is [`crate::devices::keyboards::apex_legacy_onboard`] (feature `onboard`).
 //!
 //! Protocol status: reverse-engineered. The file ids, chunk geometry, frame layouts and the payload
-//! struct layout below are reproduced from the Windows engine's device descriptors, and every one of
+//! struct layout below are reproduced from the Windows engine's device descriptors, and the wire part of
 //! them is visible in one Windows USBPcap capture of the official GG talking to an Apex 7 (firmware
-//! 4.16.8, 2026-10-15, `ssgg-capture-1612-20261015-004400`): the capture contains 121 pulls
-//! (report `0x85`, 64-byte replies) and 241 payload reads (report `0x83`, 642-byte replies) that form
-//! the `pull, read, read` pattern described here. On 2026-10-15 an Apex 7 accepted the pacing frame, the
-//! pull and the payload-read request on its vendor collection, and answered on the interrupt endpoint; the
-//! full read has not completed on hardware, and nothing here writes a profile. Treat every constant as
-//! unverified until the first Linux read-back.
+//! 4.16.8, 2026-10-15, `ssgg-capture-1612-20261015-004400`, decoded from `hub-2.pcap` frame by frame):
+//! 120 pulls of 1024 bytes at file offsets 0..11264, each drained by reads at buffer offsets 0 and 512,
+//! 100 of them on file `0x0201` (profile slot 0) plus one schema probe; 241 payload reads, every one of
+//! them answering with the first payload byte `0x0B`, i.e. schema [`SCHEMA_B`]. On 2026-10-15 an Apex 7
+//! accepted the pacing frame, the pull and the payload-read request on its interface-4 vendor collection
+//! and answered a pull on the interrupt endpoint; the payload read timed out there, which is why the
+//! reply is read on the control endpoint first. The full read has not completed on hardware, and nothing
+//! here writes a profile. Treat the payload struct offsets as unverified until the first Linux read-back.
 //!
 //! # Wire format
 //!
-//! All transfers run on the keyboard's vendor collection (the Apex 7 exposes it as usage page `0xffc1` on
-//! USB interface 4, and usage page `0xffc0` on interface 1 holds the same protocol family). Report numbers
-//! are embedded in the payload, so in `hidapi` terms the first byte of every buffer is the report ID.
+//! All transfers run on the keyboard's vendor collections. The Apex 7 exposes usage page `0xffc0` on
+//! USB interface 1 (this is where the reference capture shows every profile transfer running) and usage
+//! page `0xffc1` on interface 4 (the collection the Linux `hidraw` node for the profile protocol sits
+//! on). Report numbers are embedded in the payload, so in `hidapi` terms the first byte of every buffer
+//! is the report ID.
 //!
 //! * pacing (`HIDCONFIG`, feature report ID `0x00`, 12 bytes on the wire):
-//!   `00 | time_between_commands u32 LE | file_access u32 LE | max_usb_timeout u32 LE`,
-//!   GG reads a profile with `1 | 2 | 500`.
-//! * pull (`HIDIO`, output report ID `0x00`, 65 bytes on the wire, i.e. a 64-byte output report):
-//!   `00 | 85 | 00 | file_id u16 LE | offset u32 LE | size u16 LE | 00…`
+//!   `time_between_commands u32 LE | file_access u32 LE | max_usb_timeout u32 LE`,
+//!   GG reads a profile with `1 | 2 | 500`. The reference capture contains no 12-byte frame at all,
+//!   so GG's profile read does not need it and `ReadConfig::default` skips it.
+//! * pull (`HIDIO`, output report ID `0x00`, 64 bytes on the wire, `SET_REPORT wValue 0x0200 wIndex 1`):
+//!   `85 | 00 | file_id u16 LE | offset u32 LE | size u16 LE | 00…` (10 frame bytes, 11-byte report buffer)
 //!   — copies `size` bytes of the profile file into the device's resource buffer at buffer offset 0.
-//!   The keyboard answers with input report `0x85` (64 bytes, contents not interpreted here).
-//! * payload read (`HIDFEATURE`, feature report ID `0x00`, 643 bytes on the wire):
-//!   `00 | 83 | 00 | offset u16 LE | size u16 LE | 00…`
-//!   — returns `size` bytes of the resource buffer. The keyboard answers with a report that carries
-//!   `offset` and `size` back in its header, payload from byte 6: on Linux that answer arrives as one
-//!   input report (the collection declares a 1024-byte maximum input report); the reference capture shows
-//!   it as a 642-byte control answer.
+//!   The keyboard answers with input report `0x85` (64 bytes on `0x82`, constant in the capture, contents
+//!   not interpreted here).
+//! * payload read (`HIDFEATURE`, feature report ID `0x00`, 642 bytes on the wire, `SET_REPORT wValue
+//!   0x0300 wIndex 1`): `83 | 00 | offset u16 LE | size u16 LE | 00…` (6 frame bytes, 643-byte report buffer)
+//!   — returns `size` bytes of the resource buffer. GG reads the answer with `GET_REPORT wValue 0x0300
+//!   wIndex 1 wLength 642`, and that answer carries no header: the payload starts at byte 1. Some
+//!   firmware echoes the request header instead, with the payload from byte 6; [`parse_read_reply`]
+//!   accepts both.
 //!
 //! A profile file is read as `ceil((payload_len + 1023) / 1024)` resource-buffer fills
 //! ([`RESOURCE_BUFFER_LEN`] each); every fill is drained with two [`READ_LEN`]-byte payload reads at
@@ -95,18 +101,38 @@ pub const READ_REPLY_REPORT_ID: u8 = 0x83;
 pub const PULL_REPLY_REPORT_ID: u8 = 0x85;
 /// Report ID of a lighting-config payload-read reply.
 pub const LIGHTING_READ_REPLY_REPORT_ID: u8 = 0x03;
-/// Feature report length of a payload read, report ID byte included.
+/// Report buffer length of a payload read, report ID byte included: the reference capture shows
+/// `SET_REPORT wValue 0x0300 wLength 642`, i.e. one less byte on the wire.
 pub const READ_REPORT_LEN: usize = 643;
-/// Output report length of a pull, report ID byte included.
+/// Report buffer length of a pull, report ID byte included (`SET_REPORT wValue 0x0200 wLength 64`).
 pub const PULL_REPORT_LEN: usize = 65;
-/// Feature report length of the pacing frame.
-pub const CONFIG_REPORT_LEN: usize = 12;
-/// Header of a payload-read reply, report ID byte excluded: `reserved, offset u16, size u16`.
+/// Report buffer length of the pacing frame, report ID byte included.
+pub const CONFIG_REPORT_LEN: usize = 13;
+/// Header of a header-echoing payload-read reply, report ID byte excluded: `reserved, offset u16, size u16`.
 pub const READ_REPLY_HEADER_LEN: usize = 5;
-/// Frame length of a pull command, report ID byte excluded.
-pub const PULL_FRAME_LEN: usize = 11;
-/// Frame length of a payload-read command, report ID byte excluded.
-pub const READ_FRAME_LEN: usize = 7;
+/// Framing bytes the 2026-10-15 capture puts between the report-ID byte and the payload of a
+/// payload-read reply (`GET_REPORT wValue 0x0300 wIndex 1`): the reply starts `ff ff 00 00 00 00
+/// 08 00 01 02 00 07 00 80 02 82 02 00 00 03`, then the file bytes. 20 of the 241 replies were
+/// captured with the schema word at this offset (`0b 00` for the 2-byte probe of file `0x0201`),
+/// and the 512-byte replies of the same file carry the profile name 16 bytes later, so the anchor
+/// is measured, not derived. `ssgg onboard read --reply-header` changes it.
+pub const READ_REPLY_FRAMING_LEN: usize = 20;
+/// Frame length of a pull command (`85, reserved, file id u16, offset u32, size u16`);
+/// `request_buffer` prefixes the report ID byte.
+pub const PULL_FRAME_LEN: usize = 10;
+/// Frame length of a payload-read command (`83, reserved, offset u16, size u16`); `request_buffer`
+/// prefixes the report ID byte.
+pub const READ_FRAME_LEN: usize = 6;
+/// Pacing frame length in the wire buffer: the 9 bytes the capture shows plus the padding GG pads to.
+/// See [`config_frame`].
+///
+/// The report-ID byte (report number 0) that `request_buffer` prefixes is not part of it.
+pub const CONFIG_FRAME_LEN: usize = 12;
+/// Trailing word every pacing frame in the capture carries (`60 00` = 96). Its meaning is unknown; GG
+/// sends it, so `ssgg` sends it.
+pub const PACING_TRAILER_U16: u16 = 96;
+/// Bytes in a profile schema word, and the size of a schema-only payload read.
+pub const SCHEMA_READ_LEN: usize = 2;
 /// `file_access` value GG uses for a profile read (read/write file access).
 pub const FILE_ACCESS_READWRITE: u32 = 2;
 /// `max_usb_timeout` value GG uses for a profile read, in milliseconds.
@@ -117,8 +143,9 @@ pub const TIME_BETWEEN_COMMANDS_MS: u32 = 1;
 /// milliseconds. Used as the default pacing between our own transfers.
 pub const GG_GAP_MS: u64 = 5;
 
-/// Largest payload a payload-read reply can carry: the reply report minus the report ID byte and the
-/// reply header.
+/// Largest payload a payload-read reply can carry: the reply report (643 bytes, report ID byte included)
+/// minus that byte. Header-echoing replies can carry 636 bytes; the capture's payload-only answers the
+/// full 642, so 636 is the ceiling both shapes agree on.
 pub const MAX_READ_LEN: usize = READ_REPORT_LEN - 1 - READ_REPLY_HEADER_LEN;
 
 /// One entry of the read sequence.
@@ -192,6 +219,10 @@ pub struct ReadConfig {
     pub max_usb_timeout_ms: u32,
     /// Send the pacing frame before the pull loop. GG always sends it; turning it off is a probe.
     pub send_config: bool,
+    /// Framing bytes between the report-ID byte and the payload of a payload-read reply;
+    /// [`READ_REPLY_FRAMING_LEN`] matches the 2026-10-15 capture, `0` suits a keyboard that answers
+    /// with no framing.
+    pub reply_header: usize,
 }
 
 impl Default for ReadConfig {
@@ -208,6 +239,7 @@ impl Default for ReadConfig {
             file_access: FILE_ACCESS_READWRITE,
             max_usb_timeout_ms: MAX_USB_TIMEOUT_MS,
             send_config: true,
+            reply_header: READ_REPLY_FRAMING_LEN,
         }
     }
 }
@@ -319,8 +351,18 @@ impl ReadConfig {
     }
 }
 
-/// Transfer sequence for a schema-only read: one pull of 2 bytes, one payload read of 2 bytes.
+/// Schema pulls tried by the probe: the reference implementation pulls 2 bytes, the reference capture shows
+/// GG pulling 0 bytes at the file head before a 2-byte read. Both are tried, so a keyboard that only
+/// understands one of them still answers.
+pub const SCHEMA_PULL_SIZES: [u16; 2] = [2, 0];
+
+/// Transfer sequence for a schema-only read: one pull, one payload read of 2 bytes.
 pub fn schema_read_steps(fs_id: u16) -> Vec<Step> {
+    schema_read_steps_with(fs_id, SCHEMA_PULL_SIZES[0])
+}
+
+/// Transfer sequence for a schema-only read with a chosen pull size (see [`SCHEMA_PULL_SIZES`]).
+pub fn schema_read_steps_with(fs_id: u16, pull_size: u16) -> Vec<Step> {
     vec![
         Step {
             kind: StepKind::Config,
@@ -336,39 +378,48 @@ pub fn schema_read_steps(fs_id: u16) -> Vec<Step> {
         Step {
             kind: StepKind::Pull,
             chunk: 0,
-            frame: pull_frame(fs_id, 0, 2).to_vec(),
+            frame: pull_frame(fs_id, 0, pull_size).to_vec(),
             wire_len: PULL_REPORT_LEN,
             reply_report_id: Some(PULL_REPLY_REPORT_ID),
             reply_len: Some(64),
             dest: None,
             buffer_offset: None,
-            size: 2,
+            size: pull_size,
         },
         Step {
             kind: StepKind::Read,
             chunk: 0,
-            frame: read_frame(0, 2).to_vec(),
+            frame: read_frame(0, SCHEMA_READ_LEN as u16).to_vec(),
             wire_len: READ_REPORT_LEN,
             reply_report_id: Some(READ_REPLY_REPORT_ID),
             reply_len: Some(READ_REPORT_LEN),
             dest: Some(0),
             buffer_offset: Some(0),
-            size: 2,
+            size: SCHEMA_READ_LEN as u16,
         },
     ]
 }
 
-/// Pacing frame: `time_between_commands, file_access, max_usb_timeout`, three little-endian words.
-pub fn config_frame(time_between_commands_ms: u32, file_access: u32, max_usb_timeout_ms: u32) -> [u8; 12] {
-    let mut frame = [0u8; CONFIG_REPORT_LEN];
-    frame[0..4].copy_from_slice(&time_between_commands_ms.to_le_bytes());
-    frame[4..8].copy_from_slice(&file_access.to_le_bytes());
-    frame[8..12].copy_from_slice(&max_usb_timeout_ms.to_le_bytes());
+/// Pacing frame, laid out as the 2026-10-15 capture shows it: `time u8 | reserved u16 | file_access
+/// u16 LE | max_usb_timeout u16 LE | 96 u16 LE`, padded with three zero bytes to the 12 payload bytes
+/// GG writes (`wLength 13` counts the report-number byte). The capture's own frame is
+/// `01 00 00 02 00 f4 01 60 00` for 1 ms, read/write access and a 500 ms USB timeout; its last three
+/// padding bytes were not captured, and the meaning of the trailing `96` is unknown.
+pub fn config_frame(
+    time_between_commands_ms: u32,
+    file_access: u32,
+    max_usb_timeout_ms: u32,
+) -> [u8; CONFIG_FRAME_LEN] {
+    let mut frame = [0u8; CONFIG_FRAME_LEN];
+    frame[0] = time_between_commands_ms.min(255) as u8;
+    frame[3..5].copy_from_slice(&(file_access.min(u16::MAX as u32) as u16).to_le_bytes());
+    frame[5..7].copy_from_slice(&(max_usb_timeout_ms.min(u16::MAX as u32) as u16).to_le_bytes());
+    frame[7..9].copy_from_slice(&PACING_TRAILER_U16.to_le_bytes());
     frame
 }
 
 /// Pull frame: `85, reserved, file_id u16, file offset u32, size u16`.
-pub fn pull_frame(fs_id: u16, file_offset: u32, size: u16) -> [u8; 11] {
+pub fn pull_frame(fs_id: u16, file_offset: u32, size: u16) -> [u8; PULL_FRAME_LEN] {
     let mut frame = [0u8; PULL_FRAME_LEN];
     frame[0] = CMD_PULL_PAYLOAD;
     frame[2..4].copy_from_slice(&fs_id.to_le_bytes());
@@ -378,7 +429,7 @@ pub fn pull_frame(fs_id: u16, file_offset: u32, size: u16) -> [u8; 11] {
 }
 
 /// Payload-read frame: `83, reserved, resource-buffer offset u16, size u16`.
-pub fn read_frame(buffer_offset: u16, size: u16) -> [u8; 7] {
+pub fn read_frame(buffer_offset: u16, size: u16) -> [u8; READ_FRAME_LEN] {
     let mut frame = [0u8; READ_FRAME_LEN];
     frame[0] = CMD_READ_PAYLOAD;
     frame[2..4].copy_from_slice(&buffer_offset.to_le_bytes());
@@ -393,6 +444,8 @@ pub struct ReadReply {
     pub report_id: u8,
     /// Reserved header byte behind the report ID.
     pub reserved: u8,
+    /// True when the reply echoed the request header (see [`parse_read_reply`]).
+    pub header: bool,
     /// Buffer offset the keyboard echoes.
     pub offset: u16,
     /// Size the keyboard echoes.
@@ -410,25 +463,48 @@ pub struct ReadReply {
 ///
 /// `size` is the size that was requested; the payload is taken from the reply at
 /// [`READ_REPLY_HEADER_LEN`] and truncated to the requested size when the report carries more.
+/// Parse a payload-read reply (`reply` starts with the report ID byte) and extract its payload.
+///
+/// The reference capture shows the keyboard answering a payload read in two shapes, both accepted
+/// here. On the interrupt endpoint the reply echoes the request header and the payload starts at
+/// byte 6; on the control endpoint (`GET_REPORT 0x0300`, 642 bytes on interface 1) the answer carries
+/// no header at all, so the payload starts directly behind the report-ID byte. The reply header of
+/// the first shape is `[0x83][reserved][buffer offset u16 LE][size u16 LE]`.
 pub fn parse_read_reply(reply: &[u8], requested_size: u16) -> Result<ReadReply> {
-    if reply.len() < 1 + READ_REPLY_HEADER_LEN {
-        return Err(Error::Profile(format!(
-            "payload-read reply is {} bytes, shorter than the {}-byte report header",
-            reply.len(),
-            1 + READ_REPLY_HEADER_LEN
-        )));
+    parse_read_reply_at(reply, requested_size, READ_REPLY_FRAMING_LEN)
+}
+
+/// [`parse_read_reply`] with an explicit payload anchor: the payload starts at
+/// `1 + framing_len` (byte 0 is the report ID). The capture's replies frame the payload behind 20
+/// bytes; a keyboard that answers without framing needs `0`.
+///
+/// # Errors
+///
+/// Returns [`Error::Profile`] when the reply is empty.
+pub fn parse_read_reply_at(reply: &[u8], requested_size: u16, framing_len: usize) -> Result<ReadReply> {
+    if reply.is_empty() {
+        return Err(Error::Profile("payload-read reply is empty".to_string()));
     }
-    let offset = u16::from_le_bytes([reply[2], reply[3]]);
-    let size = u16::from_le_bytes([reply[4], reply[5]]);
-    let end = (1 + READ_REPLY_HEADER_LEN + usize::from(requested_size))
-        .min(reply.len())
-        .min(1 + READ_REPLY_HEADER_LEN + MAX_READ_LEN);
-    let data = reply[1 + READ_REPLY_HEADER_LEN..end].to_vec();
+    let header = reply.len() > READ_REPLY_HEADER_LEN && reply[0] == READ_REPLY_REPORT_ID && reply[1] == 0;
+    let (offset, size, payload) = if header {
+        (
+            u16::from_le_bytes([reply[2], reply[3]]),
+            u16::from_le_bytes([reply[4], reply[5]]),
+            &reply[1 + READ_REPLY_HEADER_LEN..],
+        )
+    } else if reply.len() > 1 + framing_len {
+        (0, requested_size, &reply[1 + framing_len..])
+    } else {
+        (0, requested_size, &reply[reply.len().saturating_sub(1)..])
+    };
+    let limit = usize::from(requested_size).min(MAX_READ_LEN);
+    let data = payload.iter().copied().take(limit).collect::<Vec<u8>>();
     let all_zero = data.iter().all(|b| *b == 0);
     let all_ff = data.len() >= 4 && data[..4].iter().all(|b| *b == 0xFF);
     Ok(ReadReply {
         report_id: reply[0],
         reserved: reply[1],
+        header,
         offset,
         size,
         data,
@@ -1151,14 +1227,14 @@ mod tests {
     fn frames_match_the_documented_wire_layout() {
         assert_eq!(
             config_frame(1, FILE_ACCESS_READWRITE, 500),
-            [0x01, 0, 0, 0, 0x02, 0, 0, 0, 0xF4, 0x01, 0, 0]
+            [0x01, 0, 0, 0x02, 0, 0xF4, 0x01, 0x60, 0, 0, 0, 0]
         );
         assert_eq!(
             pull_frame(PROFILE_FS_BASE, 1024, 1024),
-            [0x85, 0x00, 0x01, 0x02, 0x00, 0x04, 0x00, 0x00, 0x00, 0x04, 0x00]
+            [0x85, 0x00, 0x01, 0x02, 0x00, 0x04, 0x00, 0x00, 0x00, 0x04]
         );
-        assert_eq!(read_frame(512, 512), [0x83, 0x00, 0x00, 0x02, 0x00, 0x02, 0x00]);
-        assert_eq!(read_frame(0, 2), [0x83, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00]);
+        assert_eq!(read_frame(512, 512), [0x83, 0x00, 0x00, 0x02, 0x00, 0x02]);
+        assert_eq!(read_frame(0, 2), [0x83, 0x00, 0x00, 0x00, 0x02, 0x00]);
     }
 
     #[test]
@@ -1292,6 +1368,7 @@ mod tests {
                     .map(|read| ReadReply {
                         report_id: 0x83,
                         reserved: 0,
+                        header: true,
                         offset: (read * config.read_len) as u16,
                         size: config.read_len as u16,
                         data: vec![(chunk * 8 + read + 1) as u8; config.read_len],
@@ -1333,6 +1410,7 @@ mod tests {
                 .map(|read| ReadReply {
                     report_id: 0x83,
                     reserved: 0,
+                    header: true,
                     offset: (read * 512) as u16,
                     size: 512,
                     data: vec![0xAA_u8; 512],
@@ -1485,6 +1563,7 @@ mod tests {
                                 ReadReply {
                                     report_id: 0x83,
                                     reserved: 0,
+                                    header: true,
                                     offset: (read * READ_LEN) as u16,
                                     size: READ_LEN as u16,
                                     all_zero: data_slice.iter().all(|b| *b == 0),
@@ -1529,6 +1608,7 @@ mod tests {
                 .map(|i| ReadReply {
                     report_id: 0x83,
                     reserved: 0,
+                    header: true,
                     offset: ((i % 2) * READ_LEN) as u16,
                     size: READ_LEN as u16,
                     data: vec![if i == 3 { first } else { 0u8 }; READ_LEN],

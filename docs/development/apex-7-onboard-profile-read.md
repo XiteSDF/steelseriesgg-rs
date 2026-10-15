@@ -1,89 +1,83 @@
 # Apex 7 on-board profile read
 
 Source: capture notes (Windows USBPcap capture of SteelSeries GG talking to an
-Apex 7, 2026-10-15, firmware `4.16.3`). Every item below is `[EXPERIMENTAL]`: nothing of it has been
-replayed from `ssgg` on real hardware. Code: `src/onboard_profile.rs` (wire format, decode),
+Apex 7, PID `0x1612`, 2026-10-15, firmware `4.16.8`). Every item below is `[EXPERIMENTAL]`: nothing of
+it has been replayed from `ssgg` on real hardware. Code: `src/onboard_profile.rs` (wire format, decode),
 `src/devices/keyboards/apex_legacy_onboard.rs` (transfers), `ssgg onboard` (`src/cli.rs`,
 `src/main.rs`), all behind the `onboard` feature.
 
-The capture records control transfers only as *responses* (decoded response listing: 615 rows, report IDs
-`0x83`, `0x85`, `0x03`, `0x6e`, `0x68`, `0x90`, …). GG's requests are not in the CSV, so each request
-frame below is the reply-side layout turned around: same command byte, same field order, padded to the
-report length GG uses. Where a request detail is not visible from a reply it is marked **inferred**.
+The framing below is decoded from the capture's URBs (engine capture 2, parsed packet by packet: the 8-byte
+setup block of every control transfer plus its data stage), not from the decoded response listing. The CSV holds only
+*responses* (615 rows), so it was the starting point and not the authority: the request shapes and the
+reply framing in this document are what the URB decode shows. Counts quoted here are from that decode.
 
 ## Device and transport
 
-Legacy Apex family (Apex 7, Apex Raw, Apex 2014): four HID collections, and the profile
-protocol lives on the control collection — the third in enumeration order, the one whose
-`phys` path ends in `0x10000003`. `/dev/hidrawN` nodes are not in enumeration order, so
-`ssgg onboard` ranks candidate paths (the requested node first, then a `--device vid:pid` match
-through `hidapi`, then the sysfs control collection, then the remaining nodes) and stops at the first
-path that answers the protocol.
+Legacy Apex family (Apex 7, Apex Raw, Apex 2014): four HID collections. On Windows every profile
+transfer in the capture runs on **USB interface 1** (`wIndex 1`), the collection GG opens for profile
+traffic; the counts below are from that file. On the Linux box used for the hardware probe
+(same keyboard family, firmware `2.4.3`) the collection that accepts the same frames is
+`the hidraw node`, usage page `0xFFC1`, interface 4, `max_report_size 644`, `max_input_report 1024`,
+`max_output_report 64`. `/dev/hidrawN` numbers are not enumeration order, so `ssgg onboard` takes a
+`--device` node first, then every other collection of the same `vid:pid`, ordered by interface number,
+and stops at the first one that answers.
 
-| Transfer | Report | Length on the wire |
-|----------|--------|--------------------|
-| pacing frame | feature report `0x00` | 12 |
-| pull | output report `0x85` | 65 (ID byte + 64-byte frame) |
-| payload read | feature report `0x83` | 643 (ID byte + 642-byte frame) |
-| pull reply | input report `0x85` | 64 |
-| payload-read reply | feature report `0x83` | 642 (measured in the capture) |
+| Transfer | Control setup (from the capture) | Frame bytes (data stage) |
+|----------|------------------------------|------------------------|
+| pacing frame | `SET_REPORT`, `bmRequestType 0x21`, `wValue 0x0200`, `wIndex 1`, `wLength 13` | `01 00 00 …`: pacing `u8` 1 ms, `u16` 0, file access `u16` 2, USB timeout `u16` 500 ms, trailing `u16` 96 |
+| pull | `SET_REPORT`, `wValue 0x0200`, `wIndex 1`, `wLength 64` | `85 00 <file selector u16 LE> <file offset u32 LE> <size u16 LE>`, then zeros to 64 |
+| payload read | `SET_REPORT`, `wValue 0x0300`, `wIndex 1`, `wLength 642` | `83 00 <resource-buffer offset u16 LE> <size u16 LE>`, then zeros to 642 |
+| payload write | `SET_REPORT`, `wValue 0x0300`, `wIndex 1`, `wLength 642` | `03 00 <buffer offset u16 LE> <size u16 LE> <payload…>` — GG's write direction, 144 transfers, not sent by `ssgg` |
+| payload reply | `GET_REPORT`, `wValue 0x0300`, `wIndex 1`, `wLength 642` | 642 bytes: report-ID byte `B5`/`B6`/`B7`, then 20 framing bytes, then the file bytes (see "Reply framing") |
+
+All three request shapes are output-report (`wValue 0x0200`) or feature-report (`wValue 0x0300`)
+`SET_REPORT` transfers: report **number 0** in both cases, the command byte sits in the data stage, not
+in `wValue`. On Linux that means `write()` for the pacing and pull frames (data[0] = report number 0)
+and the feature-report write for the read request.
+
 
 ## Capture evidence
 
-In step 1 (GG starting up) the capture shows, in order:
+Counts in the engine capture 2 for the profile collection (interface 1): 385 `SET_REPORT wValue 0x0300
+wLength 642` transfers (241 read requests, 144 payload writes), 241 `GET_REPORT wValue 0x0300
+wLength 642` transfers (the answers), 230 `SET_REPORT wValue 0x0200 wLength 64` transfers (121 pulls,
+the rest pacing and other traffic on the same collection), 12 of the pull shape on `wIndex 0`.
 
-```
-85 00 01 02 00 00 00 00 00      64 bytes   pull: file 0x0201, offset 0, size 0
-83 00 00 00 00 02 <636 bytes>   642 bytes  read reply: offset 0, size 2   -> schema word
-85 00 01 02 00 04 00 00 00 04   64 bytes   pull: file 0x0201, offset 1024, size 1024
-83 00 00 00 00 02 <636 bytes>   642 bytes  read reply: buffer offset 0,   size 512
-83 00 00 02 00 02 <636 bytes>   642 bytes  read reply: buffer offset 512, size 512
-... 11 more pulls at offset 2048..11264, each followed by the same two reads
-85 00 02 02 ...                               same sequence for file 0x0202, then 0x0203..0x0205
-85 00 01 03 ... 85 00 05 03 ...               same sequence for the lighting files 0x0301..0x0305
-```
+The read requests are exactly three shapes:
 
-Counts in the capture: 121 pulls (1 with size 0, 120 with size 1024), 241 read replies
-(1 with size 2, 120 with buffer offset 0 / size 512, 120 with buffer offset 512 / size 512),
-file ids `0x0201`–`0x0205` (five profile slots) and `0x0301`–`0x0305` (five per-profile lighting
-files). Median gap between two consecutive replies is 5 ms; one pull-then-two-reads cycle takes
-about 9.5 ms. The capture also shows `0x03`-prefixed 642-byte replies (144 of them) — the
-payload-read replies of the lighting files answer on report ID `0x03`, not `0x83`.
+| buffer offset | size | count |
+|---------------|------|-------|
+| 0 | 2 | 1 (the schema probe of the profile file of slot 0) |
+| 0 | 512 | 120 |
+| 512 | 512 | 120 |
 
-**Inferred request frames** (`0x83` request: `83 00 <buffer offset u16 LE> <size u16 LE>` padded to
-642; `0x85` request: `85 00 <file id u16 LE> <file offset u32 LE> <size u16 LE>` padded to 64;
-pacing frame: `<time_between_commands u32 LE> <file_access u32 LE> <max_usb_timeout u32 LE>` =
-`01 00 00 …`). The pacing frame is sent once before the profile read.
+So a 1024-byte pull is drained by two 512-byte reads, and GG never asks for more than 512 bytes per
+read. The 121 pulls are: one head probe of file `0x0201` at offset 0 with size 0, then 12 pulls of
+1024 bytes per file at offsets `0, 1024, …, 11264` for each of the five profile files `0x0201`-`0x0205`
+and the five lighting files `0x0301`-`0x0305`. Median gap between two consecutive replies is 5 ms; one
+pull with its two reads takes about 9.5 ms; the submit-to-completion latency of a payload read is
+1-3 ms.
 
-The read reply header is `[0x83][reserved u8][buffer offset u16 LE][size u16 LE]` and the payload
-follows at byte 6: 642 − 6 = 636 usable payload bytes per read, which is why GG splits a 1024-byte
-pull into two 512-byte reads.
-
-**Linux reply channel (measured 2026-10-15, Apex 7 wired, firmware `2.4.3`).** The answer arrives as one
-**input report** on the interrupt endpoint, not as a control read-back. Reading it as a feature report works
-on Windows; on Linux the same request blocks for the kernel's 5-second control timeout
-(`Connection timed out (os error 110)`) because the keyboard answers nothing on the control endpoint. So
-`apex_legacy_onboard.rs` reads the interrupt endpoint first (up to `INPUT_REPORT_MAX_LEN` = 1024, the
-collection's declared maximum input report) with a 1-second ceiling, and keeps the feature-report read as a
-fallback. Both channels carry the same `[id][reserved][offset][size]` frame.
 
 ## Procedure
 
 ```
-send pacing frame 01 00 00 00 | 02 00 00 00 | f4 01 00 00    (1 ms, read/write, 500 ms timeout)
+write output report 0, 13 bytes: 00 | 01 00 00 02 00 f4 01 60 00          # pacing frame, once
 for each chunk c in 0..12:
-    write output report 0x85: 85 00 | fs_id u16 | (c * 1024) u32 | 1024 u16      # fill the buffer
-    read input report 0x85 (64)                                                  # pull ack
+    write output report 0, 64 bytes: 85 00 | fs_id u16 | (c * 1024) u32 | 1024 u16   # fill the buffer
+    read the pull answer (the capture carries it as an input report)
     for buffer_offset in {0, 512}:
-        write feature report 0x83: 83 00 | buffer_offset u16 | 512 u16
-        read feature report 0x83 (642) -> payload bytes at 6..6+512 land at file_offset + buffer_offset
+        write feature report 0, 642 bytes: 83 00 | buffer_offset u16 | 512 u16
+        GET_REPORT wValue 0x0300 wLength 642 -> file bytes behind the 20 framing bytes
     sleep 5 ms
 ```
 
-12 pulls × 1024 bytes cover 12288 bytes, enough for the 11648-byte profile payload. A schema-only
-read is one pull of the file head with size 0 followed by one read of 2 bytes. `ssgg onboard plan`
-prints this sequence; `ssgg onboard schema` runs the schema-only read; `ssgg onboard read --yes`
-runs the whole read.
+12 pulls of 1024 bytes cover 12288 bytes, enough for the 11648-byte schema A payload and the
+11696-byte schema B payload. A schema-only read is one 2-byte read of the file head. `ssgg onboard
+plan` prints the sequence, `ssgg onboard schema` runs the 2-byte probe (with `--sweep` it probes
+several reply framings), `ssgg onboard read --yes` runs the whole read. The reply framing length is
+`--reply-header` (default 20, the offset the capture's probe reply shows).
+
 
 ## Payload layout
 
@@ -123,6 +117,39 @@ The Windows engine's start-location table for a neighbouring Apex 7 model names 
 OLED and macro blocks; neither the 4-byte nor the 5-byte entry hypothesis lands on those numbers, so
 they are recorded as an open question, not as a layout.
 
+## Reply framing (measured, and the reason for `--reply-header`)
+
+All 241 payload answers in the capture start with the same 20 bytes:
+
+```
+ff ff 00 00 00 00 08 00 01 02 00 07 00 80 02 82 02 00 00 03
+```
+
+That block carries the file selector (`01 02` = `0x0201`), GG's pacing words (`f4 01 60 00` = 500 ms,
+96) and two status bytes; it is framing, not profile data. Behind it:
+
+- the 2-byte probe reply of file `0x0201` carries `0b 00` at framing offset 0, i.e. schema word
+  `0x000B`, 11696-byte payload (schema B, the Rapid Tap layout);
+- the 512-byte replies of the same file carry the profile name 16 bytes later, at reply byte 36;
+- the report-ID byte of these answers is `B5`, `B6` or `B7`, never `83` (the request's report number)
+  and never `03` (the write direction's report number).
+
+Assembling GG's own reads of file `0x0201` (12 pulls, 24 replies) with the 20-byte framing gives a
+12288-byte image whose schema word at offset 0 reads `0x0000`, whose profile name (`Config 1`) sits at
+offset 18, whose last 4 bytes are zeros, and whose CRC-32/STM32 computed over the 11648, 11696 and
+12288-byte regions (minus their last 4 bytes, as u32 and as u16 words) matches none of them. The same
+holds for slots 2-5 (`Config 2`, `Config 3`, `Config 4`) and for the lighting files, which carry no
+name at all. Slot 5 and lighting file 3 (`0x0205`, `0x0303`) were captured mid-transfer: their
+assembled bytes contain a timestamp-shaped word where the name should be, so those two files are not
+clean evidence.
+
+That is why the reply anchor is a CLI knob. `ssgg onboard schema --sweep` probes framing lengths
+`0, 5, 6, 14, 19, 20, 21, 36` on one file and prints which of them yields a schema word the decoder
+knows; `ssgg onboard read --reply-header N` assembles with that anchor. `decode` prints stored and
+computed checksum words side by side and never claims a profile is verified, because on the reference
+keyboard GG's own read-back does not verify either.
+
+
 ## Safety
 
 Read-only code. `ssgg onboard` writes nothing to the keyboard: the push command (`0x05`) is named in
@@ -131,49 +158,36 @@ profile blob contains blocks this layout does not explain, and writing a synthet
 keyboard in a state GG itself cannot repair. `read` and `schema` require `--yes`; `plan` and
 `decode` never touch a device.
 
-## Open questions
+## What is not settled
 
-- The `0x4B` init frame of the Apex Pro TKL 2022/2023 direct path: unknown whether the legacy Apex
-  family needs it, and the capture's opening frames (`0x90`, `0xf4`, `0x6c`, `0x6e`, `0x68`) are not
-  decoded.
-- Which of the 121 pulls GG issued per file is the size-0 pull at the file head: it precedes the
-  schema read of file `0x0201`; the capture shows no size-0 pulls for the other files.
-- The 260 (schema A) / 267 (schema B) payload bytes between the macro block and the checksum.
-- The lighting files (`0x0301`–`0x0305`, and the shared `0x0102`): same split/read procedure,
-  different reply report ID (`0x03`); payload length and layout not examined.
-- Interface number for the control collection on Linux (`/dev/hidraw` does not need one; a Windows
-  `hid_open` path built from a device path must use the control collection's own interface).
-- Timing limits: the capture shows ~5 ms between replies; whether the keyboard tolerates more is
-  untested. `--gap-ms` is exposed for exactly that reason.
-- The `0x85` pull ack content: the capture shows GG reading it back as a 64-byte report; its fields
-  are not decoded, so `ssgg onboard read` only records the ack's report ID and first bytes.
-- Schema words of the five slots: `onboard schema` is the first thing to run on hardware; if a slot
-  answers with a schema word the decode supports, the layout table above can be confirmed byte by byte.
+- Where this platform keeps the profile checksum. GG's assembled image ends in zeros at the offsets
+  the schema A and schema B layouts predict, and the CRC-32/STM32 of every region candidate matches
+  none of them. The 2022/2023 profile blobs use a word at blob offset 12320 (see
+  [apex-pro-tkl-2023-gg-capture.md](apex-pro-tkl-2023-gg-capture.md)); nothing in this capture says the
+  legacy family does the same.
+- Where the name starts. The Windows engine decoder puts it at payload offset 2; GG's own read-back of
+  slots 1-4 reads it at offset 18.
+- The trailing `u16 96` of the pacing frame (500 ms timeout, 96 of something) and the `u16 0` before
+  the file-access word.
+- GG's write direction (`03 00 <offset> <size> <payload>`, 144 transfers in the capture): not used
+  here, and there is no read-back command known for this family, so `ssgg onboard` writes nothing.
+- The opening frames of the capture (`0x90`, `0x6c`, `0x6e`, `0x68`, `0x65`, `0x67`, `0x34`) and the
+  57-byte lighting block layout, which is copied from the engine decoder and unverified.
 
 ## Linux collection map (measured 2026-10-15)
 
-From the kernel's own hidraw `uevent` files for a wired Apex 7 (firmware `2.4.3`). Each USB interface shows
-up as its own hidraw node, and the profile-capable collection is the vendor page `0xFFC1`:
+From the kernel's hidraw `uevent` files for a wired Apex 7 (firmware `2.4.3`). Each USB interface is
+its own hidraw node, and the profile-capable collection is the vendor page `0xFFC1`:
 
-| Node | Interface | Usage page | Max feature | Max input | Max output | 12-byte pacing frame |
-|------|-----------|------------|-------------|-----------|------------|----------------------|
-| `hidraw3` | 4 | `0xFFC1` | 644 | 1024 | 64 | accepted |
-| `hidraw2` | 1 | `0xFFC0` | not captured | — | — | `EPIPE` on the 13-byte write |
-| `hidraw4`, `hidraw5` | 2, 3 | `0x0001`, `0x000C` | — | — | — | `EPIPE` |
+| Node | Interface | Usage page | Max feature | Max input | Max output | Frames accepted |
+|------|-----------|------------|-------------|-----------|------------|---------------|
+| `hidraw3` | 4 | `0xFFC1` | 644 | 1024 | 64 | pacing frame, pull, 643-byte read request |
+| `hidraw2` | 1 | `0xFFC0` | not captured | — | — | `EPIPE` on the pacing write |
+| `hidraw4`, `hidraw5` | 2, 3 | `0x0001`, `0x000C` | — | — | — | `EPIPE` on the pacing write |
 
-Measured on `hidraw3`: the pacing frame (report id `0x00`, 12 payload bytes) is accepted; the pull (output
-report, 64 bytes) is accepted and a 64-byte input report arrives immediately behind it; the 643-byte
-`SET_REPORT` of the payload-read frame is accepted; the control read-back times out while the interrupt
-endpoint carries the answer. That collection is where the profile protocol lives, and `ssgg onboard` tries
-it first.
-
-Two behaviours of the reference implementation are implemented even though a capture cannot show them:
-
-- the first page read of a profile often comes back blanked, so `ssgg onboard read` reads both pages of a
-  pull and lets the assembled image stand on the reads that did answer;
-- a page whose first four payload bytes are `FF FF FF FF` is garbage: it is replaced with zeroes and counted
-  in `garbage_reads`.
-
-The schema probe uses one attempt per step per path (`PROBE_ATTEMPTS`) and stops after `--deadline-ms`
-(30000 ms default), so a keyboard that never answers finishes in a few seconds per path group instead of
-running for minutes.
+The reply is read as a feature report on the same node, with a buffer of **642** bytes: the kernel
+passes that number to the device as `wLength`, and the device's report is 642 bytes. Asking for 643
+(the report-ID byte counted twice) makes the control transfer never complete, which is the
+`Connection timed out (os error 110)` recorded on 2026-10-15 after the read request was accepted. The
+64-byte input reports this collection carries are poll and status reports (report IDs `0x0B`, `0x12`);
+the collector skips them and keeps the interrupt endpoint as a fallback reply channel.

@@ -1,77 +1,499 @@
-//! [EXPERIMENTAL] Hardware read loop for the legacy Apex on-board profile.
+//! [EXPERIMENTAL] On-board profile transport for the legacy/"macho" Apex platform.
 //!
-//! Everything in this file talks to a keyboard. The wire format, the read plan, reply parsing, decode
-//! and JSON live in [`crate::onboard_profile`], and the notes, including what the reference capture
-//! does and does not prove, live in docs/development/apex-7-onboard-profile-read.md.
+//! Frame construction, reply parsing, payload geometry and decoding live in [`crate::onboard_profile`].
+//! This module only moves bytes: it opens the collection that carries profile traffic, sends the
+//! pacing, pull and read frames the read plan describes, collects replies and assembles a
+//! [`crate::onboard_profile::ProfileImage`].
 //!
-//! Status: reverse-engineered. The sequence is read-only: the pacing frame, pulls and payload reads.
-//! On 2026-10-15 an Apex 7 (firmware `2.4.3`) accepted the pacing frame, the pull and the payload-read
-//! request on its `0xffc1` collection, and its answers arrive as input reports; a full profile read has
-//! not completed on hardware. Nothing in this path writes a profile, and the write command of this
-//! protocol family is deliberately not implemented here.
+//! Wire facts confirmed from the 2026-10-15 Windows USBPcap capture of official GG on an Apex 7
+//! (VID `0x1038`, PID `0x1612`, firmware `4.16.8`), decoded from
+//! `ssgg-capture-1612-20261015-004400/hub-2.pcap` URB by URB:
+//!
+//! - every profile transfer runs on USB interface 1 (`wIndex 1`), the usage-page-`0xffc0` collection;
+//! - the pacing frame is `SET_REPORT wValue 0x0200 wLength 13` with `00 01 00 00 02 00 f4 01 60 00`
+//!   in front of the pull: report number 0, output type, 12 frame bytes;
+//! - the pull frame is `SET_REPORT wValue 0x0200 wLength 64` carrying
+//!   `[85][00][file selector u16 LE][file offset u32 LE][size u16 LE]`, 10 frame bytes;
+//! - the payload-read request is `SET_REPORT wValue 0x0300 wLength 642` — a **feature** report, not an
+//!   output report — carrying `[83][00][resource-buffer offset u16 LE][size u16 LE]`, 6 frame bytes;
+//! - the answer is a **feature-report reply** (`GET_REPORT wValue 0x0300`): 634 payload bytes, the
+//!   requested bytes starting at byte 0 of the report data (byte 1 counting the report-ID byte).
+//!   GG issued 241 of these; 180 answers were all zero, the rest carried profile data, and the
+//!   submit-to-completion latency was 1-3 ms.
+//! - GG read 122 file groups: 12 pulls of 1024 bytes per file at offsets `0, 1024, …, 11264` for each
+//!   of the ten files `0x0201`-`0x0205` and `0x0301`-`0x0305`, plus a 2-byte probe on the profile file
+//!   of slot 0 and on the lighting file; no pacing frame in front of the other pulls.
+//!
+//! GG's own read-back is unusable, which is why this command reports checksum words as
+//! "stored/computed" pairs and never claims a profile is verified: in the capture the assembled
+//! profile name never decodes (it reads `` `1 `` for slot 0) and the stored tail word of slot 0
+//! (`0x25EE1762`) is not the CRC of the bytes GG assembled. The schema word GG reads at payload
+//! offset 0 is `0x0000` on this device, i.e. the base schema of the platform.
+//!
+//! Linux: the request goes out through the raw hidraw paths in [`crate::devices`] (the hidapi
+//! feature-report ioctl has the wrong direction bits); the reply is collected with
+//! [`crate::devices::read_feature_report_raw`] first and with the interrupt endpoint as a fallback,
+//! because the kernel's `HID_REPORT_GET` path on this collection returns `ETIMEDOUT`.
+//!
+//! Nothing in this path has been replayed on hardware. This module never writes a profile.
 
+use std::time::{Duration, Instant};
+
+#[cfg(unix)]
 use crate::devices::{
     list_hidraw_paths, read_feature_report_raw, read_input_report_raw, send_feature_report_raw, write_output_report_raw,
 };
+
+/// Windows/macOS transport: hidapi has the same control transfers, so the frames and replies are
+/// identical on the wire. Each call opens the collection by path.
+#[cfg(not(unix))]
+mod wire_shim {
+    use super::*;
+
+    fn open(path: &str) -> Result<hidapi::HidDevice> {
+        let api = hidapi::HidApi::new().map_err(|e| Error::DeviceCommunication(e.to_string()))?;
+        let c_path = std::ffi::CString::new(path)
+            .map_err(|_| Error::InvalidConfig("device path contains a NUL byte".to_string()))?;
+        api.open_path(&c_path)
+            .map_err(|e| Error::DeviceCommunication(format!("cannot open {path}: {e}")))
+    }
+
+    pub fn list_hidraw_paths(vendor_id: u16, product_id: u16) -> Vec<String> {
+        let Ok(api) = hidapi::HidApi::new() else {
+            return Vec::new();
+        };
+        api.device_paths()
+            .filter(|info| info.vendor_id() == vendor_id && info.product_id() == product_id)
+            .map(|info| info.path().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    pub fn write_output_report_raw(path: &str, buffer: &[u8]) -> Result<()> {
+        open(path)?
+            .send_output_report(buffer)
+            .map(|_| ())
+            .map_err(|e| Error::DeviceCommunication(e.to_string()))
+    }
+
+    pub fn send_feature_report_raw(path: &str, buffer: &[u8], _report_len: usize) -> Result<()> {
+        open(path)?
+            .send_feature_report(buffer)
+            .map_err(|e| Error::DeviceCommunication(e.to_string()))
+    }
+
+    pub fn read_feature_report_raw(path: &str, report_id: u8, report_len: usize) -> Result<Vec<u8>> {
+        let mut report = vec![report_id; report_len];
+        let read = open(path)?
+            .get_feature_report(&mut report)
+            .map_err(|e| Error::DeviceCommunication(e.to_string()))?;
+        report.truncate(read);
+        Ok(report)
+    }
+
+    pub fn read_input_report_raw(path: &str, max_len: usize, poll_ms: u64) -> Result<Vec<u8>> {
+        let mut report = vec![0u8; max_len];
+        let timeout = i32::try_from(poll_ms).unwrap_or(i32::MAX);
+        let read = open(path)?
+            .read_timeout(&mut report, timeout)
+            .map_err(|e| Error::DeviceCommunication(e.to_string()))?;
+        report.truncate(read);
+        Ok(report)
+    }
+}
+
+use crate::error::{Error, Result};
 use crate::onboard_profile::{
-    ChunkRecord, PULL_REPLY_REPORT_ID, ProfileImage, READ_REPLY_HEADER_LEN, READ_REPLY_REPORT_ID, READ_REPORT_LEN,
-    ReadConfig, Step, StepKind, hex_of, parse_read_reply, reply_mismatch,
+    CONFIG_REPORT_LEN, ChunkRecord, FILE_ACCESS_READWRITE, MAX_PROFILE_INDEX, MAX_USB_TIMEOUT_MS, PROFILE_FS_BASE,
+    PULL_REPORT_LEN, ProfileImage, READ_REPORT_LEN, ReadConfig, ReadReply, SCHEMA_READ_LEN, TIME_BETWEEN_COMMANDS_MS,
+    config_frame, hex_of, parse_read_reply_at, pull_frame, read_frame, reply_mismatch, schema_of,
 };
-use crate::{Error, Result};
-use std::time::Duration;
-use tokio::time::sleep;
+#[cfg(not(unix))]
+use wire_shim::{
+    list_hidraw_paths, read_feature_report_raw, read_input_report_raw, send_feature_report_raw, write_output_report_raw,
+};
 
-/// Attempts for one transfer on one device path before that path is given up on.
-pub const STEP_ATTEMPTS: u8 = 3;
-/// Attempts used by the schema probe, which runs over every file and every path: one try each keeps a
-/// probe on a keyboard that does not answer to a few seconds instead of minutes.
-pub const PROBE_ATTEMPTS: u8 = 1;
-/// Device paths tried for one read: discovery's control collection first, then the other collections
-/// of the same vendor/product pair.
-pub const PATH_ATTEMPTS: usize = 4;
-/// Time to wait for a pull answer. GG's own pacing round-trips in about 5 ms; this is the ceiling, not
-/// the target.
-pub const ACK_TIMEOUT_MS: u64 = 300;
-/// Time to wait for a payload-read answer.
-pub const READ_TIMEOUT_MS: u64 = 1000;
-/// Largest input report the profile collection declares (`max_input_report` in its sysfs `uevent`):
-/// payload-read answers arrive as one input report of up to this size.
-pub const INPUT_REPORT_MAX_LEN: usize = 1024;
-/// Extra settle time after the pacing frame, which the keyboard applies to the transfers that follow.
-pub const PACING_SETTLE_MS: u64 = 100;
+/// Highest profile slot this read supports.
+pub const MAX_PROFILE_INDEX_FOR_READ: u8 = MAX_PROFILE_INDEX;
+/// Report number of the payload-read reply (`GET_REPORT wValue 0x0300`).
+const READ_REPLY_ID: u8 = 0x03;
+/// Length to request for the payload reply. The kernel forwards this number to the device as
+/// `wLength`, and the device's report is 642 bytes: asking for more makes the control read never
+/// complete, which is what `Connection timed out` meant on 2026-10-15.
+const READ_REPLY_WIRE_LEN: usize = 642;
+/// Poll acknowledges and status reports the reply collector skips.
+const ACK_REPORT_IDS: [u8; 2] = [0x0B, 0x12];
+/// Wire length of the pull answer the capture shows (64 bytes on report `0x85`).
+const PULL_ACK_LEN: usize = 64;
+/// Polls per reply collection round, in milliseconds.
+const REPLY_POLL_MS: i32 = 50;
+/// Reply budget per payload read when the caller set no deadline, in milliseconds.
+const REPLY_BUDGET_MS: u64 = 2_000;
+/// Input-report polls allowed per reply before giving up.
+const REPLY_INPUT_ATTEMPTS: u32 = 20;
+/// Polls allowed for one pull answer.
+const PULL_ACK_ATTEMPTS: u32 = 4;
+/// Largest input report a profile collection can return (Apex 7 profile collections report 1024).
+const INPUT_REPORT_MAX_LEN: usize = 1024;
 
-/// Read the vendor and product of a hidraw node from its sysfs `uevent` (`HID_ID=0003:000001038:000001612`).
+/// Reads one profile slot from the first candidate collection that answers.
 ///
-/// Used when `--device` names a hidraw node directly, so the fallback list can be built.
-#[cfg(unix)]
-pub fn hidraw_vendor_product(hidraw_path: &str) -> Option<(u16, u16)> {
-    let name = std::path::Path::new(hidraw_path).file_name()?.to_str()?;
-    let uevent = std::fs::read_to_string(format!("/sys/class/hidraw/{name}/device/uevent")).ok()?;
-    parse_hid_id_uevent(&uevent)
+/// # Errors
+///
+/// Returns an error when no candidate path answers, a frame is rejected, or the read plan cannot be
+/// validated.
+pub async fn read_profile(paths: &[String], config: &ReadConfig, strict: bool) -> Result<(ProfileImage, String)> {
+    let paths = paths.to_vec();
+    let config = *config;
+    tokio::task::spawn_blocking(move || read_on_first_path(&paths, &config, strict, None))
+        .await
+        .map_err(|e| Error::Other(format!("onboard read task failed: {e}")))?
 }
 
-/// Extract vendor and product from a sysfs `uevent` text's `HID_ID` line.
-pub fn parse_hid_id_uevent(text: &str) -> Option<(u16, u16)> {
-    let line = text.lines().find(|line| line.starts_with("HID_ID="))?;
-    let value = line.trim_start_matches("HID_ID=");
-    let mut parts = value.split(':');
-    let _bus = parts.next()?;
-    let vendor = u32::from_str_radix(parts.next()?, 16).ok()?;
-    let product = u32::from_str_radix(parts.next()?, 16).ok()?;
-    Some((vendor as u16, product as u16))
+/// Reads one profile slot twice and reports the first byte where the two reads disagree.
+///
+/// # Errors
+///
+/// Returns an error when the slot cannot be read twice.
+pub async fn read_profile_verify(
+    paths: &[String],
+    config: &ReadConfig,
+    strict: bool,
+) -> Result<(ProfileImage, ProfileImage, Option<usize>, String)> {
+    let (first, path) = read_profile(paths, config, strict).await?;
+    let (second, _) = read_profile(paths, config, strict).await?;
+    let diff = first
+        .data
+        .iter()
+        .zip(second.data.iter())
+        .enumerate()
+        .find(|(_, (a, b))| a != b)
+        .map(|(offset, _)| offset);
+    Ok((first, second, diff, path))
 }
 
-/// Paths to try for a profile read: `preferred` (discovery's control collection) first, then every
-/// other collection of the same vendor/product pair, in the order [`list_hidraw_paths`] ranks them.
+/// Reads the schema word of profile slot `slot`, i.e. [`PROFILE_FS_BASE`] + slot.
+///
+/// # Errors
+///
+/// Returns an error when no candidate path answers a 2-byte schema read.
+pub async fn read_schema(
+    paths: &[String],
+    slot: u8,
+    gap_ms: u64,
+    strict: bool,
+    deadline: Option<Duration>,
+) -> Result<(u16, Vec<u8>, String)> {
+    let config = schema_config(PROFILE_FS_BASE, slot, gap_ms);
+    read_schema_words(paths, &config, strict, deadline).await
+}
+
+/// Reads the schema word with an explicit reply framing length, the knob `ssgg onboard schema
+/// --sweep` uses to find where this keyboard puts the payload behind the report-ID byte.
+///
+/// # Errors
+///
+/// Returns an error when no candidate path answers a 2-byte schema read.
+pub async fn read_schema_probe(
+    paths: &[String],
+    fs_id: u16,
+    slot: u8,
+    reply_header: usize,
+    gap_ms: u64,
+    strict: bool,
+    deadline: Option<Duration>,
+) -> Result<(u16, Vec<u8>, String)> {
+    let mut config = schema_config(fs_id, slot, gap_ms);
+    config.reply_header = reply_header;
+    read_schema_words(paths, &config, strict, deadline).await
+}
+
+/// Reads the schema word of an arbitrary file selector (the lighting files `0x0102` and `0x0301`).
+///
+/// # Errors
+///
+/// Returns an error when no candidate path answers a 2-byte schema read for that file.
+pub async fn read_schema_file(
+    paths: &[String],
+    fs_id: u16,
+    gap_ms: u64,
+    strict: bool,
+    deadline: Option<Duration>,
+) -> Result<(u16, Vec<u8>, String)> {
+    let config = schema_config(fs_id, 0, gap_ms);
+    read_schema_words(paths, &config, strict, deadline).await
+}
+
+async fn read_schema_words(
+    paths: &[String],
+    config: &ReadConfig,
+    strict: bool,
+    deadline: Option<Duration>,
+) -> Result<(u16, Vec<u8>, String)> {
+    let paths = paths.to_vec();
+    let config = *config;
+    let (image, path) = tokio::task::spawn_blocking(move || read_on_first_path(&paths, &config, strict, deadline))
+        .await
+        .map_err(|e| Error::Other(format!("onboard schema probe task failed: {e}")))??;
+    let raw = image.data;
+    Ok((schema_of(&raw), raw, path))
+}
+
+/// Read plan for a schema-only probe: one pull of 2 bytes, drained by one 2-byte payload read.
+#[must_use]
+pub fn schema_config(fs_base: u16, profile: u8, gap_ms: u64) -> ReadConfig {
+    ReadConfig {
+        profile,
+        fs_base,
+        chunks: 1,
+        resource_len: SCHEMA_READ_LEN,
+        read_len: SCHEMA_READ_LEN,
+        payload_len: SCHEMA_READ_LEN,
+        gap_ms,
+        time_between_commands_ms: TIME_BETWEEN_COMMANDS_MS,
+        file_access: FILE_ACCESS_READWRITE,
+        max_usb_timeout_ms: MAX_USB_TIMEOUT_MS,
+        send_config: true,
+        reply_header: crate::onboard_profile::READ_REPLY_FRAMING_LEN,
+    }
+}
+
+/// Runs the read plan on the first candidate path that answers, logging every path that did not.
+fn read_on_first_path(
+    paths: &[String],
+    config: &ReadConfig,
+    strict: bool,
+    deadline: Option<Duration>,
+) -> Result<(ProfileImage, String)> {
+    if paths.is_empty() {
+        return Err(Error::DeviceNotFound(
+            "no candidate device path for the on-board profile read".to_string(),
+        ));
+    }
+    let mut last = String::from("no candidate path answered");
+    for path in paths {
+        let started = Instant::now();
+        match read_image(path, config, strict, deadline) {
+            Ok(image) => return Ok((image, path.clone())),
+            Err(e) => {
+                tracing::debug!("onboard read on {path} failed after {:?}: {e}", started.elapsed());
+                last = format!("{path}: {e}");
+            }
+        }
+    }
+    Err(Error::DeviceCommunication(format!(
+        "no profile collection answered the read ({last})"
+    )))
+}
+
+/// Runs one read plan (pacing frame, then pulls with their payload reads) on one path.
+fn read_image(path: &str, config: &ReadConfig, strict: bool, deadline: Option<Duration>) -> Result<ProfileImage> {
+    config.validate()?;
+    let fs_id = config.fs_id();
+    let reads_per_pull = config.resource_len / config.read_len;
+    let read_len = u16::try_from(config.read_len).unwrap_or(u16::MAX);
+    let overall = deadline.map(|d| Instant::now() + d);
+
+    if config.send_config {
+        let frame = config_frame(
+            config.time_between_commands_ms,
+            config.file_access,
+            config.max_usb_timeout_ms,
+        );
+        // GG sends this pacing frame once, before the first pull. A collection that rejects it still
+        // answers the pull, so a failure here is logged and the read continues.
+        if let Err(e) = write_frame(path, &frame, CONFIG_REPORT_LEN) {
+            tracing::debug!("onboard pacing frame on {path} rejected: {e}");
+        }
+    }
+
+    let mut chunks: Vec<ChunkRecord> = Vec::with_capacity(config.chunks);
+    for chunk in 0..config.chunks {
+        let file_offset = (chunk * config.resource_len) as u32;
+        let pull = pull_frame(
+            fs_id,
+            file_offset,
+            u16::try_from(config.resource_len).unwrap_or(u16::MAX),
+        );
+        write_frame(path, &pull, PULL_REPORT_LEN).map_err(|e| {
+            Error::DeviceCommunication(format!(
+                "onboard pull frame for chunk {chunk} (file {fs_id:04X} offset {file_offset}) on \
+                 {path} rejected: {e}"
+            ))
+        })?;
+        let ack = read_pull_ack(path);
+        let (ack_report_id, ack_hex) = match ack.as_deref() {
+            Some(report) if !report.is_empty() => (report[0], hex_of(report)),
+            _ => {
+                tracing::debug!("onboard pull answer missing for chunk {chunk} on {path}");
+                (0, String::new())
+            }
+        };
+
+        let mut reads: Vec<ReadReply> = Vec::with_capacity(reads_per_pull);
+        for read in 0..reads_per_pull {
+            let buffer_offset = (read * config.read_len) as u16;
+            let frame = read_frame(buffer_offset, read_len);
+            write_read_request(path, &frame).map_err(|e| {
+                Error::DeviceCommunication(format!(
+                    "onboard read request for chunk {chunk} buffer offset {buffer_offset} on \
+                     {path} rejected: {e}"
+                ))
+            })?;
+            let reply = read_reply_report(path, config.read_len, overall)?;
+            let parsed = parse_read_reply_at(&reply, read_len, config.reply_header)?;
+            if let Some(msg) = reply_mismatch(&parsed, buffer_offset, read_len) {
+                tracing::debug!("onboard read: {msg}");
+                if strict {
+                    return Err(Error::DeviceCommunication(format!(
+                        "strict mode: {msg} (drop --strict to accept replies that do not echo the \
+                         request header)"
+                    )));
+                }
+            }
+            reads.push(parsed);
+            if config.gap_ms > 0 {
+                std::thread::sleep(Duration::from_millis(config.gap_ms));
+            }
+        }
+        chunks.push(ChunkRecord {
+            index: chunk,
+            fs_id,
+            file_offset,
+            ack_report_id,
+            ack_hex,
+            reads,
+        });
+        if overall.is_some_and(|d| Instant::now() >= d) {
+            return Err(Error::DeviceCommunication(format!(
+                "reply budget expired after chunk {chunk} on {path}"
+            )));
+        }
+    }
+
+    ProfileImage::assemble(chunks, *config)
+}
+
+/// Collects one payload reply: the feature-report reply the capture shows, then the interrupt
+/// endpoint. Returns `[report ID][payload…]`, the shape [`parse_read_reply`] consumes.
+fn read_reply_report(path: &str, payload_len: usize, overall: Option<Instant>) -> Result<Vec<u8>> {
+    let budget = overall
+        .map(|d| d.saturating_duration_since(Instant::now()))
+        .filter(|d| !d.is_zero())
+        .unwrap_or(Duration::from_millis(REPLY_BUDGET_MS));
+    let stop = Instant::now() + budget;
+    let mut empty_answers = 0u32;
+    let mut last_error: Option<Error> = None;
+
+    while Instant::now() < stop {
+        match read_feature_report_raw(path, READ_REPLY_ID, READ_REPLY_WIRE_LEN) {
+            Ok(report) if reply_carries_payload(&report, payload_len) => return Ok(report),
+            Ok(report) => {
+                empty_answers = empty_answers.saturating_add(1);
+                tracing::debug!(
+                    "onboard read on {path}: feature reply of {} bytes (report {:#04X}) carries no \
+                     payload of {payload_len} bytes",
+                    report.len(),
+                    report.first().copied().unwrap_or(0),
+                );
+            }
+            Err(e) => {
+                last_error = Some(e);
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(REPLY_POLL_MS.max(0).try_into().unwrap_or(1u64)));
+    }
+
+    let mut input_attempts = 0u32;
+    while input_attempts < REPLY_INPUT_ATTEMPTS && overall.is_none_or(|d| Instant::now() < d) {
+        input_attempts = input_attempts.saturating_add(1);
+        match read_input_report_raw(path, INPUT_REPORT_MAX_LEN, REPLY_POLL_MS as u64) {
+            Ok(report) if reply_carries_payload(&report, payload_len) => {
+                tracing::debug!(
+                    "onboard read: reply arrived on {path} as a {}-byte input report",
+                    report.len()
+                );
+                return Ok(report);
+            }
+            Ok(report) if !is_ack(&report) => {
+                tracing::debug!(
+                    "onboard read on {path}: ignored a {}-byte input report (report {:#04X})",
+                    report.len(),
+                    report.first().copied().unwrap_or(0),
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!("onboard read on {path}: input report read failed: {e}");
+                break;
+            }
+        }
+    }
+
+    let reason = match last_error {
+        Some(e) => e.to_string(),
+        None => format!("{empty_answers} feature reply answer(s) carried no payload of {payload_len} bytes"),
+    };
+    Err(Error::DeviceCommunication(format!(
+        "no profile payload reply from {path}: {reason}"
+    )))
+}
+
+/// Reads the pull answer (the capture shows a 64-byte report on report `0x85` after each pull).
+fn read_pull_ack(path: &str) -> Option<Vec<u8>> {
+    for _ in 0..PULL_ACK_ATTEMPTS {
+        match read_input_report_raw(path, PULL_ACK_LEN + 1, REPLY_POLL_MS as u64) {
+            Ok(report) if !report.is_empty() => return Some(report),
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!("onboard pull answer poll on {path}: {e}");
+                break;
+            }
+        }
+    }
+    None
+}
+
+/// A reply carries a payload when it is long enough to hold `payload_len` bytes behind its report-ID
+/// byte and its report ID is not a poll acknowledge.
+fn reply_carries_payload(report: &[u8], payload_len: usize) -> bool {
+    if report.is_empty() {
+        return false;
+    }
+    !ACK_REPORT_IDS.contains(&report[0]) && report.len() > payload_len
+}
+
+fn is_ack(report: &[u8]) -> bool {
+    report.first().is_some_and(|id| ACK_REPORT_IDS.contains(id))
+}
+
+/// Sends a pacing or pull frame as an output report on report number 0: `[0][frame][zeros]`,
+/// `wire_len + 1` bytes in the buffer, `wire_len` bytes on the wire.
+fn write_frame(path: &str, frame: &[u8], wire_len: usize) -> Result<()> {
+    // The kernel strips data[0] (the report number), so the buffer is one byte longer than the wire.
+    let mut buffer = vec![0u8; wire_len + 1];
+    let len = frame.len().min(wire_len);
+    buffer[..len].copy_from_slice(&frame[..len]);
+    write_output_report_raw(path, &buffer)
+}
+
+/// Sends a payload-read request as a **feature** report (`wValue 0x0300`, 642 wire bytes).
+fn write_read_request(path: &str, frame: &[u8]) -> Result<()> {
+    let mut buffer = vec![0u8; READ_REPORT_LEN];
+    let len = frame.len().min(READ_REPORT_LEN);
+    buffer[..len].copy_from_slice(&frame[..len]);
+    send_feature_report_raw(path, &buffer, READ_REPORT_LEN)
+}
+
+/// Device paths to try for a profile read: the caller's preferred collection first, then every other
+/// collection of the same device, ordered by USB interface number.
+#[must_use]
 pub fn candidate_paths(preferred: Option<&str>, vendor_id: u16, product_id: u16) -> Vec<String> {
-    let mut paths: Vec<String> = Vec::with_capacity(PATH_ATTEMPTS);
+    let mut paths: Vec<String> = Vec::new();
     if let Some(path) = preferred {
         paths.push(path.to_string());
     }
     for path in list_hidraw_paths(vendor_id, product_id) {
-        if paths.len() >= PATH_ATTEMPTS {
-            break;
-        }
         if !paths.contains(&path) {
             paths.push(path);
         }
@@ -79,295 +501,75 @@ pub fn candidate_paths(preferred: Option<&str>, vendor_id: u16, product_id: u16)
     paths
 }
 
-/// Report buffer for a request: report ID byte, frame bytes, zero padding to the wire length.
-fn request_buffer(step: &Step) -> Vec<u8> {
-    let mut report = vec![0u8; step.wire_len];
-    let take = step.frame.len().min(step.wire_len - 1);
-    report[1..1 + take].copy_from_slice(&step.frame[..take]);
-    report
+/// `vendor:pid` of a `/dev/hidrawN` node, read from its sysfs `uevent`.
+#[must_use]
+pub fn hidraw_vendor_product(path: &str) -> Option<(u16, u16)> {
+    let name = path.rsplit('/').next()?;
+    let text = std::fs::read_to_string(format!("/sys/class/hidraw/{name}/device/uevent")).ok()?;
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("HID_ID=") {
+            let mut parts = value.split(':');
+            let (_bus, vendor, product) = (parts.next()?, parts.next()?, parts.next()?);
+            let vendor = u16::from_str_radix(vendor, 16).ok()?;
+            let product = u16::from_str_radix(product, 16).ok()?;
+            return Some((vendor, product));
+        }
+    }
+    None
 }
 
-/// Send one transfer and read its reply when the protocol defines one, on one path.
-///
-/// Returns the reply report (report ID byte kept) for `Pull` and `Read` steps and an empty vector for
-/// the pacing frame, which the official engine sends without reading anything back.
-fn exchange(path: &str, step: &Step) -> Result<Vec<u8>> {
-    let report = request_buffer(step);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::onboard_profile::{PROFILE_FS_BASE, RESOURCE_BUFFER_LEN};
 
-    match step.kind {
-        StepKind::Config => {
-            send_feature_report_raw(path, &report, step.wire_len)?;
-            Ok(Vec::new())
-        }
-        StepKind::Pull => {
-            // The pull is an output report: report ID byte plus 64 payload bytes.
-            write_output_report_raw(path, &report)?;
-            let want = step.reply_len.unwrap_or(64);
-            let reply = read_input_report_raw(path, want, ACK_TIMEOUT_MS)?;
-            if reply.is_empty() {
-                return Err(Error::DeviceCommunication(format!(
-                    "no pull answer on {path} within {ACK_TIMEOUT_MS} ms"
-                )));
-            }
-            Ok(reply)
-        }
-        StepKind::Read => {
-            send_feature_report_raw(path, &report, step.wire_len)?;
-            // The answer arrives as one input report on the interrupt endpoint: this collection declares a
-            // 1024-byte maximum input report and never answers a control GET_REPORT, so a feature-report
-            // read here blocks for the kernel's 5-second control timeout.
-            match read_input_report_raw(path, INPUT_REPORT_MAX_LEN, READ_TIMEOUT_MS) {
-                Ok(reply) if reply.len() > 1 + READ_REPLY_HEADER_LEN => Ok(reply),
-                outcome => {
-                    let short = match &outcome {
-                        Ok(reply) => format!("{}/{} bytes", reply.len(), 1 + READ_REPLY_HEADER_LEN),
-                        Err(e) => e.to_string(),
-                    };
-                    tracing::debug!("payload read on {path} on the interrupt endpoint: {short}");
-                    // Fallback: the reference capture shows control GET_REPORT answers on Windows.
-                    let want = step.reply_len.unwrap_or(READ_REPORT_LEN);
-                    let reply = read_feature_report_raw(path, READ_REPLY_REPORT_ID, want)?;
-                    if reply.len() <= 1 + READ_REPLY_HEADER_LEN {
-                        return Err(Error::DeviceCommunication(format!(
-                            "payload read on {path} returned {} bytes, no payload behind the reply header \
-                             (interrupt endpoint: {short})",
-                            reply.len()
-                        )));
-                    }
-                    Ok(reply)
-                }
-            }
-        }
-    }
-}
-
-/// One transfer with retries.
-///
-/// In `strict` mode a payload-read reply whose header does not echo the request, and a pull answer on
-/// the wrong report ID, count as failed attempts. In lenient mode both are accepted and only tallied
-/// by [`ProfileImage::assemble`].
-async fn step_with_retries(path: &str, step: &Step, gap_ms: u64, strict: bool, attempts: u8) -> Result<Vec<u8>> {
-    let mut last_error = None::<String>;
-
-    for attempt in 1..=attempts {
-        let task_path = path.to_string();
-        let task_step = step.clone();
-
-        let outcome = tokio::task::spawn_blocking(move || exchange(&task_path, &task_step))
-            .await
-            .map_err(|e| Error::DeviceCommunication(format!("HID transfer task failed: {e}")))?;
-
-        match outcome {
-            Ok(reply) => {
-                let rejected = if step.kind == StepKind::Read && strict {
-                    let parsed = parse_read_reply(&reply, step.size)?;
-                    reply_mismatch(&parsed, step.buffer_offset.unwrap_or(0), step.size)
-                } else if step.kind == StepKind::Pull && strict && reply[0] != PULL_REPLY_REPORT_ID {
-                    Some(format!(
-                        "pull answer arrived on report 0x{:02X}, expected 0x{PULL_REPLY_REPORT_ID:02X}",
-                        reply[0]
-                    ))
-                } else {
-                    None
-                };
-
-                match rejected {
-                    None => return Ok(reply),
-                    Some(mismatch) => {
-                        tracing::warn!("chunk {} on {path}: {mismatch} (attempt {attempt})", step.chunk);
-                        last_error = Some(mismatch);
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "chunk {} {} on {path} failed (attempt {attempt}): {e}",
-                    step.chunk,
-                    step.kind
-                );
-                last_error = Some(e.to_string());
-            }
-        }
-
-        sleep(Duration::from_millis(gap_ms)).await;
+    #[test]
+    fn schema_config_covers_two_bytes_in_one_pull() {
+        let config = schema_config(PROFILE_FS_BASE, 2, 5);
+        assert_eq!(config.fs_id(), PROFILE_FS_BASE + 2);
+        assert_eq!(config.total_resource_len(), SCHEMA_READ_LEN);
+        // pacing frame + one pull + one payload read
+        assert_eq!(config.steps().len(), 3);
+        config.validate().expect("schema probe plan is valid");
     }
 
-    Err(Error::DeviceCommunication(format!(
-        "chunk {} on {path} did not yield a usable reply after {attempts} attempts: {}",
-        step.chunk,
-        last_error.unwrap_or_else(|| "no error recorded".to_string())
-    )))
-}
-
-/// Read one profile file from one device path.
-async fn read_on_path(path: &str, config: &ReadConfig, strict: bool) -> Result<ProfileImage> {
-    let steps = config.steps();
-    let mut records: Vec<ChunkRecord> = Vec::with_capacity(config.chunks);
-
-    for chunk in 0..config.chunks {
-        let mut ack: Vec<u8> = Vec::new();
-        let mut reads: Vec<crate::onboard_profile::ReadReply> =
-            Vec::with_capacity(config.resource_len / config.read_len);
-
-        for step in steps.iter().filter(|s| s.chunk == chunk) {
-            let reply = step_with_retries(path, step, config.gap_ms, strict, STEP_ATTEMPTS).await?;
-            match step.kind {
-                StepKind::Pull => {
-                    ack = reply;
-                }
-                StepKind::Read => {
-                    reads.push(parse_read_reply(&reply, step.size)?);
-                }
-                StepKind::Config => {
-                    sleep(Duration::from_millis(PACING_SETTLE_MS)).await;
-                }
-            }
-            sleep(Duration::from_millis(config.gap_ms)).await;
-        }
-
-        records.push(ChunkRecord {
-            index: chunk,
-            fs_id: config.fs_id(),
-            file_offset: (chunk * config.resource_len) as u32,
-            ack_report_id: ack.first().copied().unwrap_or(0),
-            ack_hex: hex_of(&ack[..ack.len().min(16)]),
-            reads,
-        });
+    #[test]
+    fn lighting_schema_config_addresses_the_shared_file() {
+        let config = schema_config(0x0102, 0, 5);
+        assert_eq!(config.fs_id(), 0x0102);
     }
 
-    ProfileImage::assemble(records, *config)
-}
-
-/// Read one profile, trying each candidate path until one answers the protocol.
-///
-/// Returns the assembled image and the path it came from.
-pub async fn read_profile(paths: &[String], config: &ReadConfig, strict: bool) -> Result<(ProfileImage, String)> {
-    if paths.is_empty() {
-        return Err(Error::DeviceNotFound(
-            "no device path available for the on-board profile read".to_string(),
-        ));
-    }
-    config.validate()?;
-
-    let mut last_error = None::<Error>;
-    for path in paths.iter().take(PATH_ATTEMPTS) {
-        match read_on_path(path, config, strict).await {
-            Ok(image) => {
-                tracing::info!("read the on-board profile from {path}");
-                return Ok((image, path.clone()));
-            }
-            Err(e) => {
-                tracing::warn!("on-board profile read on {path} failed: {e}");
-                last_error = Some(e);
-            }
-        }
+    #[test]
+    fn reply_carries_payload_needs_room_behind_the_report_id() {
+        assert!(reply_carries_payload(&[0x03, 0x01, 0x02], 2));
+        assert!(!reply_carries_payload(&[0x03, 0x01], 2));
+        assert!(!reply_carries_payload(&[0x0B, 0x0a, 0x00, 0x00], 2));
+        assert!(!reply_carries_payload(&[0x12, 0x00], 2));
+        assert!(!reply_carries_payload(&[], 2));
     }
 
-    Err(last_error.unwrap_or_else(|| Error::DeviceCommunication("the on-board profile read never ran".to_string())))
-}
-
-/// Read a profile twice and compare the profile bytes.
-///
-/// Returns both images, the offset of the first differing byte (`None` when identical) and the path
-/// they were read from.
-pub async fn read_profile_verify(
-    paths: &[String],
-    config: &ReadConfig,
-    strict: bool,
-) -> Result<(ProfileImage, ProfileImage, Option<usize>, String)> {
-    let (first, path) = read_profile(paths, config, strict).await?;
-    sleep(Duration::from_millis(config.gap_ms)).await;
-    let (second, _) = read_profile(std::slice::from_ref(&path), config, strict).await?;
-    let diff = crate::onboard_profile::image_diff(&first, &second);
-    if diff.is_some() {
-        tracing::warn!("the two reads of the on-board profile differ");
-    }
-    Ok((first, second, diff, path))
-}
-
-/// Highest profile slot this command probes: GG's `profileCount` for the legacy family is 5.
-pub const MAX_PROFILE_INDEX_FOR_READ: u8 = crate::onboard_profile::MAX_PROFILE_INDEX;
-
-/// Read only the schema word of one profile slot.
-///
-/// Returns the schema word, the raw two bytes and the path they came from.
-pub async fn read_schema(
-    paths: &[String],
-    profile: u8,
-    gap_ms: u64,
-    strict: bool,
-    deadline: Option<Duration>,
-) -> Result<(u16, [u8; 2], String)> {
-    if profile > MAX_PROFILE_INDEX_FOR_READ {
-        return Err(Error::InvalidConfig(format!(
-            "profile slot {profile} is above the highest slot {MAX_PROFILE_INDEX_FOR_READ}"
-        )));
-    }
-    read_schema_file(
-        paths,
-        crate::onboard_profile::PROFILE_FS_BASE + u16::from(profile),
-        gap_ms,
-        strict,
-        deadline,
-    )
-    .await
-}
-
-/// Read only the schema word of any file: one 2-byte pull and one 2-byte payload read.
-///
-/// The schema word is a length in GG's code, so a 2-byte read is the smallest thing the protocol
-/// defines; this is what `ssgg onboard schema` uses to learn the file map of a keyboard.
-pub async fn read_schema_file(
-    paths: &[String],
-    fs_id: u16,
-    gap_ms: u64,
-    strict: bool,
-    deadline: Option<Duration>,
-) -> Result<(u16, [u8; 2], String)> {
-    if paths.is_empty() {
-        return Err(Error::DeviceNotFound(
-            "no device path available for the on-board profile schema read".to_string(),
-        ));
+    #[test]
+    fn pull_frame_matches_the_captured_layout() {
+        assert_eq!(
+            pull_frame(0x0201, 4096, 1024),
+            [0x85, 0x00, 0x01, 0x02, 0x00, 0x10, 0x00, 0x00, 0x00, 0x04]
+        );
     }
 
-    let steps = crate::onboard_profile::schema_read_steps(fs_id);
-    let started = std::time::Instant::now();
-    let mut last_error = None::<Error>;
-
-    for path in paths.iter().take(PATH_ATTEMPTS) {
-        if let Some(limit) = deadline
-            && started.elapsed() > limit
-        {
-            return Err(Error::DeviceCommunication(format!(
-                "the schema probe stopped after {} ms without an answer (last: {})",
-                limit.as_millis(),
-                last_error
-                    .map(|e| e.to_string())
-                    .unwrap_or_else(|| "no attempt made".to_string())
-            )));
-        }
-        let mut schema_bytes = [0u8; 2];
-        let mut ok = true;
-        for step in &steps {
-            match step_with_retries(path, step, gap_ms, strict, PROBE_ATTEMPTS).await {
-                Ok(reply) => {
-                    if step.kind == StepKind::Read {
-                        let parsed = parse_read_reply(&reply, step.size)?;
-                        schema_bytes.copy_from_slice(&parsed.data[..2]);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("schema read on {path} failed: {e}");
-                    last_error = Some(e);
-                    ok = false;
-                    break;
-                }
-            }
-        }
-        if ok {
-            return Ok((u16::from_le_bytes(schema_bytes), schema_bytes, path.clone()));
-        }
+    #[test]
+    fn read_frame_matches_the_captured_layout() {
+        assert_eq!(read_frame(512, 512), [0x83, 0x00, 0x00, 0x02, 0x00, 0x02]);
+        assert_eq!(read_frame(0, 2), [0x83, 0x00, 0x00, 0x00, 0x02, 0x00]);
     }
 
-    Err(last_error.unwrap_or_else(|| Error::DeviceCommunication("the schema read never completed".to_string())))
+    #[test]
+    fn default_read_config_matches_the_captured_geometry() {
+        let config = ReadConfig::default();
+        assert_eq!(config.resource_len, RESOURCE_BUFFER_LEN);
+        assert_eq!(config.fs_id(), PROFILE_FS_BASE);
+        assert_eq!(config.total_resource_len(), 12_288);
+        let steps = config.steps();
+        let pulls = steps.iter().filter(|s| s.kind.to_string() == "pull").count();
+        assert_eq!(pulls, config.chunks);
+    }
 }
