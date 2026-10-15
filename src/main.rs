@@ -912,6 +912,36 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
             );
             println!();
 
+            if args.sweep {
+                println!("reply framing sweep on profile slot 0 (which framing length exposes a real schema word):");
+                for header in [0usize, 5, 6, 14, 19, 20, 21, 36] {
+                    let probe = hw::read_schema_probe(
+                        &paths,
+                        wire::PROFILE_FS_BASE,
+                        0,
+                        header,
+                        args.gap_ms,
+                        args.strict,
+                        deadline,
+                    )
+                    .await;
+                    match probe {
+                        Ok((word, raw, path)) => {
+                            let known = wire::payload_len_for_schema(word).ok();
+                            println!(
+                                "  framing {header:>2} bytes: schema {word:04X} raw {} -> {} ({path})",
+                                hex_of(&raw),
+                                known
+                                    .map(|len| format!("known schema, payload {len} bytes"))
+                                    .unwrap_or_else(|| "no known schema".to_string())
+                            );
+                        }
+                        Err(e) => println!("  framing {header:>2} bytes: no usable answer - {e}"),
+                    }
+                }
+                println!("re-run with --reply-header <the framing that produced a known schema>\n");
+            }
+
             let mut rows: Vec<serde_json::Value> = Vec::new();
             let mut failed = 0usize;
 

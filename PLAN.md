@@ -172,12 +172,21 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   (`WIRED_2023_PROFILE_SLOTS`), GG-engine warning. Committed in `f430380`.
 - Apex 7 on-board profile read: `onboard` feature, `src/onboard_profile.rs`,
   `src/devices/keyboards/apex_legacy_onboard.rs`, `ssgg onboard` (2026-10-15). Read-only, `[EXPERIMENTAL]`.
-  Hardware validation on 2026-10-15: `onboard plan` works; `onboard schema` reached the keyboard (the pacing
-  frame, the pull and the 643-byte payload-read request were accepted on the `0xFFC1` collection) and then
-  looped, because the code read the answer with a control feature-report read - the Apex 7 answers on the
-  interrupt endpoint, so every read burned the kernel's 5-second control timeout. Unvalidated fix: answers
-  are read as input reports (max 1024), the probe is one attempt per step and stops after `--deadline-ms`,
-  a page starting `FF FF FF FF` is counted as `garbage_reads`, and the pacing frame gets a settle gap.
+  Hardware validation on 2026-10-15 got the pacing frame, the pull and the payload-read request accepted on
+  the `0xFFC1` collection, then stalled: the code asked the kernel for a 643-byte feature report, the device's
+  report is 642, so the control read never completed (the 5-second `ETIMEDOUT` in the log). Fixed: replies are
+  read as a 642-byte feature report (matching the capture's `GET_REPORT wLength 642`) with the interrupt
+  endpoint as fallback, `--device` / every collection of the same `vid:pid` is tried in interface order, the
+  probe is one attempt per step and stops after `--deadline-ms`, a page starting `FF FF FF FF` counts as
+  `garbage_reads`, and the pacing frame gets a settle gap.
+  Re-decoding the capture's URBs (not `reports.csv`, which only holds responses) settled the request shapes:
+  pull and pacing frame are output reports (`wValue 0x0200`, report number 0, 13 and 64 bytes), the payload
+  read is a feature report (`wValue 0x0300`, 642 bytes, size 512), and the answers arrive on the same control
+  pipe with a 20-byte framing block before the payload. That anchor is `--reply-header` (default 20) and
+  `ssgg onboard schema --sweep` probes it on real hardware. Not settled: the checksum region (GG's own
+  assembly does not match CRC-32/STM32 at any candidate offset) and the name offset (2 vs 18).
+  Next step needs the keyboard: `ssgg --debug onboard schema --yes --sweep`, then
+  `ssgg --debug onboard read --yes --reply-header <offset>` with the file the sweep found.
 - Old TODO items: clippy-ci / future-incompat errors (resolved, see Baseline); `ssgg_bug_report.json` triage
   (dropped: the file was never provided); issue #6 Arch compile (closed `not_planned`).
 - `docs/development/` consolidation (2026-10-15): capture-note "Transport" section matches the 645-byte /

@@ -264,6 +264,11 @@ pub(crate) struct OnboardWireArgs {
     /// Gap between transfers, in milliseconds
     #[arg(long, default_value = "5")]
     pub(crate) gap_ms: u64,
+
+    /// Framing bytes between the report-ID byte and the payload in a payload-read reply (20 matches
+    /// the 2026-10-15 capture; 0 suits a keyboard that answers with no framing)
+    #[arg(long, default_value = "20")]
+    pub(crate) reply_header: usize,
 }
 
 #[cfg(feature = "onboard")]
@@ -284,6 +289,7 @@ impl OnboardWireArgs {
             max_usb_timeout_ms: self.max_usb_timeout_ms,
             time_between_commands_ms: self.time_between_commands_ms,
             gap_ms: self.gap_ms,
+            reply_header: self.reply_header,
         }
     }
 }
@@ -350,6 +356,11 @@ pub(crate) struct OnboardSchemaArgs {
     /// Reject a pull answer on an unexpected report ID
     #[arg(long, default_value = "true")]
     pub(crate) strict: bool,
+
+    /// Probe the schema word with each candidate reply framing length (research mode: finds the
+    /// offset the payload really starts at on this keyboard)
+    #[arg(long)]
+    pub(crate) sweep: bool,
 }
 
 #[cfg(feature = "onboard")]
