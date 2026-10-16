@@ -1,8 +1,8 @@
 //! [EXPERIMENTAL] On-board profile read for the legacy/"macho" Apex platform.
 //!
 //! Frame construction, reply parsing, payload geometry and decoding live in [`crate::devices::keyboards::apex_legacy_profile`].
-//! This module only moves bytes: it opens the collection that carries profile traffic, sends the
-//! opening-chain, pull and read frames the read plan describes, collects replies and assembles a
+//! This module only moves bytes: it sends the firmware poll, the pull frames, the pacing read that follows
+//! each pull and the payload reads, collects the replies and assembles a
 //! [`crate::devices::keyboards::apex_legacy_profile::ProfileImage`].
 //!
 //! Wire facts confirmed from the 2026-10-15 Windows USBPcap capture of official GG on an Apex 7
@@ -10,15 +10,20 @@
 //! `ssgg-capture-1612-20261015-004400/hub-2.pcap` URB by URB:
 //!
 //! - every profile transfer runs on USB interface 1 (`wIndex 1`), the usage-page-`0xffc0` collection;
-//! - the read opens with a six-frame chain, each one `SET_REPORT wValue 0x0200 wIndex 1 wLength 64`
-//!   (report number 0, output type, 64 data bytes): `90 00`, `90 01`, `f4 00`, `6c 00 01`, then
-//!   `90 00` and `90 01` again, 11 ms apart. The two `90` polls are answered on the interrupt endpoint
-//!   with the ASCII firmware version (`34 2e 31 36 2e 38 00…` = `4.16.8`), `f4 00` with
-//!   `00 01 00…`, `6c 00 01` with nothing. The meanings of `f4` and `6c` are unknown. The capture
-//!   contains no 13-byte transfer at all, so the pacing frame this module sent before is not on GG's
-//!   wire;
+//! - the read opens with one `90 00` poll, `SET_REPORT wValue 0x0200 wIndex 1 wLength 64` (report number 0,
+//!   output type, 64 data bytes), answered on the interrupt endpoint with the ASCII firmware version
+//!   (`34 2e 31 36 2e 38 00…` = `4.16.8`); `90 01` is answered identically on hardware (2026-10-17). GG's
+//!   own opening chain is six frames - `90 00`, `90 01`, `f4 00`, `6c 00 01`, then `90 00` and `90 01` again,
+//!   11 ms apart - and the meanings of `f4 00` (answered `00 01 00…`) and `6c 00 01` (never answered) are
+//!   unknown, so the chain is not replayed here. The capture contains no 13-byte transfer at all, so the
+//!   pacing frame this module sent before is not on GG's wire;
 //! - the pull frame is `SET_REPORT wValue 0x0200 wLength 64` carrying
-//!   `[85][00][file selector u16 LE][file offset u32 LE][size u16 LE]`, 10 frame bytes;
+//!   `[85][00][file selector u16 LE][file offset u32 LE][size u16 LE]`, 10 frame bytes. GG pairs every pull
+//!   with one input read (`read-chunk HIDIO 65`) and keeps **no bytes** of its byte specifier `(0 0 0)`:
+//!   the packet that answers it is the keyboard's ordinary input report `0x01` (all-zero on an idle
+//!   keyboard, 1.7-3.7 ms after the pull in all 121 pulls). That read is pacing, not a data transfer - but
+//!   it is load-bearing: `read_pull_ack` runs it for every chunk, and a 2026-10-17 run that skipped it
+//!   failed every payload read-back;
 //! - the payload-read request is `SET_REPORT wValue 0x0300 wLength 642` — a **feature** report, not an
 //!   output report — carrying `[83][00][resource-buffer offset u16 LE][size u16 LE]`, 6 frame bytes;
 //! - the answer is a **feature-report reply** (`GET_REPORT wValue 0x0300 wIndex 1 wLength 642`): 643
@@ -80,10 +85,10 @@ const READ_REPLY_ID: u8 = 0x00;
 const READ_REPLY_WIRE_LEN: usize = ONBOARD_REPLY_REPORT_SIZE;
 /// Poll acknowledges and status reports the reply collector skips.
 const ACK_REPORT_IDS: [u8; 2] = [0x0B, 0x12];
-/// Wire length to ask for when collecting the packet that follows a pull. The pull has no answer of
-/// its own: the device keeps streaming its ordinary input reports on the interrupt endpoint (report
-/// `0x01`, all-zero on an idle keyboard, 1.7-3.7 ms after the pull in the capture) and GG consumes one
-/// packet per chunk as pacing, taking no bytes from it.
+/// Bytes to read for the pacing packet that follows a pull. The pull has no answer of its own: the device
+/// keeps streaming its ordinary input reports on the interrupt endpoint (report `0x01`, all-zero on an idle
+/// keyboard, 1.7-3.7 ms after the pull in the capture) and GG consumes one packet per chunk as pacing, taking
+/// no bytes from it (its `read-chunk HIDIO 65` - one report-ID slot plus this report).
 const PULL_ACK_LEN: usize = 64;
 /// Polls per reply collection round, in milliseconds.
 const REPLY_POLL_MS: i32 = 50;
@@ -91,7 +96,7 @@ const REPLY_POLL_MS: i32 = 50;
 const REPLY_BUDGET_MS: u64 = 2_000;
 /// Input-report polls allowed per reply before giving up.
 const REPLY_INPUT_ATTEMPTS: u32 = 20;
-/// Polls allowed for one pull answer.
+/// Reads allowed per pull before giving up (the device streams input reports, so one answer is expected).
 const PULL_ACK_ATTEMPTS: u32 = 4;
 /// Polls allowed for the firmware-version answer.
 const FIRMWARE_REPLY_ATTEMPTS: u32 = 3;
@@ -132,8 +137,8 @@ pub async fn read_profile(keyboard: &GenericKeyboard, profile: u8, strict: bool)
         .map_err(|e| Error::Other(format!("onboard read worker sent no result: {e}")))?
 }
 
-/// Runs one read (the opening chain, then [`DEFAULT_CHUNKS`] pulls with their payload reads) on one
-/// collection.
+/// Runs one read (the firmware poll, then [`DEFAULT_CHUNKS`] pulls, each with its pacing read and payload
+/// reads) on one collection.
 fn read_image(
     keyboard: &GenericKeyboard,
     profile: u8,
@@ -318,8 +323,11 @@ fn read_reply_report(keyboard: &GenericKeyboard, payload_len: usize, overall: Op
     )))
 }
 
-/// Consumes the interrupt packet that follows a pull (flow control, the content is not looked at -
-/// GG's read specifiers keep zero bytes of it), so the next payload read starts from a clean queue.
+/// Reads the pacing packet that follows a pull. Its content is not looked at - GG's read specifiers keep zero
+/// bytes of it - and the pull has no answer of its own: the device keeps streaming its ordinary input reports
+/// on the interrupt endpoint (report `0x01`, all-zero on an idle keyboard, 1.7-3.7 ms after the pull in the
+/// capture). The drain is load-bearing on hidraw: a run on 2026-10-17 that skipped it failed every payload
+/// read-back with `io::read_exact: unexpected end of file`.
 fn read_pull_ack(keyboard: &GenericKeyboard) -> Option<Vec<u8>> {
     read_interrupt_report(keyboard, PULL_ACK_LEN, PULL_ACK_ATTEMPTS)
 }

@@ -534,6 +534,7 @@ impl HidCommand for OnboardFirmwareVersionCommand {
 /// read and keeps none of the bytes (its read spec's byte specifier for the pull is zero length), and on the
 /// wire that packet is the keyboard's ordinary input report - report `0x01`, all-zero on an idle keyboard, in
 /// all 121 pulls of the capture. The pull is flow control; the profile bytes come from [`OnboardReadCommand`].
+/// Draining that packet is not optional on Linux - see `apex_legacy_onboard::read_pull_ack`.
 ///
 /// Sizes and frame layout from the 2026-10-15 reference capture (121 pulls of 1024 bytes at file
 /// offsets 0, 4, 8, … 44 for the schema probe and 0..11264 for full files).

@@ -37,7 +37,10 @@ and never sent. Wire format, layout table and open questions: `docs/development/
    input report `0x01` (63 bytes, all zero = no keys pressed), and the device's own read spec keeps **no**
    bytes of it (byte specifier `(0 0 0)` in `apex_7.lisp`). So the packet GG reads after a pull is a flow-control
    token; every profile byte arrives through the `0x83` window replies. `ssgg onboard read` does the same
-   (`read_pull_ack` consumes one packet and inspects none of it). The capture kit's `reports.csv` lists the
+   (`read_pull_ack` consumes one packet and inspects none of it, `PULL_ACK_LEN` bytes). The drain is not
+   optional on Linux: a 2026-10-17 run that
+   skipped it failed every payload read-back with `io::read_exact: unexpected end of file`. The capture kit's
+   `reports.csv` lists the
    121 pulls as 64-byte "control responses" starting `85 00 …` - those are the requests GG submitted, which is
    why pull replies were earlier described as constant 64-byte frames.
 
