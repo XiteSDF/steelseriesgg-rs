@@ -45,12 +45,13 @@ feature-gated). `ssgg onboard read` runs on that device. Nothing has been replay
    1 has no `input*`, boot once with the kernel argument `usbhid.poll_descriptor_ignores_interfaces=0`
    (`sudo raspistop --bootcmd setusbhid` form from `ONBOARD.md` Step 1) and re-check.
 2. **[HW] Reply framing on the device:** short reads, one per candidate framing -
-   `ssgg --debug onboard read --yes --profile 0 --chunks 1 --resource-len 512 --read-len 512
-   --payload-len 512 --reply-header N` for `N` in `0, 1, 2, 5, 6, 14, 19, 20, 21, 36`; the `90` poll answer
+   `ssgg --debug onboard read --yes --profile 0`; the geometry, pacing, opening chain and reply framing are
+   constants since 2026-10-17 (`ReadConfig` and its CLI tunables are gone), so the framing candidates
+   `0, 1, 2, 5, 6, 14, 19, 20, 21, 36` are read from the `--debug` capture and applied in code; the `90` poll answer
    in the log confirms the device path, and the framing whose answer carries schema `0x000B` with a
    readable name is the anchor.
-3. **[HW] Read slot 0** with the winning framing (`--out /tmp/p0.bin --json /tmp/p0.json`), then slots
-   `1..4`, then `--verify` and the `--gap-ms` ladder. Record the checksum line and the decoded layout as
+3. **[HW] Read slot 0** (`--out /tmp/p0.bin --json /tmp/p0.json`), then slots
+   `1..4`, then `--verify`; pacing is the `GG_GAP_MS` constant, so a gap ladder is a code change. Record the checksum line and the decoded layout as
    `ONBOARD.md` "Next hardware steps" describes.
 4. **[HW] Windows:** same read through the hidapi path; confirms the interface choice for the control
    collection.
@@ -218,11 +219,11 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   interrupt endpoint with the ASCII firmware version for the `90` polls. Implemented 2026-10-16 as
   `hid_reports::ONBOARD_INIT_CHAIN` (it moved to `src/devices/hid_reports.rs` on 2026-10-17, see below):
   the read path sends the chain once per run and prints the version,
-  `--no-init-chain` compares the same read without it, `--gap-ms` paces it (11 ms = the capture, 1 ms =
+  the opening chain is always sent and pacing is `GG_GAP_MS` (11 ms = the capture, 1 ms =
   the old pacing word). The 13-byte "pacing frame" (`01 00 00 02 00 f4 01 60 00`) is not on the wire: it
   came from the text export and `config_frame` was deleted.
   The answers are 643-byte `GET_REPORT` replies, report-ID byte `03`, payload directly behind it: framing
-  0 is `READ_REPLY_FRAMING_LEN` and the `--reply-header` default (the old default 20 was the export
+  0 is `READ_REPLY_FRAMING_LEN`, the constant `onboard read` uses (the old default 20 was the export
   prefix). Measured from the replies: the schema word is payload offset 0 (`0b 00` = schema B) and the
   name offset 2, and the payload-read reply is a file head, not a window - 241 reads return 33 distinct
   payloads (179 all-zero, `0b 00` in 6, one each of `Config 1`..`Config 5`), the requested buffer and file
@@ -255,10 +256,10 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   Next step (keyboard): ask the read-back of the collection that declares it - interface 1 (`0xFFC0`): the
   kernel validates GET_REPORT against the interface's report descriptor, and interface 1 answered `EPIPE` to
   the 2026-10-15 report-ID-framed writes. Then
-  with the keyboard: `ssgg --debug onboard read --yes` and, per candidate framing, `ssgg --debug onboard
-  read --yes --reply-header <offset>`, and check in the capture that a control-IN transfer with 642 bytes of data
-  appears; `--no-init-chain` and `--gap-ms 1` measure what the 2026-10-15 acceptance of `83`/`85` proves
-  (GG runs the chain before every read session).
+  with the keyboard: `ssgg --debug onboard read --yes --profile 0`, and check in the capture that a control-IN
+  transfer with 642 bytes of data appears and where its payload starts; the reply framing, the opening chain and
+  the pacing are constants in code, so what the CLI used to sweep by flag is now measured from the capture and
+  applied to the constants (GG runs the chain before every read session).
 - Old TODO items: clippy-ci / future-incompat errors (resolved, see Baseline); `ssgg_bug_report.json` triage
   (dropped: the file was never provided); issue #6 Arch compile (closed `not_planned`).
 - `docs/development/` consolidation (2026-10-15): capture-note "Transport" section matches the 645-byte /

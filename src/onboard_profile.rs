@@ -59,7 +59,7 @@
 //!
 //! The payload starts at file offset 0 with the schema word; the engine's payload structs carry one
 //! leading constant id byte that is not part of the file, so a payload read lands at its file offset and
-//! the assembled image is [`ReadConfig::payload_len`] bytes with no id byte.
+//! the assembled image is [`PROFILE_FILE_LEN`] bytes with no id byte.
 
 use crate::devices::hid_reports::{ONBOARD_FEATURE_REPORT_SIZE, ONBOARD_OUTPUT_REPORT_SIZE};
 use crate::devices::keyboards::apex_pro_tkl_2023_profile::profile_checksum;
@@ -160,110 +160,37 @@ pub fn parse_firmware_version(reply: &[u8]) -> Option<String> {
 /// full 642, so 636 is the ceiling both shapes agree on.
 pub const MAX_READ_LEN: usize = READ_REPORT_LEN - 1 - READ_REPLY_HEADER_LEN;
 
-/// Parameters of one profile read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct ReadConfig {
-    /// Profile slot `0..=4`.
-    pub profile: u8,
-    /// Base file id; [`PROFILE_FS_BASE`] for profiles.
-    pub fs_base: u16,
-    /// Pulls to issue.
-    pub chunks: usize,
-    /// Resource buffer size per pull.
-    pub resource_len: usize,
-    /// Bytes per payload read.
-    pub read_len: usize,
-    /// Payload length to assemble.
-    pub payload_len: usize,
-    /// Pacing between our transfers, in milliseconds.
-    pub gap_ms: u64,
-    /// Send [`crate::devices::hid_reports::ONBOARD_INIT_CHAIN`] before the pull loop. GG always runs it;
-    /// turning it off is a probe.
-    pub send_init_chain: bool,
-    /// Framing bytes between the report-ID byte and the payload of a payload-read reply;
-    /// [`READ_REPLY_FRAMING_LEN`] (0) matches the 2026-10-15 capture, 5 suits a keyboard that echoes
-    /// the request header.
-    pub reply_header: usize,
+/// File bytes one read covers: [`DEFAULT_CHUNKS`] pulls of [`RESOURCE_BUFFER_LEN`] bytes, which covers
+/// both payload lengths ([`PAYLOAD_LEN_A`] and [`PAYLOAD_LEN_B`]).
+pub const PROFILE_FILE_LEN: usize = DEFAULT_CHUNKS * RESOURCE_BUFFER_LEN;
+
+/// Payload reads per pull: one pull fills [`RESOURCE_BUFFER_LEN`], each read drains [`READ_LEN`] of it.
+pub const READS_PER_PULL: usize = RESOURCE_BUFFER_LEN / READ_LEN;
+
+/// The fixed read must cover both payload lengths, or the assembled image would be a partial profile.
+const _: () = assert!(
+    PROFILE_FILE_LEN >= PAYLOAD_LEN_B,
+    "the fixed pull loop must cover the longer payload"
+);
+
+/// Profile file id of slot `profile`: [`PROFILE_FS_BASE`] plus the slot index.
+#[must_use]
+pub fn profile_file_id(profile: u8) -> u16 {
+    PROFILE_FS_BASE.wrapping_add(u16::from(profile))
 }
 
-impl Default for ReadConfig {
-    fn default() -> Self {
-        Self {
-            profile: 0,
-            fs_base: PROFILE_FS_BASE,
-            chunks: DEFAULT_CHUNKS,
-            resource_len: RESOURCE_BUFFER_LEN,
-            read_len: READ_LEN,
-            payload_len: PAYLOAD_LEN_A,
-            gap_ms: GG_GAP_MS,
-            send_init_chain: true,
-            reply_header: READ_REPLY_FRAMING_LEN,
-        }
+/// Reject a slot index this read does not support.
+///
+/// # Errors
+///
+/// [`Error::InvalidConfig`] when `profile` is above [`MAX_PROFILE_INDEX`].
+pub fn validate_profile(profile: u8) -> Result<()> {
+    if profile > MAX_PROFILE_INDEX {
+        return Err(Error::InvalidConfig(format!(
+            "profile slot {profile} is above the highest slot {MAX_PROFILE_INDEX}"
+        )));
     }
-}
-
-impl ReadConfig {
-    /// File id of the profile being read.
-    pub fn fs_id(&self) -> u16 {
-        self.fs_base.wrapping_add(u16::from(self.profile))
-    }
-
-    /// File bytes covered by the planned pulls.
-    pub fn total_resource_len(&self) -> usize {
-        self.chunks * self.resource_len
-    }
-
-    /// Reject configurations that cannot produce a complete payload or cannot fit a reply.
-    pub fn validate(&self) -> Result<()> {
-        if self.profile > MAX_PROFILE_INDEX {
-            return Err(Error::InvalidConfig(format!(
-                "profile slot {} is above the highest slot {MAX_PROFILE_INDEX}",
-                self.profile
-            )));
-        }
-        if self.resource_len == 0 || self.read_len == 0 {
-            return Err(Error::InvalidConfig(
-                "resource length and read length must be non-zero".to_string(),
-            ));
-        }
-        if self.read_len > self.resource_len {
-            return Err(Error::InvalidConfig(format!(
-                "read length {} exceeds the resource buffer length {}",
-                self.read_len, self.resource_len
-            )));
-        }
-        let per_pull = self.resource_len / self.read_len;
-        if per_pull * self.read_len != self.resource_len {
-            return Err(Error::InvalidConfig(format!(
-                "the {} resource buffer is not a whole number of {} reads",
-                self.resource_len, self.read_len
-            )));
-        }
-        if self.read_len > MAX_READ_LEN {
-            return Err(Error::InvalidConfig(format!(
-                "read length {} exceeds the {} bytes a reply report can carry",
-                self.read_len, MAX_READ_LEN
-            )));
-        }
-        if self.payload_len == 0 {
-            return Err(Error::InvalidConfig("payload length must be non-zero".to_string()));
-        }
-        if self.total_resource_len() < self.payload_len {
-            return Err(Error::InvalidConfig(format!(
-                "{} pulls of {} bytes cover {}, short of the {} payload bytes",
-                self.chunks,
-                self.resource_len,
-                self.total_resource_len(),
-                self.payload_len
-            )));
-        }
-        Ok(())
-    }
-
-    /// Payload reads per pull: one pull fills the resource buffer, each read takes [`ReadConfig::read_len`].
-    pub fn reads_per_pull(&self) -> usize {
-        self.resource_len / self.read_len
-    }
+    Ok(())
 }
 
 /// Parsed header of a payload-read reply.
@@ -421,8 +348,8 @@ pub struct ReadStats {
 /// Assembled profile data with its per-pull records.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProfileImage {
-    /// Configuration the read ran with.
-    pub config: ReadConfig,
+    /// Profile slot the read ran on.
+    pub profile_slot: u8,
     /// Per-pull records, in collection order.
     pub chunks: Vec<ChunkRecord>,
     /// Profile file bytes, reads concatenated in pull order.
@@ -437,12 +364,16 @@ pub struct ProfileImage {
 impl ProfileImage {
     /// Assemble collected records into the profile image and tally reply statistics.
     ///
-    /// Reads that land past [`ReadConfig::payload_len`] are kept in the records and dropped from the
-    /// assembled data: the last pull always covers more than the payload needs.
-    pub fn assemble(chunks: Vec<ChunkRecord>, config: ReadConfig) -> Result<Self> {
-        config.validate()?;
+    /// Reads are scattered by their file offset; reads past [`PROFILE_FILE_LEN`] are kept in the
+    /// records and dropped from the assembled data.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidConfig`] when `profile_slot` is out of range.
+    pub fn assemble(profile_slot: u8, chunks: Vec<ChunkRecord>) -> Result<Self> {
+        validate_profile(profile_slot)?;
 
-        let mut data = vec![0u8; config.payload_len];
+        let mut data = vec![0u8; PROFILE_FILE_LEN];
         let mut reads_read = 0usize;
         let mut header_mismatches = 0usize;
         let mut zero_reads = 0usize;
@@ -457,25 +388,19 @@ impl ProfileImage {
             let mut cursor = record.file_offset as usize;
             for reply in &record.reads {
                 reads_read += 1;
-                if reply_mismatch(
-                    reply,
-                    (cursor - record.file_offset as usize) as u16,
-                    config.read_len as u16,
-                )
-                .is_some()
-                {
+                if reply_mismatch(reply, (cursor - record.file_offset as usize) as u16, READ_LEN as u16).is_some() {
                     header_mismatches += 1;
                 }
                 if reply.all_zero {
                     zero_reads += 1;
                 }
-                if reply.data.len() < config.read_len {
+                if reply.data.len() < READ_LEN {
                     short_reads += 1;
                 }
                 if reply.data.is_empty() {
                     continue;
                 }
-                if cursor >= config.payload_len {
+                if cursor >= PROFILE_FILE_LEN {
                     continue;
                 }
                 let end = cursor + reply.data.len();
@@ -483,11 +408,11 @@ impl ProfileImage {
                     // A page whose first four bytes are FF is garbage from the device's point of view; the
                     // reference implementation replaces it with zeroes and so do we.
                     garbage_reads += 1;
-                    let room = config.payload_len.saturating_sub(cursor);
+                    let room = PROFILE_FILE_LEN.saturating_sub(cursor);
                     data[cursor..cursor + room].fill(0);
                     cursor += room;
-                } else if end > config.payload_len {
-                    let room = config.payload_len.saturating_sub(cursor);
+                } else if end > PROFILE_FILE_LEN {
+                    let room = PROFILE_FILE_LEN.saturating_sub(cursor);
                     data[cursor..cursor + room].copy_from_slice(&reply.data[..room]);
                     cursor += room;
                 } else {
@@ -504,7 +429,7 @@ impl ProfileImage {
             .unwrap_or(0);
 
         Ok(Self {
-            config,
+            profile_slot,
             stats: ReadStats {
                 chunks_read: chunks.len(),
                 reads_read,
@@ -1005,8 +930,8 @@ pub fn to_json(image: &ProfileImage) -> Result<String> {
         json!(null)
     };
     let value = json!({
-        "profile_slot": image.config.profile,
-        "fs_id": format!("0x{:04X}", image.config.fs_id()),
+        "profile_slot": image.profile_slot,
+        "fs_id": format!("0x{:04X}", profile_file_id(image.profile_slot)),
         "schema": format!("0x{schema:04X}"),
         "schema_decoded": decoded,
         "firmware": image.firmware,
@@ -1056,12 +981,10 @@ mod tests {
 
     #[test]
     fn pull_and_read_frames_come_from_the_typed_commands() {
-        let config = ReadConfig::default();
-        config.validate().unwrap();
         let pull = OnboardPullCommand {
-            fs_id: config.fs_id(),
+            fs_id: profile_file_id(0),
             file_offset: 0,
-            size: config.resource_len as u16,
+            size: RESOURCE_BUFFER_LEN as u16,
         }
         .data_stage();
         assert_eq!(pull[0], CommandCode::OnboardPull as u8);
@@ -1073,7 +996,7 @@ mod tests {
         assert_eq!(pull.len(), OnboardPullCommand::FRAME_LEN);
         let read = OnboardReadCommand {
             buffer_offset: 0,
-            size: config.read_len as u16,
+            size: READ_LEN as u16,
         }
         .data_stage();
         assert_eq!(read[0], CommandCode::OnboardPayloadRead as u8);
@@ -1082,16 +1005,13 @@ mod tests {
 
     #[test]
     fn pulls_walk_the_resource_buffer_and_carry_the_slot_file_id() {
-        let config = ReadConfig {
-            profile: 3,
-            ..ReadConfig::default()
-        };
-        assert_eq!(config.fs_id(), 0x0204);
-        for n in 0..config.chunks {
+        let slot = 3;
+        assert_eq!(profile_file_id(slot), 0x0204);
+        for n in 0..DEFAULT_CHUNKS {
             let pull = OnboardPullCommand {
-                fs_id: config.fs_id(),
-                file_offset: (n * config.resource_len) as u32,
-                size: config.resource_len as u16,
+                fs_id: profile_file_id(slot),
+                file_offset: (n * RESOURCE_BUFFER_LEN) as u32,
+                size: RESOURCE_BUFFER_LEN as u16,
             }
             .data_stage();
             assert_eq!(
@@ -1101,32 +1021,32 @@ mod tests {
             );
             assert_eq!(
                 u32::from_le_bytes([pull[4], pull[5], pull[6], pull[7]]),
-                (n * config.resource_len) as u32,
-                "pull n fills the buffer at file offset n * resource_len"
+                (n * RESOURCE_BUFFER_LEN) as u32,
+                "pull n fills the buffer at file offset n * RESOURCE_BUFFER_LEN"
             );
             assert_eq!(
                 u16::from_le_bytes([pull[8], pull[9]]),
-                config.resource_len as u16,
+                RESOURCE_BUFFER_LEN as u16,
                 "pull size"
             );
         }
-        for n in 0..config.reads_per_pull() {
+        for n in 0..READS_PER_PULL {
             let read = OnboardReadCommand {
-                buffer_offset: (n * config.read_len) as u16,
-                size: config.read_len as u16,
+                buffer_offset: (n * READ_LEN) as u16,
+                size: READ_LEN as u16,
             }
             .data_stage();
             assert_eq!(
                 u16::from_le_bytes([read[2], read[3]]),
-                (n * config.read_len) as u16,
+                (n * READ_LEN) as u16,
                 "read n asks for the n-th window of the resource buffer"
             );
-            assert_eq!(u16::from_le_bytes([read[4], read[5]]), config.read_len as u16);
+            assert_eq!(u16::from_le_bytes([read[4], read[5]]), READ_LEN as u16);
         }
         assert_eq!(
-            config.total_resource_len(),
+            PROFILE_FILE_LEN,
             DEFAULT_CHUNKS * RESOURCE_BUFFER_LEN,
-            "the default geometry covers the payload of the reference capture"
+            "the fixed read covers 12 x 1024 file bytes"
         );
     }
 
@@ -1203,117 +1123,101 @@ mod tests {
         assert_eq!(parsed.data.len(), 10, "a truncated report yields a short read");
     }
 
-    #[test]
-    fn assemble_scatters_reads_by_file_offset() {
-        let config = ReadConfig {
-            chunks: 2,
-            payload_len: 2048,
-            ..ReadConfig::default()
-        };
-        let records = (0..2)
-            .map(|chunk| ChunkRecord {
-                index: chunk,
-                fs_id: config.fs_id(),
-                file_offset: (chunk * config.resource_len) as u32,
-                ack_report_id: 0x85,
-                ack_hex: "85".to_string(),
-                reads: (0..2)
-                    .map(|read| ReadReply {
+    fn record(chunk: usize, data: impl Fn(usize) -> Vec<u8>) -> ChunkRecord {
+        ChunkRecord {
+            index: chunk,
+            fs_id: profile_file_id(0),
+            file_offset: (chunk * RESOURCE_BUFFER_LEN) as u32,
+            ack_report_id: 0x85,
+            ack_hex: "85 00".to_string(),
+            reads: (0..READS_PER_PULL)
+                .map(|read| {
+                    let data = data(read);
+                    let all_zero = data.iter().all(|b| *b == 0);
+                    ReadReply {
                         report_id: 0x83,
                         reserved: 0,
                         header: true,
-                        offset: (read * config.read_len) as u16,
-                        size: config.read_len as u16,
-                        data: vec![(chunk * 8 + read + 1) as u8; config.read_len],
-                        all_zero: false,
-                        all_ff: false,
-                    })
-                    .collect(),
-            })
-            .collect::<Vec<_>>();
-        let image = ProfileImage::assemble(records, config).unwrap();
-        assert_eq!(image.data.len(), 2048);
-        assert_eq!(image.data[0], 1);
-        assert_eq!(image.data[512], 2);
-        assert_eq!(image.data[1024], 9);
-        assert_eq!(image.data[1536], 10);
-        assert_eq!(image.stats.chunks_read, 2);
-        assert_eq!(image.stats.reads_read, 4);
-        assert_eq!(image.stats.header_mismatches, 0);
-        assert_eq!(image.stats.zero_chunks, 0);
-        assert_eq!(image.stats.covered_len, 2048);
+                        offset: (read * READ_LEN) as u16,
+                        size: READ_LEN as u16,
+                        all_ff: data.starts_with(&[0xFF, 0xFF, 0xFF, 0xFF]),
+                        all_zero,
+                        data,
+                    }
+                })
+                .collect(),
+        }
     }
 
     #[test]
-    fn assemble_drops_reads_past_the_payload() {
-        let config = ReadConfig {
-            chunks: 1,
-            resource_len: 1024,
-            read_len: 512,
-            payload_len: 600,
-            ..ReadConfig::default()
-        };
-        let record = ChunkRecord {
-            index: 0,
-            fs_id: config.fs_id(),
-            file_offset: 0,
+    fn assemble_scatters_reads_by_file_offset() {
+        let records = (0..DEFAULT_CHUNKS)
+            .map(|chunk| record(chunk, |read| vec![(chunk * READS_PER_PULL + read + 1) as u8; READ_LEN]))
+            .collect::<Vec<_>>();
+        let image = ProfileImage::assemble(0, records).unwrap();
+        assert_eq!(image.data.len(), PROFILE_FILE_LEN);
+        assert_eq!(image.data[0], 1);
+        assert_eq!(image.data[READ_LEN], 2);
+        assert_eq!(image.data[RESOURCE_BUFFER_LEN], 3);
+        assert_eq!(
+            image.data[PROFILE_FILE_LEN - 1],
+            (DEFAULT_CHUNKS * READS_PER_PULL) as u8
+        );
+        assert_eq!(image.stats.chunks_read, DEFAULT_CHUNKS);
+        assert_eq!(image.stats.reads_read, DEFAULT_CHUNKS * READS_PER_PULL);
+        assert_eq!(image.stats.header_mismatches, 0);
+        assert_eq!(image.stats.zero_chunks, 0);
+        assert_eq!(image.stats.covered_len, PROFILE_FILE_LEN);
+        assert_eq!(image.profile_slot, 0);
+    }
+
+    #[test]
+    fn assemble_drops_reads_past_the_file_and_clips_the_last_one() {
+        let mut records = (0..DEFAULT_CHUNKS)
+            .map(|chunk| record(chunk, |_| vec![0u8; READ_LEN]))
+            .collect::<Vec<_>>();
+        // One pull beyond the file: its reads are recorded and stay out of the assembled bytes.
+        records.push(ChunkRecord {
+            index: DEFAULT_CHUNKS,
+            fs_id: profile_file_id(0),
+            file_offset: PROFILE_FILE_LEN as u32,
             ack_report_id: 0x85,
-            ack_hex: "85".to_string(),
-            reads: (0..2)
+            ack_hex: "85 00".to_string(),
+            reads: (0..READS_PER_PULL)
                 .map(|read| ReadReply {
                     report_id: 0x83,
                     reserved: 0,
                     header: true,
-                    offset: (read * 512) as u16,
-                    size: 512,
-                    data: vec![0xAA_u8; 512],
+                    offset: (read * READ_LEN) as u16,
+                    size: READ_LEN as u16,
+                    data: vec![0xAA_u8; READ_LEN],
                     all_zero: false,
                     all_ff: false,
                 })
                 .collect(),
-        };
-        let image = ProfileImage::assemble(vec![record], config).unwrap();
-        assert_eq!(image.data.len(), 600);
-        assert_eq!(image.data[599], 0xAA, "the tail read is clipped to the payload");
-        assert_eq!(image.stats.short_reads, 0);
+        });
+        let image = ProfileImage::assemble(0, records).unwrap();
+        assert_eq!(image.data.len(), PROFILE_FILE_LEN);
+        assert!(
+            image.data.iter().all(|b| *b == 0),
+            "the extra pull contributes no bytes"
+        );
+        assert_eq!(image.stats.chunks_read, DEFAULT_CHUNKS + 1);
+        assert_eq!(
+            image.stats.reads_read,
+            (DEFAULT_CHUNKS + 1) * READS_PER_PULL,
+            "the extra reads are still tallied in the statistics"
+        );
     }
 
     #[test]
-    fn config_rejects_plans_that_cannot_cover_the_payload() {
-        let config = ReadConfig {
-            chunks: 11,
-            ..ReadConfig::default()
-        };
-        let err = config.validate().unwrap_err().to_string();
-        assert!(err.contains("short of"), "{err}");
-        let config = ReadConfig {
-            resource_len: 700,
-            read_len: 700,
-            payload_len: 11_648,
-            chunks: 12,
-            ..ReadConfig::default()
-        };
-        let err = config.validate().unwrap_err().to_string();
-        assert!(err.contains("reply report"), "{err}");
-        let config = ReadConfig {
-            resource_len: 1000,
-            read_len: 300,
-            payload_len: 11_648,
-            chunks: 12,
-            ..ReadConfig::default()
-        };
-        let err = config.validate().unwrap_err().to_string();
-        assert!(err.contains("whole number"), "{err}");
-        assert!(
-            ReadConfig {
-                profile: 5,
-                ..ReadConfig::default()
-            }
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("highest slot")
-        );
+    fn only_the_profile_slot_is_selectable() {
+        for slot in 0..=MAX_PROFILE_INDEX {
+            assert!(validate_profile(slot).is_ok(), "slot {slot} is readable");
+        }
+        let err = validate_profile(MAX_PROFILE_INDEX + 1).unwrap_err().to_string();
+        assert!(err.contains("highest slot"), "{err}");
+        assert!(validate_profile(255).is_err());
     }
 
     #[test]
@@ -1395,60 +1299,52 @@ mod tests {
         assert_eq!(value["button_mappings"].as_array().unwrap().len(), 128);
         assert!(value["rapid_tap"].is_object());
 
-        let image = ProfileImage::assemble(
-            {
-                let reads_per_pull = RESOURCE_BUFFER_LEN / READ_LEN;
-                (0..DEFAULT_CHUNKS)
-                    .map(|chunk| ChunkRecord {
-                        index: chunk,
-                        fs_id: 0x0201,
-                        file_offset: (chunk * RESOURCE_BUFFER_LEN) as u32,
-                        ack_report_id: 0x85,
-                        ack_hex: "85 00".to_string(),
-                        reads: (0..reads_per_pull)
-                            .map(|read| {
-                                let i = chunk * reads_per_pull + read;
-                                let start = i * READ_LEN;
-                                let data_slice = data
-                                    .get(start..start + READ_LEN)
-                                    .map(|s| s.to_vec())
-                                    .unwrap_or_else(|| vec![0u8; READ_LEN]);
-                                ReadReply {
-                                    report_id: 0x83,
-                                    reserved: 0,
-                                    header: true,
-                                    offset: (read * READ_LEN) as u16,
-                                    size: READ_LEN as u16,
-                                    all_zero: data_slice.iter().all(|b| *b == 0),
-                                    all_ff: false,
-                                    data: data_slice,
-                                }
-                            })
-                            .collect(),
-                    })
-                    .collect::<Vec<_>>()
-            },
-            ReadConfig {
-                payload_len: PAYLOAD_LEN_B,
-                ..ReadConfig::default()
-            },
-        )
+        let image = ProfileImage::assemble(0, {
+            let reads_per_pull = READS_PER_PULL;
+            (0..DEFAULT_CHUNKS)
+                .map(|chunk| ChunkRecord {
+                    index: chunk,
+                    fs_id: 0x0201,
+                    file_offset: (chunk * RESOURCE_BUFFER_LEN) as u32,
+                    ack_report_id: 0x85,
+                    ack_hex: "85 00".to_string(),
+                    reads: (0..reads_per_pull)
+                        .map(|read| {
+                            let i = chunk * reads_per_pull + read;
+                            let start = i * READ_LEN;
+                            let data_slice = data
+                                .get(start..start + READ_LEN)
+                                .map(|s| s.to_vec())
+                                .unwrap_or_else(|| vec![0u8; READ_LEN]);
+                            ReadReply {
+                                report_id: 0x83,
+                                reserved: 0,
+                                header: true,
+                                offset: (read * READ_LEN) as u16,
+                                size: READ_LEN as u16,
+                                all_zero: data_slice.iter().all(|b| *b == 0),
+                                all_ff: false,
+                                data: data_slice,
+                            }
+                        })
+                        .collect(),
+                })
+                .collect::<Vec<_>>()
+        })
         .unwrap();
         let raw = to_json(&image).unwrap();
         let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(value["schema_decoded"], "b");
-        assert_eq!(value["data_len"], PAYLOAD_LEN_B);
+        assert_eq!(value["profile_slot"], 0);
+        assert_eq!(value["fs_id"], "0x0201");
+        assert_eq!(value["data_len"], PROFILE_FILE_LEN);
     }
 
     #[test]
     fn image_diff_finds_the_first_difference() {
-        let config = ReadConfig {
-            payload_len: 12 * 1024,
-            ..ReadConfig::default()
-        };
         let record = |first: u8| ChunkRecord {
             index: 0,
-            fs_id: config.fs_id(),
+            fs_id: profile_file_id(0),
             file_offset: 0,
             ack_report_id: 0x85,
             ack_hex: "85".to_string(),
@@ -1465,9 +1361,9 @@ mod tests {
                 })
                 .collect(),
         };
-        let a = ProfileImage::assemble(vec![record(1)], config).unwrap();
-        let b = ProfileImage::assemble(vec![record(1)], config).unwrap();
-        let c = ProfileImage::assemble(vec![record(2)], config).unwrap();
+        let a = ProfileImage::assemble(0, vec![record(1)]).unwrap();
+        let b = ProfileImage::assemble(0, vec![record(1)]).unwrap();
+        let c = ProfileImage::assemble(0, vec![record(2)]).unwrap();
         assert_eq!(image_diff(&a, &b), None);
         assert_eq!(image_diff(&a, &c), Some(3 * READ_LEN));
         assert_eq!(a.diff(&c), Some(3 * READ_LEN));

@@ -97,12 +97,16 @@ for each chunk c in 0..12:
 12 pulls of 1024 bytes cover 12288 bytes, enough for the 11648-byte schema A payload and the
 11696-byte schema B payload. A schema-only read is the opening chain, one 2-byte pull of the file head
 and one 2-byte read (GG's own probe, kept in the transfer map; `ssgg onboard` has no schema-probing mode).
-`ssgg onboard read --yes` runs the whole read and prints its geometry first (slot, file id, pulls, payload
-reads, pacing, reply anchor); frames are built per chunk from the typed commands, nothing materialises a
-transfer list (`Step`, `StepKind`, `ReadConfig::steps()`, `init_steps()`, `plan_json` and the `onboard plan`
-subcommand were removed 2026-10-17).
-The reply framing length is `--reply-header` (default 0, the offset the capture's replies show); skip
-the chain itself with `--no-init-chain`.
+`ssgg onboard read --yes --profile N` runs the whole read and prints its geometry first; frames are built
+per chunk from the typed commands, nothing materialises a transfer list (`Step`, `StepKind`,
+`ReadConfig::steps()`, `init_steps()`, `plan_json` and the `onboard plan` subcommand were removed
+2026-10-17).
+The profile slot is the only run-time choice. The geometry (12 pulls of 1024, 2 reads of 512), the pacing
+([`GG_GAP_MS`]), the opening chain (always sent) and the reply framing
+([`READ_REPLY_FRAMING_LEN`], 0 = the offset the capture's replies show) are constants:
+`ReadConfig` and its CLI tunables (`--resource-len`, `--read-len`, `--chunks`, `--payload-len`,
+`--fs-base`, `--gap-ms`, `--no-init-chain`, `--reply-header`) were removed 2026-10-17. A keyboard that
+needs other geometry is a code change, measured first on the capture.
 
 
 ## Payload layout
@@ -143,7 +147,7 @@ The Windows engine's start-location table for a neighbouring Apex 7 model names 
 OLED and macro blocks; neither the 4-byte nor the 5-byte entry hypothesis lands on those numbers, so
 they are recorded as an open question, not as a layout.
 
-## Reply framing (measured, and the reason for `--reply-header`)
+## Reply framing (measured; the anchor is a constant, not a flag)
 
 Every payload answer in the capture is a 643-byte `GET_REPORT wValue 0x0300` data stage whose first byte
 is the report-ID byte `03` and whose payload starts directly behind it: the framing length is 0. The two
@@ -177,11 +181,12 @@ exports that prefix every report row with the capture's own USBPcap/usbmon heade
 (`80 02 00 00 00 00 00 00 ff ff …`), and `reports.csv` lists responses only, so it cannot show request
 shapes at all. Re-derive anything here from the raw pcaps, which are the capture's source of truth.
 
-The framing stays a CLI knob because the keyboard this lands on has not been measured: the Apex 7
-accepted 6 on 2026-10-15, and 5 suits a keyboard that echoes the request header. Find the anchor with
-short reads at each framing `0, 1, 2, 5, 6, 14, 19, 20, 21, 36` (`ssgg onboard read --yes --chunks 1
---resource-len 512 --read-len 512 --payload-len 512 --reply-header N`) and keep the one whose answer
-carries a schema word the decoder knows; `ssgg onboard read --reply-header N` assembles with that anchor.
+The framing is a constant now ([`READ_REPLY_FRAMING_LEN`] = 0, the offset the 2026-10-15 capture shows).
+It was a CLI knob while the landing keyboard was unmeasured - the Apex 7 accepted 6 on 2026-10-15, and 5
+suits a keyboard that echoes the request header - and the short-read sweep over
+`0, 1, 2, 5, 6, 14, 19, 20, 21, 36` is no longer runnable from the CLI. Measure it from a capture
+(`ssgg --debug onboard read`), record the result, and change the constant; the framing a keyboard uses is
+visible in the read output: the schema word appears at byte 0 of the payload only when the anchor is right.
 
 ## Safety
 
@@ -198,8 +203,8 @@ keyboard in a state GG itself cannot repair. `read` requires `--yes`; `decode` n
   [apex-pro-tkl-2023-gg-capture.md](apex-pro-tkl-2023-gg-capture.md)); nothing in this capture says the
   legacy family does the same.
 - What `f4 00` and `6c 00 01` do. They are part of the opening chain, `f4 00` answers `00 01 00 …` and
-  `6c 00 01` is not answered at all; nothing here says which of the six frames a keyboard requires, and
-  `ssgg onboard read --no-init-chain` exists to measure that.
+  `6c 00 01` is not answered at all; nothing here says which of the six frames a keyboard requires, and the
+  read always sends all six (`--no-init-chain` was removed 2026-10-17, so measuring that needs a code change).
 - GG's write direction (`03 00 <offset> <size> <payload>`, 144 transfers in the capture): not used
   here, and there is no read-back command known for this family, so `ssgg onboard` writes nothing.
 - The remaining `wValue 0x0200` frames of the capture (`0x6e`, `0x68`, `0x6a`, `0x89`, `0x41`, `0x69`,

@@ -814,12 +814,14 @@ async fn cmd_profile(action: ProfileAction) -> Result<()> {
 /// docs/development/apex-7-onboard-profile-read.md and has never been replayed from this crate.
 #[cfg(feature = "onboard")]
 async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAction) -> Result<()> {
-    use steelseries_gg::onboard_profile::{hex_dump, profile_json, schema_of, to_json};
+    use steelseries_gg::onboard_profile::{
+        DEFAULT_CHUNKS, READ_LEN, READS_PER_PULL, RESOURCE_BUFFER_LEN, hex_dump, profile_file_id, profile_json,
+        schema_of, to_json,
+    };
 
     match action {
         OnboardAction::Read(args) => {
-            let config = args.wire.to_config();
-            config.validate()?;
+            let profile = args.profile;
             if !args.yes {
                 return require_yes("read the on-board profile");
             }
@@ -835,20 +837,17 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
             let label = onboard_device_label(keyboard.as_ref());
             print_onboard_banner();
             println!(
-                "profile slot {} (file id {:04X}): {} pulls of {} bytes, {} reads of {} bytes",
-                config.profile,
-                config.fs_id(),
-                config.chunks,
-                config.resource_len,
-                config.chunks * (config.resource_len / config.read_len),
-                config.read_len
+                "profile slot {profile} (file id {:04X}): {} pulls of {RESOURCE_BUFFER_LEN} bytes, {} reads of {READ_LEN} bytes",
+                profile_file_id(profile),
+                DEFAULT_CHUNKS,
+                DEFAULT_CHUNKS * READS_PER_PULL
             );
             println!("reading on the {label}");
             println!();
 
             if args.verify {
-                let first = keyboard.read_onboard_profile(&config).await?;
-                let second = keyboard.read_onboard_profile(&config).await?;
+                let first = keyboard.read_onboard_profile(profile).await?;
+                let second = keyboard.read_onboard_profile(profile).await?;
                 let diff = first
                     .data
                     .iter()
@@ -879,7 +878,7 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
                     println!("JSON report of the first read written to {}", json.display());
                 }
             } else {
-                let image = keyboard.read_onboard_profile(&config).await?;
+                let image = keyboard.read_onboard_profile(profile).await?;
                 print_onboard_image(&image, &label);
                 if args.hex {
                     print!("{}", hex_dump(&image.data, 0, image.data.len()));

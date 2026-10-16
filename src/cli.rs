@@ -214,74 +214,11 @@ pub(crate) enum OnboardAction {
 /// reads out of it.
 #[cfg(feature = "onboard")]
 #[derive(clap::Args)]
-pub(crate) struct OnboardWireArgs {
-    /// On-board profile slot (0-4)
+pub(crate) struct OnboardReadArgs {
+    /// On-board profile slot (0-4). Everything else about the read is fixed geometry: 12 pulls of 1024
+    /// bytes, 512-byte payload reads, GG's opening chain, its pacing, the reply framing the capture shows.
     #[arg(short, long, default_value = "0")]
     pub(crate) profile: u8,
-
-    /// Resource-buffer length each pull fills, in bytes
-    #[arg(long, default_value = "1024")]
-    pub(crate) resource_len: usize,
-
-    /// Payload bytes asked for in each read
-    #[arg(long, default_value = "512")]
-    pub(crate) read_len: usize,
-
-    /// Pulls per profile file
-    #[arg(short, long, default_value = "12")]
-    pub(crate) chunks: usize,
-
-    /// Profile payload length (default: 11648, the schema A length)
-    #[arg(long)]
-    pub(crate) payload_len: Option<usize>,
-
-    /// First profile file id (0x0201 is profile 0 on the reference keyboard)
-    #[arg(long, value_parser = parse_hex_u16)]
-    pub(crate) fs_base: Option<u16>,
-
-    /// Skip GG's opening chain (`90 00`, `90 01`, `f4 00`, `6c 00 01`, `90 00`, `90 01`). The capture
-    /// shows GG running it in front of every profile read, and the `90` poll is what answers the
-    /// firmware version; turning it off is a probe.
-    #[arg(long)]
-    pub(crate) no_init_chain: bool,
-
-    /// Gap between transfers, in milliseconds (11 is the spacing the capture shows between the
-    /// opening-chain frames)
-    #[arg(long, default_value = "11")]
-    pub(crate) gap_ms: u64,
-
-    /// Framing bytes between the report-ID byte and the payload in a payload-read reply (0 matches the
-    /// 2026-10-15 capture, where every answer puts the payload directly behind the report-ID byte; 6 is
-    /// what the Apex 7 accepted on 2026-10-15, 5 suits a keyboard that echoes the request header)
-    #[arg(long, default_value = "0")]
-    pub(crate) reply_header: usize,
-}
-
-#[cfg(feature = "onboard")]
-impl OnboardWireArgs {
-    /// Turn the tunables into a read plan. Defaults match the reference capture.
-    pub(crate) fn to_config(&self) -> steelseries_gg::onboard_profile::ReadConfig {
-        steelseries_gg::onboard_profile::ReadConfig {
-            profile: self.profile,
-            resource_len: self.resource_len,
-            read_len: self.read_len,
-            chunks: self.chunks,
-            payload_len: self
-                .payload_len
-                .unwrap_or(steelseries_gg::onboard_profile::PAYLOAD_LEN_A),
-            fs_base: self.fs_base.unwrap_or(steelseries_gg::onboard_profile::PROFILE_FS_BASE),
-            send_init_chain: !self.no_init_chain,
-            gap_ms: self.gap_ms,
-            reply_header: self.reply_header,
-        }
-    }
-}
-
-#[cfg(feature = "onboard")]
-#[derive(clap::Args)]
-pub(crate) struct OnboardReadArgs {
-    #[command(flatten)]
-    pub(crate) wire: OnboardWireArgs,
 
     /// Device as `vid:pid` (default: the first Apex 7-family keyboard found). The read runs on that
     /// keyboard's own handle, the collection the device manager opened
@@ -656,12 +593,6 @@ pub(crate) fn require_color(s: &str) -> Result<Color> {
 pub(crate) fn parse_hex_u8(s: &str) -> std::result::Result<u8, String> {
     let s = s.trim_start_matches("0x");
     u8::from_str_radix(s, 16).map_err(|e| format!("Invalid hex value: {}", e))
-}
-
-#[cfg(feature = "onboard")]
-pub(crate) fn parse_hex_u16(s: &str) -> std::result::Result<u16, String> {
-    let s = s.trim_start_matches("0x");
-    u16::from_str_radix(s, 16).map_err(|e| format!("Invalid hex value: {}", e))
 }
 
 #[cfg(feature = "audio")]

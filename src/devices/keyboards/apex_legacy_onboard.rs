@@ -58,8 +58,9 @@ use crate::devices::hid_reports::{
 };
 use crate::error::{Error, Result};
 use crate::onboard_profile::{
-    ChunkRecord, INIT_REPLY_LEN, MAX_PROFILE_INDEX, ProfileImage, ReadConfig, ReadReply, hex_of,
-    parse_firmware_version, parse_read_reply_at, reply_mismatch,
+    ChunkRecord, DEFAULT_CHUNKS, GG_GAP_MS, INIT_REPLY_LEN, MAX_PROFILE_INDEX, ProfileImage, READ_LEN,
+    READ_REPLY_FRAMING_LEN, READS_PER_PULL, RESOURCE_BUFFER_LEN, ReadReply, hex_of, parse_firmware_version,
+    parse_read_reply_at, profile_file_id, reply_mismatch, validate_profile,
 };
 
 /// Highest profile slot this read supports.
@@ -106,10 +107,9 @@ const INPUT_REPORT_MAX_LEN: usize = 1024;
 ///
 /// # Errors
 ///
-/// Returns an error when the collection rejects a frame, never answers a payload read, or the read plan
-/// cannot be validated.
-pub async fn read_profile(keyboard: &GenericKeyboard, config: &ReadConfig, strict: bool) -> Result<ProfileImage> {
-    let config = *config;
+/// Returns an error when the collection rejects a frame, never answers a payload read, or `profile` is
+/// not a slot this read supports.
+pub async fn read_profile(keyboard: &GenericKeyboard, profile: u8, strict: bool) -> Result<ProfileImage> {
     // The read plan blocks (frame pacing, reply polls) on a worker thread. `spawn_blocking` asks for a
     // `'static` closure; the keyboard outlives the join we await below, and the closure finishes before
     // `read_profile` returns, so borrowing it for the closure is sound.
@@ -117,7 +117,7 @@ pub async fn read_profile(keyboard: &GenericKeyboard, config: &ReadConfig, stric
         unsafe { std::mem::transmute::<&GenericKeyboard, &'static GenericKeyboard>(keyboard) };
     let (tx, rx) = std::sync::mpsc::channel();
     tokio::task::spawn_blocking(move || {
-        let result = read_image(keyboard, &config, strict, None);
+        let result = read_image(keyboard, profile, strict, None);
         let _ = tx.send(result);
     })
     .await
@@ -126,33 +126,31 @@ pub async fn read_profile(keyboard: &GenericKeyboard, config: &ReadConfig, stric
         .map_err(|e| Error::Other(format!("onboard read worker sent no result: {e}")))?
 }
 
-/// Runs one read plan (the opening chain, then pulls with their payload reads) on one collection.
+/// Runs one read (the opening chain, then [`DEFAULT_CHUNKS`] pulls with their payload reads) on one
+/// collection.
 fn read_image(
     keyboard: &GenericKeyboard,
-    config: &ReadConfig,
+    profile: u8,
     strict: bool,
     deadline: Option<Duration>,
 ) -> Result<ProfileImage> {
     let path = keyboard.packet_label();
-    config.validate()?;
-    let fs_id = config.fs_id();
-    let reads_per_pull = config.reads_per_pull();
-    let read_len = u16::try_from(config.read_len).unwrap_or(u16::MAX);
+    validate_profile(profile)?;
+    let fs_id = profile_file_id(profile);
+    let read_len = READ_LEN as u16;
     let overall = deadline.map(|d| Instant::now() + d);
 
-    let firmware = if config.send_init_chain {
-        send_init_chain(keyboard, config.gap_ms)
-    } else {
-        None
-    };
+    // The chain is part of every read GG runs, and its `0x90` poll is the only source of the firmware
+    // version this read reports.
+    let firmware = send_init_chain(keyboard, GG_GAP_MS);
 
-    let mut chunks: Vec<ChunkRecord> = Vec::with_capacity(config.chunks);
-    for chunk in 0..config.chunks {
-        let file_offset = (chunk * config.resource_len) as u32;
+    let mut chunks: Vec<ChunkRecord> = Vec::with_capacity(DEFAULT_CHUNKS);
+    for chunk in 0..DEFAULT_CHUNKS {
+        let file_offset = (chunk * RESOURCE_BUFFER_LEN) as u32;
         let pull = OnboardPullCommand {
             fs_id,
             file_offset,
-            size: u16::try_from(config.resource_len).unwrap_or(OnboardPullCommand::MAX_SIZE),
+            size: RESOURCE_BUFFER_LEN as u16,
         };
         write_output_command(keyboard, pull).map_err(|e| {
             Error::DeviceCommunication(format!(
@@ -169,9 +167,9 @@ fn read_image(
             }
         };
 
-        let mut reads: Vec<ReadReply> = Vec::with_capacity(reads_per_pull);
-        for read in 0..reads_per_pull {
-            let buffer_offset = (read * config.read_len) as u16;
+        let mut reads: Vec<ReadReply> = Vec::with_capacity(READS_PER_PULL);
+        for read in 0..READS_PER_PULL {
+            let buffer_offset = (read * READ_LEN) as u16;
             let command = OnboardReadCommand {
                 buffer_offset,
                 size: read_len,
@@ -182,8 +180,8 @@ fn read_image(
                      {path} rejected: {e}"
                 ))
             })?;
-            let reply = read_reply_report(keyboard, config.read_len, overall)?;
-            let parsed = parse_read_reply_at(&reply, read_len, config.reply_header)?;
+            let reply = read_reply_report(keyboard, READ_LEN, overall)?;
+            let parsed = parse_read_reply_at(&reply, read_len, READ_REPLY_FRAMING_LEN)?;
             if let Some(msg) = reply_mismatch(&parsed, buffer_offset, read_len) {
                 tracing::debug!("onboard read: {msg}");
                 if strict {
@@ -194,8 +192,8 @@ fn read_image(
                 }
             }
             reads.push(parsed);
-            if config.gap_ms > 0 {
-                std::thread::sleep(Duration::from_millis(config.gap_ms));
+            if GG_GAP_MS > 0 {
+                std::thread::sleep(Duration::from_millis(GG_GAP_MS));
             }
         }
         chunks.push(ChunkRecord {
@@ -213,7 +211,7 @@ fn read_image(
         }
     }
 
-    ProfileImage::assemble(chunks, *config).map(|image| image.with_firmware(firmware))
+    ProfileImage::assemble(profile, chunks).map(|image| image.with_firmware(firmware))
 }
 
 /// Sends GG's opening chain and returns the firmware version the `0x90` poll answered with.
@@ -396,14 +394,18 @@ mod tests {
 
     #[test]
     fn default_read_config_matches_the_captured_geometry() {
-        let config = ReadConfig::default();
-        assert_eq!(config.resource_len, RESOURCE_BUFFER_LEN);
-        assert_eq!(config.fs_id(), PROFILE_FS_BASE);
-        assert_eq!(config.total_resource_len(), 12_288);
+        assert_eq!(profile_file_id(0), PROFILE_FS_BASE);
         assert_eq!(
-            config.reads_per_pull(),
-            RESOURCE_BUFFER_LEN / crate::onboard_profile::READ_LEN,
-            "the default geometry reads 512-byte windows out of the 1024-byte buffer"
+            DEFAULT_CHUNKS * RESOURCE_BUFFER_LEN,
+            12_288,
+            "the fixed read covers the payload of the reference capture"
         );
+        assert_eq!(
+            READS_PER_PULL,
+            RESOURCE_BUFFER_LEN / READ_LEN,
+            "the fixed read drains the buffer in 512-byte windows"
+        );
+        assert!(validate_profile(MAX_PROFILE_INDEX).is_ok());
+        assert!(validate_profile(MAX_PROFILE_INDEX + 1).is_err());
     }
 }
