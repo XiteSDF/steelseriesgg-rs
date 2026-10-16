@@ -19,9 +19,7 @@ use std::ops::{Deref, DerefMut};
 
 use async_trait::async_trait;
 
-#[cfg(feature = "onboard")]
 use super::apex_legacy_onboard;
-#[cfg(feature = "onboard")]
 use super::apex_legacy_profile::ProfileImage;
 use super::{GenericKeyboard, Keyboard};
 use crate::devices::key_mapping::{KeyId, KeyMapping};
@@ -44,11 +42,11 @@ pub fn onboard_family(product_id: u16) -> bool {
     )
 }
 
-/// Apex 7 keyboard device: standard lighting control through [`GenericKeyboard`], plus - with the
-/// `onboard` feature - the `[EXPERIMENTAL]` on-board profile read on its own handle.
+/// Apex 7 keyboard device: standard lighting control through [`GenericKeyboard`], plus the
+/// `[EXPERIMENTAL]` on-board profile read on its own handle.
 ///
-/// Discovery builds this device for every [`onboard_family`] product ID whether or not the crate was
-/// built with `onboard`: the device class is part of the device tree, only the read is feature-gated.
+/// Discovery builds this device for every [`onboard_family`] product ID: the device class is part of the
+/// device tree, and the read path is part of the core build.
 pub struct Apex7 {
     inner: GenericKeyboard,
 }
@@ -63,7 +61,6 @@ impl Apex7 {
     }
 
     /// Whether this device's product ID is on the platform the read was reverse-engineered from.
-    #[cfg(feature = "onboard")]
     #[must_use]
     pub fn supports_onboard(&self) -> bool {
         onboard_family(self.inner.info().product_id)
@@ -75,7 +72,6 @@ impl Apex7 {
     ///
     /// Returns an error when the slot is out of range, the collection rejects a frame, or it never
     /// answers a payload read.
-    #[cfg(feature = "onboard")]
     pub async fn read_profile(&self, profile: u8) -> Result<ProfileImage> {
         apex_legacy_onboard::read_profile(&self.inner, profile, false).await
     }
@@ -129,12 +125,10 @@ impl Device for Apex7 {
 
 // Delegate Keyboard trait; the on-board profile methods are this device's own.
 crate::impl_keyboard_with_delegation!(Apex7, {
-    #[cfg(feature = "onboard")]
     fn supports_onboard_profile(&self) -> bool {
         self.supports_onboard()
     }
 
-    #[cfg(feature = "onboard")]
     async fn read_onboard_profile(&self, profile: u8) -> Result<ProfileImage> {
         self.read_profile(profile).await
     }
@@ -155,7 +149,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "onboard")]
     mod onboard {
         use super::super::*;
         use crate::devices::{DeviceInfo, DeviceType};

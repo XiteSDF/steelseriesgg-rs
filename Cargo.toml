@@ -32,9 +32,6 @@ required-features = ["sonar"]
 default = []
 audio = ["dep:libpulse-binding"]
 sonar = ["dep:reqwest"]
-# On-board profile read-back: the hardware I/O loop and its CLI subcommand. The wire format,
-# decode and JSON in `src/onboard_profile.rs` stay ungated so their tests run in every build.
-onboard = []
 
 [dependencies]
 anyhow = "1.0.104"

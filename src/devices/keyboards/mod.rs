@@ -2,9 +2,7 @@
 
 pub mod apex;
 pub mod apex7;
-#[cfg(feature = "onboard")]
 pub mod apex_legacy_onboard;
-#[cfg(feature = "onboard")]
 pub mod apex_legacy_profile;
 pub mod apex_pro_tkl_2023;
 pub mod apex_pro_tkl_2023_profile;
@@ -214,7 +212,7 @@ pub trait Keyboard: Device {
         ))
     }
 
-    // === On-board profiles (feature `onboard`, `[EXPERIMENTAL]`) ===
+    // === On-board profiles (`[EXPERIMENTAL]`) ===
 
     /// Whether this keyboard answers the legacy on-board profile protocol.
     fn supports_onboard_profile(&self) -> bool {
@@ -225,7 +223,6 @@ pub trait Keyboard: Device {
     ///
     /// `[EXPERIMENTAL]`: the protocol is reverse-engineered from a capture of official GG and
     /// has never completed a read on hardware from this code.
-    #[cfg(feature = "onboard")]
     async fn read_onboard_profile(
         &self,
         _profile: u8,
@@ -479,7 +476,6 @@ impl GenericKeyboard {
 
     /// Send one output report on this keyboard's collection: `data[0]` is the report number
     /// (`SET_REPORT wValue 0x0200`).
-    #[cfg(feature = "onboard")]
     pub(crate) fn write_profile_packet(&self, data: &[u8]) -> Result<()> {
         let device = self.connected_device()?.lock();
         let written = device
@@ -496,7 +492,6 @@ impl GenericKeyboard {
 
     /// Read one feature report from this keyboard's collection (`GET_REPORT wValue 0x0300`):
     /// `report_id` seeds byte 0, `len` is the size the collection declares and goes out as `wLength`.
-    #[cfg(feature = "onboard")]
     pub(crate) fn read_profile_feature_packet(&self, report_id: u8, len: usize) -> Result<Vec<u8>> {
         if len < 2 {
             return Err(Error::DeviceCommunication(format!(
@@ -514,7 +509,6 @@ impl GenericKeyboard {
 
     /// Read one interrupt-endpoint input report from this keyboard's collection, waiting up to
     /// `timeout_ms`.
-    #[cfg(feature = "onboard")]
     pub(crate) fn read_profile_input_packet(&self, len: usize, timeout_ms: u64) -> Result<Vec<u8>> {
         let mut report = vec![0u8; len.max(1)];
         let poll_ms = i32::try_from(timeout_ms).unwrap_or(i32::MAX);

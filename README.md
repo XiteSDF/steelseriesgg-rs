@@ -327,7 +327,7 @@ Run HID report fuzzing (development tool):
 ssgg fuzz
 ```
 
-### On-board profile read (feature `onboard`, `[EXPERIMENTAL]`)
+### On-board profile read (`ssgg onboard`, `[EXPERIMENTAL]`)
 
 Reads the profile a legacy Apex keyboard keeps in its own flash (Apex 7, Apex Raw, Apex 2014).
 The protocol is reverse-engineered from a GG capture; the pacing frame, the pull and the
@@ -337,7 +337,7 @@ The code reads only: it never writes the on-board profile. Format and open quest
 [docs/development/apex-7-onboard-profile-read.md](docs/development/apex-7-onboard-profile-read.md).
 
 ```bash
-cargo build --release --features onboard
+cargo build --release
 
 # no hardware touched: decode a profile image saved by an earlier read
 ssgg onboard decode /tmp/p0.bin --json /tmp/p0.json
@@ -379,8 +379,10 @@ debug = false
 
 - `audio` - Enable audio mixer with PulseAudio/PipeWire support
 - `sonar` - Enable SteelSeries Sonar API integration
-- `onboard` - Enable the `[EXPERIMENTAL]` read of the on-board profile of a legacy Apex keyboard (Apex 7
- , Apex Raw, Apex 2014); adds `ssgg onboard`. Read-only, never writes the profile
+
+The `[EXPERIMENTAL]` on-board profile read of the legacy Apex family (Apex 7, Apex Raw, Apex 2014) is part of
+the core build - it adds `ssgg onboard` and never writes the profile. Experimental protocol paths are not
+feature-gated; they carry `[EXPERIMENTAL]` labels.
 
 By default, no optional features are enabled. The Arch package ships with default features only.
 

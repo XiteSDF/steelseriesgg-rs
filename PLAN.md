@@ -35,9 +35,9 @@ Protocol facts for the Apex Pro TKL 2023 are in `AGENTS.md` ("Protocol research 
 Code is in place (2026-10-17, `onboard-configs-dev`): `Apex7` in `src/devices/keyboards/apex7.rs` wraps
 `GenericKeyboard` (its `HidReportBuilder` and the open `HidDevice`) and does the read's packet I/O
 itself on that handle; `Keyboard::read_onboard_profile` is the device API,
-`discovery::open_keyboard` returns `Apex7` for `0x1612`, `0x1614`, `0x1616`, `0x1618` - **with or without
-the `onboard` feature** (2026-10-17: the device class is part of the device tree, only the read path is
-feature-gated). `ssgg onboard read` runs on that device. Nothing has been replayed on hardware.
+`discovery::open_keyboard` returns `Apex7` for `0x1612`, `0x1614`, `0x1616`, `0x1618` - the whole read path is
+core code (2026-10-17: the `onboard` feature flag was removed, the device class and the read path are both in
+the default build). `ssgg onboard read` runs on that device. Nothing has been replayed on hardware.
 
 0. **[HW] The per-pull pacing read stays** (2026-10-17, Apex 7 `0xFFC1`): the pull's answer is the keyboard's
    idle input report, and draining it per chunk is what lets the following feature read-back complete - a run
@@ -206,7 +206,8 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   SignalRGB research (it drives devices directly via its own plugins; no SteelSeries bytes in public docs).
 - Apex Pro TKL 2023 wired: GG capture, 84-key lighting table, 645-byte frame, interface-1 path, profile slot map
   (`WIRED_2023_PROFILE_SLOTS`), GG-engine warning. Committed in `f430380`.
-- Apex 7 on-board profile read: `onboard` feature, `src/devices/keyboards/apex_legacy_profile.rs`,
+- Apex 7 on-board profile read: core code (the `onboard` feature flag was removed on 2026-10-17),
+  `src/devices/keyboards/apex_legacy_profile.rs`,
   `src/devices/keyboards/apex_legacy_onboard.rs`, `ssgg onboard` (2026-10-15). Read-only, `[EXPERIMENTAL]`.
   Hardware validation on 2026-10-15 got a pacing frame, a pull and the payload-read request accepted on
   the `0xFFC1` collection, then stalled: the code asked the kernel for a 643-byte feature report, the
