@@ -215,8 +215,9 @@ A pull has **no reply with content**. Three independent lines of evidence:
 So the packet GG reads after a pull is a **pacing token**: one HID read of the device's input stream
 (65 bytes = the report-ID slot plus the 64-byte report), issued so the kernel serialises the transfer, and
 its content is thrown away by design. All profile bytes arrive through the `0x83` window replies (the
-`GET_REPORT 0x0300` read-back), never through a pull's answer - which is what the read loop here does too
-(`apex_legacy_onboard::read_pull_ack` consumes one packet and looks at none of it).
+`GET_REPORT 0x0300` read-back), never through a pull's answer. **`ssgg onboard read` sends no such read**
+(2026-10-17): there is nothing to take from the packet, so the per-pull input poll (`read_pull_ack`) was
+removed and the read goes straight from the pull to its two payload reads.
 
 The capture kit's `reports.csv` lists 121 "control responses" of 64 bytes starting `85 00 <fs_id> <offset>
 <size>`: `capture.ps1` labels host-to-device control-endpoint data "control response", so those rows are the
@@ -362,7 +363,8 @@ backend sent was fixed in 2.6.6 and 2.6.7 is pinned, so one code path serves Lin
 `#[cfg(unix)]`/`#[cfg(not(unix))]` pairs are deleted. `devices::send_feature_report_raw`,
 `read_feature_report_raw`, `write_output_report_raw` and `read_input_report_raw` - one path opened per call - were then
 **removed the same day**: the Apex 7 profile read runs on the `Apex7` device handle, because a reader
-that opens the node per report cannot collect the opening-chain answers or the pull acknowledges, and Apex 7 wired works
+that opens the node per report cannot collect the interrupt answers (`90` poll; the pull pacing read was
+removed 2026-10-17 and the read no longer polls the endpoint per chunk), and Apex 7 wired works
 through hidapi. `Keyboard::send_feature` (the Apex 2023 lighting path) is back on the device handle: the interface-1 reading
 behind its 2026-10-15 path special case was never measured, and **needs a hardware test on `0x1628`**. Two consequences worth knowing: `HIDIOCSOUTPUT` puts output frames on the control port as
 `SET_REPORT wValue 0x0200` - the shape the reference capture shows - where the raw `write(2)` this replaces went to an
