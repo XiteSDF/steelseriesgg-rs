@@ -95,7 +95,7 @@ run sent none, so it collected nothing but 64-byte interrupt status. That is ste
 |-------|-------|
 | Wire types: `0x85` pull, `0x83` read, `0x03` init chain, the pacing frame `0x01 0x00 00 02 00 f4 01 60 00`, the 643-byte read buffer | `src/devices/hid_reports.rs` (`OnboardPullCommand`, `OnboardReadCommand`, `OnboardInitCommand`, `ONBOARD_INIT_CHAIN`) — not feature-gated, no raw byte arrays outside it |
 | Read plan, reply parsing, assembly, decode | `src/onboard_profile.rs` (`ReadConfig`, `plan_json`, `parse_read_reply`, `ProfileImage`, `decode`), feature `onboard` |
-| Transports | `src/devices/keyboards/apex_legacy_onboard.rs`: `OnboardTransport` (trait: `write_output`, `send_feature`, `read_feature`, `read_input`) with the single implementation `HandleTransport` - the handle the device manager keeps open for the whole read. The per-call path-open helpers (`send_feature_report_raw`, `read_feature_report_raw`, `write_output_report_raw`, `read_input_report_raw`) and `PathTransport` were removed on 2026-10-17; Apex 7 wired works through hidapi |
+| Packet I/O | `src/devices/keyboards/apex_legacy_onboard.rs`: `ProfileHandle` (`Arc<Mutex<HidDevice>>`) with module-internal transfers on it (`write_output`, `send_feature`, `read_feature`, `read_input`, `device_label`) - `Apex7` passes its own handle, no transport type. The trait `OnboardTransport`, its `HandleTransport` and `PathTransport` implementations, and the per-call path-open helpers (`send_feature_report_raw`, `read_feature_report_raw`, `write_output_report_raw`, `read_input_report_raw`) were removed on 2026-10-17; Apex 7 wired works through hidapi |
 | Keyboard device | `src/devices/keyboards/apex7.rs`: `Apex7` wraps `GenericKeyboard` (its `HidReportBuilder` and the open `HidDevice`) and runs the read on its own handle; `onboard_family(pid)` selects `0x1612`, `0x1614`, `0x1616`, `0x1618` and `discovery::open_keyboard` wraps those PIDs in it **with or without the `onboard` feature** — only the read (`read_profile`, the transport, the read plan) is gated, so a family board keeps standard lighting in a default build |
 | Device API | `Keyboard::supports_onboard_profile`, `Keyboard::read_onboard_profile` (feature `onboard`, `[EXPERIMENTAL]`); every other keyboard answers "not supported" |
 | CLI | `ssgg onboard plan / read / decode` (`src/cli.rs`, `src/main.rs`); `read` runs on the `Apex7` device (its own handle, `--device vid:pid` selects the keyboard), and fails with a clear message when the target is not on the family |
@@ -107,5 +107,5 @@ Two facts from the first Linux run (2026-10-15, Apex 7 `/dev/hidraw3`) that shap
   (`is_collection = true`), and the interface-1 node had no `input*` at all that day.
 - `usbhid` polls a collection's interrupt endpoint only while a descriptor on that node is open. A
   per-report open (`/dev/hidrawN` opened for one report) has nowhere to deliver the opening-chain and
-  pull answers, so `read_interrupt_report` saw none. `HandleTransport` avoids that: the read runs on the
-  handle the device manager opened, and it stays open for the whole read.
+  pull answers, so `read_interrupt_report` saw none. The read avoids that: `Apex7` does its own packet
+  I/O on the handle the device manager opened, and that handle stays open for the whole read.

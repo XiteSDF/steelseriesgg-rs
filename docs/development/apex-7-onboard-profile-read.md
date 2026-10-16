@@ -5,10 +5,10 @@ Apex 7, PID `0x1612`, 2026-10-15, firmware `4.16.8`). Every item below is `[EXPE
 it has been replayed from `ssgg` on real hardware. Code: `src/devices/hid_reports.rs` (the command codes
 and every report buffer: `OnboardInitCommand` and `ONBOARD_INIT_CHAIN`, `OnboardPullCommand`,
 `OnboardReadCommand`), `src/onboard_profile.rs` (read sequence plan, reply parsing, decode),
-`src/devices/keyboards/apex_legacy_onboard.rs` (transfers, plus the `OnboardTransport` the device path
-uses), `src/devices/keyboards/apex7.rs` (`Apex7`: the keyboard device of the legacy Apex family, which
-wraps `GenericKeyboard` — its `HidReportBuilder` and open `HidDevice` — and runs the read on that
-handle), `ssgg onboard` (`src/cli.rs`, `src/main.rs`). Discovery builds `Apex7` for the family
+`src/devices/keyboards/apex_legacy_onboard.rs` (read plan, reply parsing, the transfers on
+`ProfileHandle`), `src/devices/keyboards/apex7.rs` (`Apex7`: the keyboard device of the legacy Apex
+family, which wraps `GenericKeyboard` — its `HidReportBuilder` and open `HidDevice` — and does the
+read's packet I/O itself, on that handle), `ssgg onboard` (`src/cli.rs`, `src/main.rs`). Discovery builds `Apex7` for the family
 with or without the `onboard` feature (the device class is part of the device tree); only the read path
 (transport, read plan, `Keyboard::read_onboard_profile`) is behind that feature, the report builders are not.
 
@@ -312,7 +312,7 @@ as the kernel's own `HIDIOCSFEATURE`/`HIDIOCGFEATURE` (`hidapi-2.6.7/src/linux_n
 backend sent was fixed in 2.6.6 and 2.6.7 is pinned, so one code path serves Linux, Windows and macOS - the
 `#[cfg(unix)]`/`#[cfg(not(unix))]` pairs are deleted. `devices::send_feature_report_raw`,
 `read_feature_report_raw`, `write_output_report_raw` and `read_input_report_raw` - one path opened per call - were then
-**removed the same day**: the Apex 7 profile read runs on the `Apex7` device handle (`HandleTransport`), because a reader
+**removed the same day**: the Apex 7 profile read runs on the `Apex7` device handle, because a reader
 that opens the node per report cannot collect the opening-chain answers or the pull acknowledges, and Apex 7 wired works
 through hidapi. `Keyboard::send_feature` (the Apex 2023 lighting path) is back on the device handle: the interface-1 reading
 behind its 2026-10-15 path special case was never measured, and **needs a hardware test on `0x1628`**. Two consequences worth knowing: `HIDIOCSOUTPUT` puts output frames on the control port as
