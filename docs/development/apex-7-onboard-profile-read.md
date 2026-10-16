@@ -5,10 +5,10 @@ Apex 7, PID `0x1612`, 2026-10-15, firmware `4.16.8`). Every item below is `[EXPE
 it has been replayed from `ssgg` on real hardware. Code: `src/devices/hid_reports.rs` (the command codes
 and every report buffer: `OnboardInitCommand` and `ONBOARD_INIT_CHAIN`, `OnboardPullCommand`,
 `OnboardReadCommand`), `src/onboard_profile.rs` (read sequence plan, reply parsing, decode),
-`src/devices/keyboards/apex_legacy_onboard.rs` (read plan, reply parsing, the transfers on
-`ProfileHandle`), `src/devices/keyboards/apex7.rs` (`Apex7`: the keyboard device of the legacy Apex
-family, which wraps `GenericKeyboard` — its `HidReportBuilder` and open `HidDevice` — and does the
-read's packet I/O itself, on that handle), `ssgg onboard` (`src/cli.rs`, `src/main.rs`). Discovery builds `Apex7` for the family
+`src/devices/keyboards/apex_legacy_onboard.rs` (read plan, reply assembly, polling),
+`src/devices/keyboards/apex7.rs` (`Apex7`: the keyboard device of the legacy Apex family, which wraps
+`GenericKeyboard`) - the packet I/O is `GenericKeyboard`'s own profile transfers on the handle it owns
+(`write_profile_packet`, `read_profile_feature_packet`, `read_profile_input_packet`, …), `ssgg onboard` (`src/cli.rs`, `src/main.rs`). Discovery builds `Apex7` for the family
 with or without the `onboard` feature (the device class is part of the device tree); only the read path
 (transport, read plan, `Keyboard::read_onboard_profile`) is behind that feature, the report builders are not.
 
