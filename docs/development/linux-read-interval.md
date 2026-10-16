@@ -55,3 +55,27 @@ Per transfer type (count / median gap / p90 gap / max gap, ms):
 
 Read the mechanism in `apex-7-onboard-profile-read.md`, section "Input reports: the node must be open when
 the report arrives".
+
+## 5. Read sizes: why 642, and where the off-by-one was
+
+Measured 2026-10-18 from the transport, not from a capture. The two directions of the profile transfer are
+asymmetric, and the asymmetry is the kernel's:
+
+- **Write** (`SET_REPORT`): the buffer carries a leading report-number byte, the kernel strips it and the
+  wire number is the rest. `ONBOARD_FEATURE_REPORT_SIZE` (643) goes out as `wLength 642`, matching GG's
+  642-byte read requests.
+- **Read** (`GET_REPORT`): the requested length goes to the device verbatim (hidapi passes the slice length
+  straight to `HIDIOCGFEATURE`, `src/linux_native/ioctl.rs:26`), and the kernel writes the device's report-ID
+  byte into byte 0 of the same buffer. The ask is `READ_REPORT_LEN` = 642, which decodes as
+  `wValue 0x0300 wLength 642` - GG's number.
+
+The 2026-10-15 run put `GET wLength 641` on the wire (24 submits in `linux-read.pcapng`): the raw-ioctl code
+that has since been deleted subtracted the report-ID byte from the length it handed the kernel, and its
+"643 produces `ETIMEDOUT`" observation is the same subtraction seen from the other side. Under hidapi, asking
+643 would put 643 on the wire, which is the length the keyboard has never answered.
+
+A reply therefore arrives as `[report ID][641 bytes]`, and a header-echoing reply spends 5 of those 641 on its
+header. The most a read frame may ask for is **636** payload bytes: `MAX_READ_LEN` and `ONBOARD_MAX_READ_LEN`
+are both `642 - 1 - 5`, and the code asserts they are equal. The constant that bounded read frames said 641
+until 2026-10-18: it subtracted the report-ID byte but not the header, allowing a read to ask for a size no
+reply can carry.

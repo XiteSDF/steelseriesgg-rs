@@ -310,6 +310,17 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   `send_init_chain` now sleeps `GG_GAP_MS` after each frame and reads one input report (`GG_INPUT_READ_BYTES` = 65,
   GG's `read-chunk HIDIO 65`, which `PULL_ACK_LEN` now shares); why an unread answer silences the frames after it is
   inference, not measured.
+- 2026-10-18 (off-by-one): the reply-side lengths now derive from one measured number. GG's read-back is
+  `GET wLength 642`, and the two directions behave differently: the write strips the buffer's report-number byte
+  (`ONBOARD_FEATURE_REPORT_SIZE` 643 goes out as 642) while the read sends the requested length verbatim
+  (hidapi hands the slice length straight to `HIDIOCGFEATURE`, `src/linux_native/ioctl.rs:26`), so
+  `READ_REPORT_LEN` = 642 is both the ask and the wire number and a reply arrives as `[report ID][641 bytes]`.
+  The size cap follows from that: `ONBOARD_MAX_READ_LEN` and `MAX_READ_LEN` are both 642 − 1 − 5 = 636 (the
+  report-ID byte and the 5-byte header come off the reply), asserted equal in code; they said 641 and 637, which
+  subtracted the report-ID byte but not the header. The 2026-10-15 capture shows the deleted raw-ioctl code
+  putting `wLength 641` on the wire, one byte short of GG - that is why "643 produces `ETIMEDOUT`" and "no reply
+  payload arrived" both read as facts. Recorded in `apex-7-onboard-profile-read.md` (§3 transfer map, §3.1
+  comparison, §5 collection map) and `linux-read-interval.md` §5.
 - Old TODO items: clippy-ci / future-incompat errors (resolved, see Baseline); `ssgg_bug_report.json` triage
   (dropped: the file was never provided); issue #6 Arch compile (closed `not_planned`).
 - `docs/development/` consolidation (2026-10-15): capture-note "Transport" section matches the 645-byte /

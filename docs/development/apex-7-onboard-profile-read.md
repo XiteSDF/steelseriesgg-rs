@@ -275,10 +275,12 @@ keyboard in a state GG itself cannot repair. `read` requires `--yes`; `decode` n
   zeros; no capture in this repo shows a payload-read reply that changes with the requested offset.
 - The Linux framing of the read-back. GG asks report number 0 on interface 1 in both directions; the run
   of 2026-10-15 asked the command byte as the report number on interfaces 0-4 (`wValue 0x0290`, `0x0285`,
-  `0x0383`) and issued **no read-back at all**. The report number is fixed in code since 2026-10-17 (every
-  buffer now starts with report number 0, `READ_REPLY_ID = 0x00`); what remains unmeasured is asking the
-  read-back of the collection that declares it - interface 1, `0xFFC0` - and whether a 642-byte control-IN
-  transfer with a data stage appears there (the `--debug` log distinguishes "the request failed" from "the
+  `0x0383`) and its interface-1 read-back went out at `wLength 641`, one byte short of GG's 642 (the
+  raw-ioctl code subtracted the report-ID byte; hidapi does not). The report number is fixed in code since
+  2026-10-17 (every buffer now starts with report number 0, `READ_REPLY_ID = 0x00`) and the length since
+  2026-10-18 (`READ_REPORT_LEN = 642`, asserted against `ONBOARD_MAX_READ_LEN`); what remains unmeasured is
+  asking the read-back of the collection that declares it - interface 1, `0xFFC0` - with `wLength 642` and
+  seeing a control-IN data stage come back (the `--debug` log distinguishes "the request failed" from "the
   transfer answered with the wrong length").
 
 ## Windows GG vs Linux `ssgg onboard read`, same keyboard (measured 2026-10-15)
@@ -294,7 +296,7 @@ device 24 = the `0x1612` control interface, 612 control submits and 612 complete
 | Report ID / lengths | report ID 0 everywhere: `wValue 0x0200` wLength 64 for output frames, `wValue 0x0300` wLength 642 for the 642-byte frames | report ID = command byte: `wValue 0x0290`/`0x02f4`/`0x026c` wLength 101, `0x0285` wLength 102, `0x0383` wLength 1603 (the report-ID byte is counted twice, so every frame declares one byte more than GG's and carries 100/101/1602 payload bytes) |
 | Pull `85` | 121 transfers, header `85 00 01 02` with a u32 at bytes 4-7 stepping 0, 4, 8, ... 44 | 85 transfers (17 x 5 interfaces), 7 distinct payloads, that word stays 0 |
 | Read `83` | 241 requests in three shapes: `83 00 00 00 02 00`, `83 00 00 02 00 02 00`, `83 00 00 00 00 02 00` (121/120: file 1 window 2 and file 2 window 2, read over and over) | 17 requests, **all byte-identical** `83 00 00 00 02 00 00 00 00 00 00 00` — the file and window words never change |
-| **Read-back** | **241 GET_REPORT control-IN transfers `a1 01 wValue 0x0300 wIndex 1 wLength 642`**, one per read request, each answered by a 643-byte control-IN data stage (report-ID byte `03` + 642 payload bytes; 1..513 non-zero bytes per reply, 89% of its u32 words are zero). The name-bearing reply is `03 0b 00 43 6f 6e 66 69 67 20 31` = schema word `0x000B` + `Config 1` | **no GET_REPORT transfer at all**; every one of the 612 control completes carries a 0-byte data stage. `ssgg` polls the interrupt endpoint `0x82` (102 polls) and receives only 64-byte status reports: `34 2e 31 36 2e 38` ("4.16.8") x 68, `00 01` x 17, `85 01` x 17 |
+| **Read-back** | **241 GET_REPORT control-IN transfers `a1 01 wValue 0x0300 wIndex 1 wLength 642`**, one per read request, each answered by a 643-byte control-IN data stage (report-ID byte `03` + 642 payload bytes; 1..513 non-zero bytes per reply, 89% of its u32 words are zero). The name-bearing reply is `03 0b 00 43 6f 6e 66 69 67 20 31` = schema word `0x000B` + `Config 1` | GET transfers **did** appear: 24 setup blocks `a1 01 wValue 0x0300 wLength 641` - one byte short of GG's 642, because the raw-ioctl code subtracted the report-ID byte from the length it passed to the kernel. No complete carries a data stage, so no payload arrived; the 64-byte interrupt reports `ssgg` collected were `34 2e 31 36 2e 38` ("4.16.8") x 68, `00 01` x 17, `85 01` x 17 |
 | Chain answers | `90 00`/`90 01` -> "4.16.8", `f4 00` -> `00 01 00 …`, `6c 00 01` -> nothing | identical, byte for byte |
 | Other traffic in the window | 144 `03` 642-byte profile writes, 72 `05` lighting frames | none (read-only run) |
 
@@ -304,9 +306,14 @@ the `83` request, on the same interface. `ssgg onboard read` never issues it, so
 to reassemble: the request is accepted, the answers it collects are the 64-byte interrupt status reports,
 and no control transfer in its own capture carries data.
 
-The kernel strips the report-ID byte from a feature-report reply, so the payload starts at buffer offset 0,
-which is framing 0 and matches the shape above; the length to ask for is **642** (643 is the request that
-never completes, see the collection map below).
+The kernel strips the report-ID byte from a feature-report **write** (the report number in the buffer's byte 0 is
+removed and `wLength` is the remaining byte count), which is why a 643-byte write buffer goes out as
+`wLength 642`. On the **read** side the kernel forwards the requested length verbatim: hidapi hands the slice
+length straight to `HIDIOCGFEATURE` (hidapi 2.6.7 `src/linux_native/ioctl.rs:26`). So the ask equals the wire
+number, the device's report-ID byte arrives in buffer[0], and a 642-byte ask delivers `[report ID][641 bytes]`.
+The length to ask for is **642**: 642 answers, 643 makes the control transfer never complete (measured
+2026-10-15, `Connection timed out`), and the 2026-10-15 `ssgg` run asked 641 - its raw-ioctl code subtracted
+the report-ID byte itself, one byte short of GG's number. See the collection map below.
 
 What is a blocker: GG works on **interface 1 only** (the `0xFFC0` control collection), and that is exactly
 where our writes failed - the collection map records `EPIPE` on interface 1's chain write, while GG's
@@ -321,11 +328,15 @@ the frame that reproduces GG's transfer. Fixed in code 2026-10-17: the report bu
 frames and answer the chain there, GG never touches them) - the answers are identical, so the spray is only
 wasted traffic.
 
-Our run's read-back never reached the wire: the only control-IN transfers in its capture are 18
-`GET_DESCRIPTOR`s, and no 642-byte request of any kind appears (its feature-report requests are 1603-byte
-`SET_REPORT` writes with `wValue 0x0383`). Record the answer of the read-back with `--debug` before
-changing the size: on 2026-10-15 a 643-byte request produced a 5-second `ETIMEDOUT`, which means a
-transfer was submitted then, and the 2026-10-15 run at 22:03 (642) produced no transfer at all.
+Our run's read-back did reach the wire, one byte short: this file's setup blocks include
+`GET_REPORT wValue 0x0300 wLength 641` (24 of them, on interface 1) beside the 24
+`SET_REPORT wValue 0x0300 wLength 642` writes and the 18 `GET_DESCRIPTOR`s; the raw-ioctl code subtracted the
+report-ID byte from the length it handed the kernel, and every control complete carries a 0-byte data stage,
+so no reply payload arrived. hidapi sends the buffer length to `HIDIOCGFEATURE` verbatim
+(`src/linux_native/ioctl.rs:26`), so today's ask is `READ_REPORT_LEN = 642` and that decodes as
+`wLength 642`, GG's number. The size history, recorded before `--debug` existed: on 2026-10-15 a
+643-byte request produced a 5-second `ETIMEDOUT`, which means a transfer was submitted then. The 22:03 run
+asked 641 and its completes carry no data stage: the request went out, the keyboard answered nothing.
 
 ## Linux collection map (measured 2026-10-15)
 
@@ -338,9 +349,9 @@ its own hidraw node, and the profile-capable collection is the vendor page `0xFF
 | `hidraw2` | 1 | `0xFFC0` | not captured | — | — | `EPIPE` on the chain write |
 | `hidraw4`, `hidraw5` | 2, 3 | `0x0001`, `0x000C` | — | — | — | `EPIPE` on the chain write |
 
-The reply is read as a feature report on the same node, with a buffer of **642** bytes: the kernel
-passes that number to the device as `wLength`, and the device's report is 642 bytes. Asking for 643
-(the report-ID byte counted twice) makes the control transfer never complete, which is the
+The reply is read as a feature report on the same node, with a buffer of **642** bytes: on the read side the
+kernel forwards that number to the device as `wLength` verbatim, and the device's report is 642 bytes. Asking
+for 643 (the report-ID byte counted twice) makes the control transfer never complete, which is the
 `Connection timed out (os error 110)` recorded on 2026-10-15 after the read request was accepted. The
 64-byte input reports this collection carries are poll and status reports (report IDs `0x0B`, `0x12`);
 the collector skips them and keeps the interrupt endpoint as a fallback reply channel, read on the node

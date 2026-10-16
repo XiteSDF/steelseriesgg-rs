@@ -85,6 +85,14 @@ not the interface 1 (`wIndex 1`) the Windows capture used). The read does not pr
    read-back, and
    the kernel validates the request against that interface's report descriptor. **642**, never 643 (643 is
    the `ETIMEDOUT` of 2026-10-15). The read-back is what the 2026-10-18 profile reads collected.
+   The length rules differ between the two directions and the kernel is why: a feature-report **write**
+   buffer carries a leading report-number byte the kernel strips, so the 643-byte `ONBOARD_FEATURE_REPORT_SIZE`
+   buffer goes out as `wLength 642`; a feature-report **read** sends the requested length verbatim
+   (`HIDIOCGFEATURE` gets the slice length from hidapi, `src/linux_native/ioctl.rs:26`), so `READ_REPORT_LEN`
+   (642) is both the ask and the wire number, and the reply arrives as `[report ID][641 bytes]`. The read's
+   5-byte header lives inside those 641, so the payload a read may ask for tops out at **636**
+   (`MAX_READ_LEN` = `ONBOARD_MAX_READ_LEN`): an earlier constant said 641, which subtracted the report-ID
+   byte but not the header.
 1b. **[HW] hidapi as the transport (code 2026-10-17, verified by the 2026-10-17/18 reads):** the hand-rolled raw-ioctl and
    `write(2)` paths are deleted; every transfer is a hidapi call (`send_feature_report`, `get_feature_report`,
    `write`, `read_timeout`) on the handle the device manager opened for the keyboard. On Linux the `linux-native` backend issues

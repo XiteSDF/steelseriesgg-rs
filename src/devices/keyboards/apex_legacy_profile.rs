@@ -57,7 +57,8 @@
 //!   The `85 00 fs offset size` frames the capture kit lists as 64-byte "pull replies" are the
 //!   `SET_REPORT` requests themselves.
 //! * payload read (`HIDFEATURE`, feature report ID `0x00`, 642 bytes on the wire, `SET_REPORT wValue
-//!   0x0300 wIndex 1`): `83 | 00 | offset u16 LE | size u16 LE | 00…` (6 frame bytes, 643-byte report buffer)
+//!   0x0300 wIndex 1`): `83 | 00 | offset u16 LE | size u16 LE | 00…` (6 frame bytes, a
+//!   `crate::devices::hid_reports::ONBOARD_FEATURE_REPORT_SIZE` write buffer, report number byte included)
 //!   — returns `size` bytes of the resource buffer. GG reads the answer with `GET_REPORT wValue 0x0300
 //!   wIndex 1 wLength 642`, and that answer carries no header: the payload starts at byte 1. The 2-byte
 //!   probe of file `0x0201` answers `03 | 0b 00` and the first 512-byte read of the same file answers
@@ -78,7 +79,7 @@
 //! leading constant id byte that is not part of the file, so a payload read lands at its file offset and
 //! the assembled image is [`PROFILE_FILE_BYTES`] bytes with no id byte.
 
-use crate::devices::hid_reports::{ONBOARD_FEATURE_REPORT_SIZE, ONBOARD_OUTPUT_REPORT_SIZE};
+use crate::devices::hid_reports::{ONBOARD_GET_WIRE_BYTES, ONBOARD_MAX_READ_LEN, ONBOARD_OUTPUT_REPORT_SIZE};
 use crate::devices::keyboards::apex_pro_tkl_2023_profile::profile_checksum;
 use crate::error::{Error, Result};
 use serde::Serialize;
@@ -129,9 +130,12 @@ pub const READ_REPLY_REPORT_ID: u8 = 0x83;
 pub const PULL_REPLY_REPORT_ID: u8 = 0x85;
 /// Report ID of a lighting-config payload-read reply.
 pub const LIGHTING_READ_REPLY_REPORT_ID: u8 = 0x03;
-/// Report buffer length of a payload read, report number byte included (see
-/// [`ONBOARD_FEATURE_REPORT_SIZE`]).
-pub const READ_REPORT_LEN: usize = ONBOARD_FEATURE_REPORT_SIZE;
+/// Buffer size to ask the transport for when reading a payload read back: [`ONBOARD_GET_WIRE_BYTES`] (642).
+/// The read side sends this number to the device as `wLength` verbatim, which is the capture's
+/// `GET_REPORT wValue 0x0300 wIndex 1 wLength 642`; asking 643 makes the transfer never complete
+/// (`Connection timed out`, measured 2026-10-15). The kernel lands the device's report-ID byte in buffer[0],
+/// so the reply arrives as `[report ID][641 bytes]`.
+pub const READ_REPORT_LEN: usize = ONBOARD_GET_WIRE_BYTES;
 /// Data-stage length of the 64-byte output reports of this protocol (`SET_REPORT wValue 0x0200
 /// wIndex 1 wLength 64`): the firmware poll and every pull. The report number the transport prefixes
 /// is not part of it.
@@ -175,10 +179,15 @@ pub fn parse_firmware_version(reply: &[u8]) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// Largest payload a payload-read reply can carry: the reply report (643 bytes, report ID byte included)
-/// minus that byte. Header-echoing replies can carry 636 bytes; the capture's payload-only answers the
-/// full 642, so 636 is the ceiling both shapes agree on. A ceiling derived from the wire, not a tunable.
+/// Largest payload a payload-read reply can carry: the 642 bytes the reply delivers, minus the report-ID
+/// byte the kernel puts in buffer[0] and minus the 5-byte header a header-echoing reply prepends
+/// (`03 01 01 00 01`). Payload-only replies (the capture's shape) start directly behind the report-ID byte,
+/// so 636 is the ceiling both shapes agree on — and it equals [`ONBOARD_MAX_READ_LEN`], the cap the read
+/// frame builder enforces. A ceiling derived from the wire, not a tunable.
 pub const MAX_READ_LEN: usize = READ_REPORT_LEN - 1 - READ_REPLY_HEADER_LEN;
+
+/// The read frame may never ask for more than a reply can carry.
+const _: () = assert!(MAX_READ_LEN == ONBOARD_MAX_READ_LEN);
 
 /// File bytes one read covers: [`PULLS_PER_FILE`] pulls of [`DEVICE_RESOURCE_BUFFER_LEN`] bytes, which
 /// covers both payload lengths ([`PAYLOAD_LEN_A`] and [`PAYLOAD_LEN_B`]). The read always covers exactly
