@@ -38,7 +38,10 @@ itself on that handle; `Keyboard::read_onboard_profile` is the device API,
 `discovery::open_keyboard` returns `Apex7` for `0x1612`, `0x1614`, `0x1616`, `0x1618` - the whole read path is
 core code (2026-10-17: the `onboard` feature flag was removed, the device class and the read path are both in
 the default build). `ssgg onboard read` runs on that device. **Status 2026-10-18:** a full profile slot read
-completes on an Apex 7 under Linux, so this section is the validation backlog: record the model, firmware, slot
+completes on an Apex 7 under Linux, with GG's six-frame opening chain sent (`ONBOARD_INIT_CHAIN`) - a read that
+sends only the `90 00` poll is answered on the wire with scrambled payload bytes. The chain is answered **one
+frame at a time**, so `send_init_chain` reads one input report after every frame (2026-10-18). So this section is the
+validation backlog: record the model, firmware, slot
 bytes and the checksum line from the run log - that is what promotes any of it to confirmed.
 
 0. **[HW] The per-pull pacing read stays** (2026-10-17, Apex 7 `0xFFC1`): the pull's answer is the keyboard's
@@ -295,6 +298,18 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   2 closed), `docs/development/apex-7-onboard-profile-read.md` (intro, transport section) and
   `.claude/rules/experimental-protocol.md`; `ONBOARD.md` steps 3-5 are what is left, starting with the model,
   firmware and decoded bytes of a run.
+- 2026-10-18 (regression fix): GG's opening chain is back. `OnboardInitCommand` + `ONBOARD_INIT_CHAIN`
+  (`90 00`, `90 01`, `f4 00`, `6c 00 01`, `90 00`, `90 01`, `GG_GAP_MS` apart) are rebuilt in `hid_reports.rs`,
+  `apex_legacy_onboard::send_init_chain` sends it in front of the first pull and takes the `firmware:` line from
+  its first `90 00`; `read_firmware_version` is gone (the chain's first poll is that poll), and a test asserts the
+  six frames against the capture and chain frame 1 against `OnboardFirmwareVersionCommand` byte for byte. Hardware
+  evidence: with only the `90 00` poll the read is answered on the wire and the payload replies come back
+  scrambled; with the chain the same read collects a profile slot (Apex 7, 2026-10-18). Which of the six frames the
+  keyboard needs is open - `ONBOARD.md` step 0b. Same day, the same run log showed the chain is answered **one frame
+  at a time**: draining only the first answer left the answers of `90 00` and `90 01` and nothing from frame 3 on, so
+  `send_init_chain` now sleeps `GG_GAP_MS` after each frame and reads one input report (`GG_INPUT_READ_BYTES` = 65,
+  GG's `read-chunk HIDIO 65`, which `PULL_ACK_LEN` now shares); why an unread answer silences the frames after it is
+  inference, not measured.
 - Old TODO items: clippy-ci / future-incompat errors (resolved, see Baseline); `ssgg_bug_report.json` triage
   (dropped: the file was never provided); issue #6 Arch compile (closed `not_planned`).
 - `docs/development/` consolidation (2026-10-15): capture-note "Transport" section matches the 645-byte /

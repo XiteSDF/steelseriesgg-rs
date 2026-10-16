@@ -1,7 +1,8 @@
 //! [EXPERIMENTAL] On-board profile read for the legacy/"macho" Apex platform.
 //!
 //! Frame construction, reply parsing, payload geometry and decoding live in [`crate::devices::keyboards::apex_legacy_profile`].
-//! This module only moves bytes: it sends the firmware poll, the pull frames, the pacing read that follows
+//! This module only moves bytes: it sends GG's opening chain (which starts with the firmware poll), the
+//! pull frames, the pacing read that follows
 //! each pull and the payload reads, collects the replies and assembles a
 //! [`crate::devices::keyboards::apex_legacy_profile::ProfileImage`].
 //!
@@ -10,13 +11,17 @@
 //! `ssgg-capture-1612-20261015-004400/hub-2.pcap` URB by URB:
 //!
 //! - every profile transfer runs on USB interface 1 (`wIndex 1`), the usage-page-`0xffc0` collection;
-//! - the read opens with one `90 00` poll, `SET_REPORT wValue 0x0200 wIndex 1 wLength 64` (report number 0,
-//!   output type, 64 data bytes), answered on the interrupt endpoint with the ASCII firmware version
-//!   (`34 2e 31 36 2e 38 00…` = `4.16.8`); `90 01` is answered identically on hardware (2026-10-17). GG's
-//!   own opening chain is six frames - `90 00`, `90 01`, `f4 00`, `6c 00 01`, then `90 00` and `90 01` again,
-//!   11 ms apart - and the meanings of `f4 00` (answered `00 01 00…`) and `6c 00 01` (never answered) are
-//!   unknown, so the chain is not replayed here. The capture contains no 13-byte transfer at all, so the
-//!   pacing frame this module sent before is not on GG's wire;
+//! - the read opens with GG's six-frame chain, `90 00`, `90 01`, `f4 00`, `6c 00 01`, then `90 00` and
+//!   `90 01` again, 11 ms apart, each frame `SET_REPORT wValue 0x0200 wIndex 1 wLength 64` (report number 0,
+//!   output type, 64 data bytes); `90 00` and `90 01` are answered on the interrupt endpoint with the ASCII
+//!   firmware version (`34 2e 31 36 2e 38 00…` = `4.16.8`) and answer identically (measured 2026-10-17),
+//!   `f4 00` answers `00 01 00…` and `6c 00 01` is never answered, so the meanings of both are unknown.
+//!   **This crate sends the whole chain, one interrupt read after every frame**: on hardware a read that
+//!   sends only the `90 00` poll is answered on the wire and the payload replies come back scrambled, and a
+//!   chain run that drained only the first answer saw `90 00` and `90 01` answered and nothing from frame 3
+//!   on (Apex 7, 2026-10-18). Which frame arms the resource buffer, and why an undrained answer silences the
+//!   frames after it, are not known. The capture contains no 13-byte transfer at all, so the pacing frame this
+//!   module sent before is not on GG's wire;
 //! - the pull frame is `SET_REPORT wValue 0x0200 wLength 64` carrying
 //!   `[85][00][file selector u16 LE][file offset u32 LE][size u16 LE]`, 10 frame bytes. GG pairs every pull
 //!   with one input read (`read-chunk HIDIO 65`) and keeps **no bytes** of its byte specifier `(0 0 0)`:
@@ -61,13 +66,14 @@ use std::time::{Duration, Instant};
 
 use super::GenericKeyboard;
 use super::apex_legacy_profile::{
-    ChunkRecord, DEVICE_RESOURCE_BUFFER_LEN, FIRMWARE_REPLY_LEN, GG_GAP_MS, PAYLOAD_READ_LEN, PROFILE_FILE_BYTES,
+    ChunkRecord, DEVICE_RESOURCE_BUFFER_LEN, GG_GAP_MS, GG_INPUT_READ_BYTES, PAYLOAD_READ_LEN, PROFILE_FILE_BYTES,
     PULLS_PER_FILE, ProfileImage, READ_REPLY_FRAMING_LEN, READS_PER_PULL, ReadReply, hex_of, parse_firmware_version,
     parse_read_reply_at, profile_file_id, reply_mismatch, validate_profile,
 };
 use crate::devices::hid_reports::{
-    HidCommand, HidDeviceType, HidReportBuilder, ONBOARD_FEATURE_REPORT_SIZE, ONBOARD_OUTPUT_REPORT_SIZE,
-    ONBOARD_REPLY_REPORT_SIZE, OnboardFirmwareVersionCommand, OnboardPullCommand, OnboardReadCommand,
+    HidCommand, HidDeviceType, HidReportBuilder, ONBOARD_FEATURE_REPORT_SIZE, ONBOARD_INIT_CHAIN,
+    ONBOARD_INIT_FRAME_COUNT, ONBOARD_OUTPUT_REPORT_SIZE, ONBOARD_REPLY_REPORT_SIZE, OnboardPullCommand,
+    OnboardReadCommand,
 };
 use crate::error::{Error, Result};
 
@@ -88,8 +94,9 @@ const ACK_REPORT_IDS: [u8; 2] = [0x0B, 0x12];
 /// Bytes to read for the pacing packet that follows a pull. The pull has no answer of its own: the device
 /// keeps streaming its ordinary input reports on the interrupt endpoint (report `0x01`, all-zero on an idle
 /// keyboard, 1.7-3.7 ms after the pull in the capture) and GG consumes one packet per chunk as pacing, taking
-/// no bytes from it (its `read-chunk HIDIO 65` - one report-ID slot plus this report).
-const PULL_ACK_LEN: usize = 64;
+/// no bytes from it (GG's `read-chunk HIDIO 65`: report-ID slot plus 64 data bytes, see
+/// [`GG_INPUT_READ_BYTES`], which is what this asks hidapi for).
+const PULL_ACK_LEN: usize = GG_INPUT_READ_BYTES;
 /// Polls per reply collection round, in milliseconds.
 const REPLY_POLL_MS: i32 = 50;
 /// Reply budget for one payload read, in milliseconds: the feature-report poll loop runs until this
@@ -100,8 +107,13 @@ const REPLY_BUDGET_MS: u64 = 2_000;
 const REPLY_INPUT_ATTEMPTS: u32 = 20;
 /// Reads allowed per pull before giving up (the device streams input reports, so one answer is expected).
 const PULL_ACK_ATTEMPTS: u32 = 4;
-/// Polls allowed for the firmware-version answer.
-const FIRMWARE_REPLY_ATTEMPTS: u32 = 3;
+/// Bytes to read for one opening-chain answer: GG's input read size, [`GG_INPUT_READ_BYTES`] (a report-ID
+/// slot plus 64 data bytes), which every chain answer fits (`0x6E` with the ASCII version, `0x12` with
+/// `00 01 …`).
+const CHAIN_REPLY_LEN: usize = GG_INPUT_READ_BYTES;
+/// Reads per chain frame. One: the frame that follows must not consume this frame's answer, and a frame
+/// GG leaves unanswered (`6c 00 01`) must not stall the chain.
+const CHAIN_REPLY_ATTEMPTS: u32 = 1;
 /// Largest input report a profile collection can return (Apex 7 profile collections report 1024).
 const INPUT_REPORT_MAX_LEN: usize = 1024;
 
@@ -112,9 +124,10 @@ const INPUT_REPORT_MAX_LEN: usize = 1024;
 // two reply shapes, all on the handle that device already owns - the collection the device manager
 // opened, open for the whole read.
 //
-// `[EXPERIMENTAL]`: on hardware the pull, the pacing read and the payload read-back all complete on an
-// Apex 7 (2026-10-17/18); the read request is answered by the `GET_REPORT` control-IN reply the capture
-// shows.
+// `[EXPERIMENTAL]`: on hardware the opening chain, the pull, the pacing read and the payload read-back all
+// complete on an Apex 7 (2026-10-17/18); the read request is answered by the `GET_REPORT` control-IN reply
+// the capture shows. The chain is what makes the payload readable: without it the replies come back
+// scrambled.
 
 /// Reads one profile slot on one collection a keyboard device holds open, which is how
 /// [`super::apex7::Apex7`] reads its own on-board profiles.
@@ -135,7 +148,7 @@ pub async fn read_profile(keyboard: &GenericKeyboard, profile: u8) -> Result<Pro
     })
 }
 
-/// Runs one read (the firmware poll, then [`PULLS_PER_FILE`] pulls, each with its pacing read and payload
+/// Runs one read (GG's opening chain, then [`PULLS_PER_FILE`] pulls, each with its pacing read and payload
 /// reads) on one collection.
 fn read_image(keyboard: &GenericKeyboard, profile: u8) -> Result<ProfileImage> {
     let path = collection_label(keyboard);
@@ -153,9 +166,9 @@ fn read_image(keyboard: &GenericKeyboard, profile: u8) -> Result<ProfileImage> {
         PROFILE_FILE_BYTES,
     );
 
-    // One `90 00` poll for the firmware version the image reports; the rest of GG's opening chain is
-    // not part of this read (see `read_firmware_version`).
-    let firmware = read_firmware_version(keyboard);
+    // GG's opening chain runs in front of the first pull, and the firmware version line comes from its
+    // first poll; the read does not produce a clean payload without it (see [`send_init_chain`]).
+    let firmware = send_init_chain(keyboard)?;
 
     let mut chunks: Vec<ChunkRecord> = Vec::with_capacity(PULLS_PER_FILE);
     for chunk in 0..PULLS_PER_FILE {
@@ -216,25 +229,57 @@ fn read_image(keyboard: &GenericKeyboard, profile: u8) -> Result<ProfileImage> {
     ProfileImage::assemble(profile, chunks).map(|image| image.with_firmware(firmware))
 }
 
-/// Reads the firmware version with one poll: `90 00` ([`OnboardFirmwareVersionCommand`]), answered on
-/// the interrupt endpoint with the ASCII version.
+/// Sends GG's opening chain: [`ONBOARD_INIT_CHAIN`], six 64-byte output frames
+/// ([`crate::devices::hid_reports::OnboardInitCommand`]) [`GG_GAP_MS`] apart - `90 00`, `90 01`, `f4 00`,
+/// `6c 00 01`, `90 00`, `90 01` - draining one interrupt report after **every** frame, and returning the
+/// firmware version the first `90 00` answers.
 ///
-/// GG's opening chain (`90 00`, `90 01`, `f4 00`, `6c 00 01`, twice over) is not sent. Both `90` polls
-/// answer on hardware (confirmed on an Apex 7 wired, 2026-10-17), so one is enough; `f4 00` and
-/// `6c 00 01` have unknown meanings and no known use in the read. The version is informational, so a
-/// refused poll is logged and the read continues without it.
-fn read_firmware_version(keyboard: &GenericKeyboard) -> Option<String> {
+/// The chain is not optional. On hardware a read that sends only the `90 00` poll
+/// ([`crate::devices::hid_reports::OnboardFirmwareVersionCommand`]) is answered on the wire and the payload
+/// replies come back as scrambled bytes; with this chain the same read collects a profile slot (Apex 7,
+/// 2026-10-18). Which frame arms the resource buffer is unknown - `f4 00` answers `00 01 00 …` in the
+/// capture and `6c 00 01` answers nothing - so all six frames go, the way GG sends them. A refused frame
+/// fails the read: a keyboard that drops the chain cannot be read cleanly.
+///
+/// **Each frame is answered only after the previous answer has been read.** Measured 2026-10-18: a chain
+/// run that drained just the first answer saw the answers of `90 00` and `90 01` and nothing from frame 3
+/// on, with the frames on the wire. GG's session keeps the interrupt stream read throughout (its read spec
+/// issues a `read-chunk HIDIO 65` per transfer), so a read per frame matches GG's pattern; the flow-control
+/// reading (the device's command queue keeps one answer pending) is inference, not measured.
+fn send_init_chain(keyboard: &GenericKeyboard) -> Result<Option<String>> {
     let path = collection_label(keyboard);
-    if let Err(e) = write_output_command(keyboard, OnboardFirmwareVersionCommand) {
-        tracing::debug!("onboard firmware poll on {path} rejected: {e}");
-        return None;
+    let mut firmware = None;
+    for (index, frame) in ONBOARD_INIT_CHAIN.iter().enumerate() {
+        write_output_command(keyboard, *frame).map_err(|e| {
+            Error::DeviceCommunication(format!(
+                "onboard opening chain frame {} of {ONBOARD_INIT_FRAME_COUNT} ({}) on {path} rejected: {e}",
+                index + 1,
+                frame.description()
+            ))
+        })?;
+        if GG_GAP_MS > 0 {
+            // The answer lands 1-3 ms after the frame, and GG's own cadence is one frame per GG_GAP_MS.
+            std::thread::sleep(Duration::from_millis(GG_GAP_MS));
+        }
+        let answer = read_interrupt_report(keyboard, CHAIN_REPLY_LEN, CHAIN_REPLY_ATTEMPTS);
+        match answer.as_deref() {
+            Some(report) if index == 0 => firmware = parse_firmware_version(report),
+            Some(report) => {
+                tracing::debug!(
+                    "onboard opening chain frame {} on {path} answered {}",
+                    index + 1,
+                    hex_of(&report[..report.len().min(8)])
+                );
+            }
+            None => {
+                tracing::debug!("onboard opening chain frame {} on {path} answered nothing", index + 1);
+            }
+        }
     }
-    let report = read_interrupt_report(keyboard, FIRMWARE_REPLY_LEN, FIRMWARE_REPLY_ATTEMPTS)?;
-    tracing::debug!(
-        "onboard firmware poll answer on {path}: {}",
-        hex_of(&report[..report.len().min(8)])
-    );
-    parse_firmware_version(&report)
+    if firmware.is_none() {
+        tracing::debug!("onboard opening chain on {path} answered no firmware version");
+    }
+    Ok(firmware)
 }
 
 /// Collects one payload reply: the feature-report reply the capture shows, then the interrupt

@@ -4,9 +4,11 @@ Source: capture notes (Windows USBPcap capture of SteelSeries GG talking to an
 Apex 7, PID `0x1612`, 2026-10-15, firmware `4.16.8`). Every item below is `[EXPERIMENTAL]`. Read status
 2026-10-18: `ssgg onboard read` completes a full slot read on an Apex 7 under Linux (operator-reported;
 model, firmware and the decoded bytes are not recorded here), so the **read** is replayed on hardware —
-what is not verified is the decode (slot layout, checksum words, the per-slot compare against GG). Nothing
-in this protocol writes to the device. Code: `src/devices/hid_reports.rs` (the command codes
-and every report buffer: `OnboardFirmwareVersionCommand`, `OnboardPullCommand`,
+what is not verified is the decode (slot layout, checksum words, the per-slot compare against GG). The read
+sends GG's six-frame opening chain (`ONBOARD_INIT_CHAIN`): with only the `90 00` poll the device answers and
+the payload replies come back scrambled (2026-10-18). Nothing in this protocol writes to the device. Code: `src/devices/hid_reports.rs` (the command codes
+and every report buffer: `OnboardFirmwareVersionCommand`, `OnboardInitCommand` / `ONBOARD_INIT_CHAIN`,
+`OnboardPullCommand`,
 `OnboardReadCommand`), `src/devices/keyboards/apex_legacy_profile.rs` (reply framing, payload geometry, reply parsing, decode - the module moved there on 2026-10-17, from `src/onboard_profile.rs`, because everything in it is specific to this legacy platform),
 `src/devices/keyboards/apex_legacy_onboard.rs` (read plan, reply assembly, polling),
 `src/devices/keyboards/apex7.rs` (`Apex7`: the keyboard device of the legacy Apex family, which wraps
@@ -38,7 +40,7 @@ discovered as its own device; the old path-based probe that tried interface 1 fi
 
 | Transfer | Control setup (from the capture) | Frame bytes (data stage) |
 |----------|------------------------------|------------------------|
-| firmware poll (1 frame, once) | `SET_REPORT`, `bmRequestType 0x21`, `wValue 0x0200`, `wIndex 1`, `wLength 64` | `90 00 …` zero-padded to 64, answered on the interrupt endpoint with the ASCII firmware version (`34 2e 31 …` = `4.16.8`). **This is all the read sends.** GG's opening chain occupies the same slot with six frames 11 ms apart (`90 00`, `90 01`, `f4 00`, `6c 00 01`, `90 00`, `90 01`): `90 00` and `90 01` answer identically — measured on an Apex 7 wired on 2026-10-17, which is why one poll is enough — `f4 00` answers `00 01 00…`, `6c 00 01` answers nothing, and the meanings of both are unknown. `OnboardInitCommand`/`ONBOARD_INIT_CHAIN` were removed 2026-10-17; the codes stay as `CommandCode::{FirmwareVersion, EngineStatus, OpenFiles}` |
+| firmware poll (1 frame, once) | `SET_REPORT`, `bmRequestType 0x21`, `wValue 0x0200`, `wIndex 1`, `wLength 64` | `90 00 …` zero-padded to 64, answered on the interrupt endpoint with the ASCII firmware version (`34 2e 31 …` = `4.16.8`). **This poll is the first frame of GG's opening chain, 11 ms apart: `90 00`, `90 01`, `f4 00`, `6c 00 01`, `90 00`, `90 01`, and the read sends all six** (`ONBOARD_INIT_CHAIN`). `90 00` and `90 01` answer identically — measured on an Apex 7 wired on 2026-10-17 — `f4 00` answers `00 01 00…`, `6c 00 01` answers nothing, and the meanings of both are unknown. The chain is not decoration: without it the payload replies come back scrambled (Apex 7, 2026-10-18), which is why `OnboardInitCommand`/`ONBOARD_INIT_CHAIN` were restored on 2026-10-18 after being removed on 2026-10-17. **Every frame is followed by one input read**: a chain run that drained only the first answer collected the `90 00` and `90 01` answers and nothing from frame 3 on (Apex 7, 2026-10-18) |
 | pull | `SET_REPORT`, `wValue 0x0200`, `wIndex 1`, `wLength 64` | `85 00 <file selector u16 LE> <file offset u32 LE> <size u16 LE>`, then zeros to 64 — answered by an ordinary input report (`0x01`, all-zero on an idle keyboard), see "What a pull is answered by" |
 | payload read | `SET_REPORT`, `wValue 0x0300`, `wIndex 1`, `wLength 642` | `83 00 <resource-buffer offset u16 LE> <size u16 LE>`, then zeros to 642 |
 | payload write | `SET_REPORT`, `wValue 0x0300`, `wIndex 1`, `wLength 642` | `03 00 <buffer offset u16 LE> <size u16 LE> <payload…>` — GG's write direction, 144 transfers, not sent by `ssgg` |
@@ -224,8 +226,9 @@ its content is thrown away by design. All profile bytes arrive through the `0x83
 **The read is required on Linux, not just a GG habit.** On 2026-10-17 an Apex 7 `0xFFC1` collection was run with
 that per-pull input read removed: every payload read-back then failed with `io::read_exact: unexpected end of
 file`, and with the read restored the same collection read the profile. The step is
-`apex_legacy_onboard::read_pull_ack` (`PULL_ACK_LEN` = 64; GG's `read-chunk HIDIO 65` is that report plus its
-report-ID slot).
+`apex_legacy_onboard::read_pull_ack` (`PULL_ACK_LEN` = 65 = GG's `read-chunk HIDIO 65`, the report plus its
+report-ID slot; it was 64 until 2026-10-18, which works for the pacing packet and truncates the last byte of a
+65-byte answer).
 
 The capture kit's decoded response listing lists 121 "control responses" of 64 bytes starting `85 00 <fs_id> <offset>
 <size>`: `capture.ps1` labels host-to-device control-endpoint data "control response", so those rows are the
@@ -254,8 +257,16 @@ keyboard in a state GG itself cannot repair. `read` requires `--yes`; `decode` n
   [apex-pro-tkl-2023-gg-capture.md](apex-pro-tkl-2023-gg-capture.md)); nothing in this capture says the
   legacy family does the same.
 - What `f4 00` and `6c 00 01` do. GG sends them in its opening chain, `f4 00` answers `00 01 00 …` and
-  `6c 00 01` is not answered at all; nothing here says which of the six frames a keyboard requires, and the
-  this crate sends neither: since 2026-10-17 the read's only opening transfer is the `90 00` poll.
+  `6c 00 01` is not answered at all. **The chain as a whole is required on hardware**: a read that sends only
+  the `90 00` poll is answered on the wire and its payload replies come back as scrambled bytes, with the
+  chain sent the same read collects a profile slot (Apex 7, 2026-10-18), so `ssgg onboard read` sends all six
+  frames (`ONBOARD_INIT_CHAIN`, `apex_legacy_onboard::send_init_chain`, restored 2026-10-18 after being
+  removed 2026-10-17). **Which of the six frames the keyboard needs is open** - that is the question to answer
+  by dropping them one at a time on a run that reads a known slot. The answers are produced **one frame at a
+  time**: a chain run that drained only the first answer saw `90 00` and `90 01` answered and nothing from
+  frame 3 on, with all six frames on the wire (Apex 7, 2026-10-18), so `send_init_chain` reads one input
+  report after every frame (GG's `read-chunk HIDIO 65`). Why an undrained answer silences the frames after it
+  is not measured - the command-queue flow-control reading is inference.
 - GG's write direction (`03 00 <offset> <size> <payload>`, 144 transfers in the capture): not used
   here, and there is no read-back command known for this family, so `ssgg onboard` writes nothing.
 - The remaining `wValue 0x0200` frames of the capture (`0x6e`, `0x68`, `0x6a`, `0x89`, `0x41`, `0x69`,
