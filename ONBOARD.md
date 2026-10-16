@@ -49,6 +49,18 @@ run sent none, so it collected nothing but 64-byte interrupt status. That is ste
    the `ETIMEDOUT` of 2026-10-15). Confirm with `--debug` that a control-IN transfer with 642 bytes of data
    appears in the capture we take, and that the first bytes behind the report-ID byte are the schema word
    (`0b 00`).
+1b. **[HW] hidapi as the transport (code 2026-10-17, hardware unverified):** the hand-rolled raw-ioctl and
+   `write(2)` paths are deleted; every transfer is a hidapi call on a path opened for that call
+   (`send_feature_report`, `get_feature_report`, `write`, `read_timeout`). On Linux the `linux-native` backend issues
+   the kernel's own `HIDIOCSFEATURE`/`HIDIOCGFEATURE`/`HIDIOCSOUTPUT` (`hidapi-2.6.7/src/linux_native/ioctl.rs:20,26,38`),
+   the direction-bit bug was fixed in 2.6.6 and 2.6.7 is pinned, so the `#[cfg(unix)]` split is gone. Output frames
+   therefore leave as `SET_REPORT wValue 0x0200` control transfers, matching the reference capture, instead of a
+   `write(2)` to an OUT endpoint the profile collection does not have. **Open**: a descriptor held for the whole session
+   was implemented and reverted on 2026-10-17; `usbhid` polls the interrupt endpoint only while a descriptor on the node
+   is open, so the per-report polls in `read_input_report_raw` still miss the chain and pull answers (measured in
+   `docs/development/apex-7-onboard-profile-read.md`, "Input reports: the node must be open when the report arrives").
+   The 2026-10-15 text `Inappropriate ioctls (errno 110)` is not evidence of what the kernel answered - that path
+   formatted `last_os_error()` after unrelated calls on the same thread.
 2. **[HW] Schema words of all five slots:** `ssgg onboard schema --yes` prints the word of slot 0 plus the
    lighting file; sweep `--profile 0..4`. Schema `0x000A` / `0x000B` means the decode applies; anything
    else is a third schema - record it, do not guess.
