@@ -2,6 +2,8 @@
 
 pub mod apex;
 #[cfg(feature = "onboard")]
+pub mod apex7;
+#[cfg(feature = "onboard")]
 pub mod apex_legacy_onboard;
 pub mod apex_pro_tkl_2023;
 pub mod apex_pro_tkl_2023_profile;
@@ -208,6 +210,37 @@ pub trait Keyboard: Device {
     fn set_actuation_point_mm(&mut self, _mm: f32) -> Result<()> {
         Err(Error::DeviceCommunication(
             "Setting actuation point not supported".to_string(),
+        ))
+    }
+
+    // === On-board profiles (feature `onboard`, `[EXPERIMENTAL]`) ===
+
+    /// Whether this keyboard answers the legacy on-board profile protocol.
+    fn supports_onboard_profile(&self) -> bool {
+        false
+    }
+
+    /// Read one on-board profile slot. Keyboards that do not carry the protocol return an error.
+    ///
+    /// `[EXPERIMENTAL]`: the protocol is reverse-engineered from a capture of official GG and
+    /// has never completed a read on hardware from this code.
+    #[cfg(feature = "onboard")]
+    async fn read_onboard_profile(
+        &self,
+        _config: &crate::onboard_profile::ReadConfig,
+    ) -> Result<crate::onboard_profile::ProfileImage> {
+        Err(Error::DeviceCommunication(
+            "on-board profile read is not supported by this keyboard".to_string(),
+        ))
+    }
+
+    /// Probe the schema word of one on-board file, answering with the word and the raw reply.
+    ///
+    /// `[EXPERIMENTAL]`: see [`Keyboard::read_onboard_profile`].
+    #[cfg(feature = "onboard")]
+    async fn read_onboard_schema(&self, _config: &crate::onboard_profile::ReadConfig) -> Result<(u16, Vec<u8>)> {
+        Err(Error::DeviceCommunication(
+            "on-board profile read is not supported by this keyboard".to_string(),
         ))
     }
 }
@@ -449,6 +482,16 @@ impl GenericKeyboard {
 
         self.send_command_async(RgbZoneCommand::new_all_zones(&self.zone_color_buffer))
             .await
+    }
+
+    /// Borrow the open hidapi handle of this keyboard.
+    ///
+    /// For a transfer that has to run on the collection the device manager opened, and on a handle that
+    /// stays open while the device answers - `usbhid` polls a collection's interrupt endpoint only while
+    /// a descriptor on that node is open.
+    #[must_use]
+    pub fn hid_handle(&self) -> Option<&Arc<Mutex<HidDevice>>> {
+        self.device.as_ref()
     }
 
     /// Update the cached actuation point value.
