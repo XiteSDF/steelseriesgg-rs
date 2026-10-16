@@ -31,16 +31,16 @@
 //! on). Report numbers are embedded in the payload, so in `hidapi` terms the first byte of every buffer
 //! is the report ID.
 //!
-//! * opening chain (`HIDINIT`, output report ID `0x00`, 64 data bytes on the wire, `SET_REPORT wValue
-//!   0x0200 wIndex 1 wLength 64`): GG starts the profile read with `90 00`, `90 01`, `f4 00`,
-//!   `6c 00 01` and then `90 00`, `90 01` again, 11 ms apart. The two `0x90` polls are answered on the
-//!   interrupt endpoint with the ASCII firmware version (`34 2e 31 36 2e 38 00…` = `4.16.8`, see
-//!   [`parse_firmware_version]), `f4 00` is answered with `00 01 00…`, and `6c 00 01` is not answered at
-//!   all. The meanings of `0xf4` and `0x6c` are unknown. See
-//!   [`crate::devices::hid_reports::ONBOARD_INIT_CHAIN`]. The capture
-//!   contains no
-//!   13-byte transfer anywhere, so the pacing frame earlier versions of this module sent is not part of
-//!   GG's read.
+//! * firmware poll (output report ID `0x00`, 64 data bytes on the wire, `SET_REPORT wValue 0x0200 wIndex
+//!   1 wLength 64`): this crate sends `90 00` and reads the answer on the interrupt endpoint, where it
+//!   is the ASCII firmware version (`34 2e 31 36 2e 38 00…` = `4.16.8`, see [`parse_firmware_version]).
+//!   An Apex 7 wired answered `90 00` and `90 01` identically on 2026-10-17, so one poll is enough and
+//!   the crate sends one: see
+//!   [`crate::devices::hid_reports::OnboardFirmwareVersionCommand`]. GG's own opening chain is longer -
+//!   `90 00`, `90 01`, `f4 00`, `6c 00 01`, then `90 00` and `90 01` again, 11 ms apart - and the
+//!   meanings of `f4 00` (answered `00 01 00…`) and `6c 00 01` (never answered in the capture) are
+//!   unknown, so the chain is not replayed here. The capture contains no 13-byte transfer anywhere, so
+//!   the pacing frame earlier versions of this module sent is not part of GG's read.
 //! * pull (`HIDIO`, output report ID `0x00`, 64 bytes on the wire, `SET_REPORT wValue 0x0200 wIndex 1`):
 //!   `85 | 00 | file_id u16 LE | offset u32 LE | size u16 LE | 00…` (10 frame bytes, 11-byte report buffer)
 //!   — copies `size` bytes of the profile file into the device's resource buffer at buffer offset 0.
@@ -104,8 +104,9 @@ pub const LIGHTING_FS_SHARED: u16 = 0x0102;
 pub const MACRO_DATA_LEN: usize = 9600;
 
 /// Command byte of the push (profile write); defined for completeness, nothing here sends it. The
-/// read path has no command bytes of its own: they are [`CommandCode`] variants and every frame is
-/// built by a typed command in [`crate::devices::hid_reports`] (see [`OnboardPullCommand`]).
+/// read path has no command bytes of its own: they are
+/// [`crate::devices::hid_reports::CommandCode`] variants and every frame is built by a typed command in
+/// [`crate::devices::hid_reports`] (see [`crate::devices::hid_reports::OnboardPullCommand`]).
 pub const CMD_PUSH_PAYLOAD: u8 = 0x05;
 /// Report ID of every request frame.
 pub const REQUEST_REPORT_ID: u8 = 0x00;
@@ -127,7 +128,7 @@ pub const OUTPUT_REPORT_DATA_LEN: usize = ONBOARD_OUTPUT_REPORT_SIZE - 1;
 /// Report buffer length of an opening-chain frame, report number byte included.
 pub const INIT_REPORT_LEN: usize = ONBOARD_OUTPUT_REPORT_SIZE;
 /// Length of the interrupt-endpoint answer to an opening-chain frame.
-pub const INIT_REPLY_LEN: usize = OUTPUT_REPORT_DATA_LEN;
+pub const FIRMWARE_REPLY_LEN: usize = OUTPUT_REPORT_DATA_LEN;
 /// Header of a header-echoing payload-read reply, report ID byte excluded: `reserved, offset u16, size u16`.
 pub const READ_REPLY_HEADER_LEN: usize = 5;
 /// Framing bytes between the report-ID byte and the payload of a payload-read reply (`GET_REPORT
@@ -143,11 +144,11 @@ pub const READ_REPLY_HEADER_LEN: usize = 5;
 pub const READ_REPLY_FRAMING_LEN: usize = 0;
 /// Bytes in a profile schema word, and the size of a schema-only payload read.
 /// Median gap between two device replies during a GG profile read in the reference capture, in
-/// milliseconds. Used as the default pacing between our own transfers; the opening-chain frames GG
-/// sends are 11 ms apart.
+/// milliseconds. Used as the default pacing between our own transfers. (GG's opening-chain frames are
+/// 11 ms apart; this read replays none of them.)
 pub const GG_GAP_MS: u64 = 5;
 
-/// Firmware version an opening-chain [`CommandCode::FirmwareVersion`] answer carries: the printable
+/// Firmware version a [`crate::devices::hid_reports::CommandCode::FirmwareVersion`] answer carries: the printable
 /// ASCII run
 /// from the first byte, which the capture shows NUL padded (`34 2e 31 36 2e 38 00…` = `4.16.8`).
 /// Returns `None` when the answer starts with non-printable bytes, which is how a keyboard that frames

@@ -978,8 +978,8 @@ fn print_onboard_image(image: &steelseries_gg::devices::keyboards::apex_legacy_p
 
     println!("read {} profile bytes from {path}", image.data.len());
     match image.firmware.as_deref() {
-        Some(firmware) => println!("firmware:  {firmware} (answered the opening-chain 0x90 poll)"),
-        None => println!("firmware:  no answer to the opening-chain 0x90 poll"),
+        Some(firmware) => println!("firmware:  {firmware} (answered the 0x90 firmware poll)"),
+        None => println!("firmware:  no answer to the 0x90 firmware poll"),
     }
     println!(
         "transfers: {} payload reads over {} pulls; {} bytes covered, {} short read(s)",

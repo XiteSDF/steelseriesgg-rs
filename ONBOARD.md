@@ -17,18 +17,20 @@ Moved from `PLAN.md`:
 
 ## Apex 7 on-board profile read (`onboard` feature, hardware validation)
 
-Implemented 2026-10-15 from the 2026-10-15 GG capture: GG's six-frame opening chain (`90 00`,
-`90 01`, `f4 00`, `6c 00 01`, `90 00`, `90 01` - the `90` poll answers the firmware version), `0x85`
-pulls, `0x83` payload reads, checksum, payload decode, `ssgg onboard read|decode`. Only the profile slot is
-selectable (`--profile 0..4`); the geometry is compile-time constants. The 13-byte
-"pacing frame" earlier versions sent is not in the capture and was removed. Every protocol byte in it is
+Implemented 2026-10-15 from the 2026-10-15 GG capture: a `0x90` firmware-version poll, `0x85` pulls,
+`0x83` payload reads, checksum, payload decode, `ssgg onboard read|decode`. Only the profile slot is
+selectable (`--profile 0..4`); the geometry is compile-time constants. The 13-byte "pacing frame" earlier
+versions sent is not in the capture and was removed, and so was GG's six-frame opening chain (`90 00`,
+`90 01`, `f4 00`, `6c 00 01`, `90 00`, `90 01`), removed 2026-10-17: the read sends the single `90 00`
+poll it needs, because on hardware `90 00` and `90 01` answer identically and `f4 00` and `6c 00 01`
+have no known meaning. Every protocol byte in it is
 `[EXPERIMENTAL]` - nothing has been replayed on hardware. Read-only by design: the push command is named
 and never sent. Wire format, layout table and open questions: `docs/development/apex-7-onboard-profile-read.md`.
 
-0. **[HW] Opening chain:** `ssgg onboard read --yes --profile 0` first reports what the chain answered (the
-   `firmware:` line is the `0x90` poll's answer). If the keyboard answers `4.16.x`, the chain is accepted on our
-   framing. The chain is part of every read: `--no-init-chain` is gone, so comparing with and without it needs a
-   code change, not a flag.
+0. **[HW] Firmware poll:** `ssgg onboard read --yes --profile 0` starts with the single `90 00` poll and
+   prints its answer in the `firmware:` line. **Measured 2026-10-17:** an Apex 7 wired answered `90 00` and
+   `90 01` the same way, so one poll is all the read needs; `f4 00` and `6c 00 01` (the other two frames of
+   GG's chain) are not sent and their meanings are unknown.
 
 Measured 2026-10-16 by comparing the GG capture with the ssgg run of 2026-10-15 on the same keyboard: the
 chain, the chain answers, the pull header and the `83` header all match, and the frames we send are answered
@@ -62,7 +64,7 @@ run sent none, so it collected nothing but 64-byte interrupt status. That is ste
    `write(2)` to an OUT endpoint the profile collection does not have. **Done 2026-10-17**: the per-call
    path-open helpers (`*_report_raw`) are removed and the read runs on the device's own handle, which is open for the whole
    read; `usbhid` polls the interrupt endpoint only while a descriptor on the node is open, which is why per-report opens
-   missed the chain and pull answers (measured in
+   missed the firmware-poll and pull answers (measured in
    `docs/development/apex-7-onboard-profile-read.md`, "Input reports: the node must be open when the report arrives").
    The 2026-10-15 text `Inappropriate ioctls (errno 110)` is not evidence of what the kernel answered - that path
    formatted `last_os_error()` after unrelated calls on the same thread.
@@ -95,8 +97,8 @@ run sent none, so it collected nothing but 64-byte interrupt status. That is ste
 
 | Piece | Where |
 |-------|-------|
-| Wire types: `0x85` pull, `0x83` read, `0x03` init chain, the pacing frame `0x01 0x00 00 02 00 f4 01 60 00`, the 643-byte read buffer | `src/devices/hid_reports.rs` (`OnboardPullCommand`, `OnboardReadCommand`, `OnboardInitCommand`, `ONBOARD_INIT_CHAIN`) — not feature-gated, no raw byte arrays outside it |
-| Read geometry, reply parsing, assembly, decode | `src/devices/keyboards/apex_legacy_profile.rs` (`PROFILE_FILE_LEN`, `READS_PER_PULL`, `profile_file_id`, `validate_profile`, `parse_read_reply`, `ProfileImage`, `decode`), feature `onboard`. It was `src/onboard_profile.rs` until 2026-10-17, when it moved into the legacy Apex namespace: its constants are all `apexui.dll` facts of the legacy ("macho") platform - reply framing, resource-buffer size, payload sizes, schema words, struct offsets - and there is nothing there another family can share. It is now feature-gated, as its consumers are. The only knob is the profile slot: pull count, buffer size, read size, pacing, opening chain and reply framing are constants, the read loop builds every frame from the typed commands, and it is also what logs the geometry - the CLI prints none, so no legacy constant appears in `src/main.rs` |
+| Wire types: `0x85` pull, `0x83` read, `0x90` firmware poll, the 643-byte read buffer | `src/devices/hid_reports.rs` (`OnboardPullCommand`, `OnboardReadCommand`, `OnboardFirmwareVersionCommand`) — not feature-gated, no raw byte arrays outside it. `OnboardInitCommand`/`ONBOARD_INIT_CHAIN` are gone (2026-10-17, see the firmware-poll row of `.claude/rules/experimental-protocol.md`): the chain's `f4 00` and `6c 00 01` stay documented as `CommandCode::EngineStatus`/`OpenFiles`, meanings unknown, sent by nothing |
+| Read geometry, reply parsing, assembly, decode | `src/devices/keyboards/apex_legacy_profile.rs` (`PROFILE_FILE_LEN`, `READS_PER_PULL`, `profile_file_id`, `validate_profile`, `parse_read_reply`, `ProfileImage`, `decode`), feature `onboard`. It was `src/onboard_profile.rs` until 2026-10-17, when it moved into the legacy Apex namespace: its constants are all `apexui.dll` facts of the legacy ("macho") platform - reply framing, resource-buffer size, payload sizes, schema words, struct offsets - and there is nothing there another family can share. It is now feature-gated, as its consumers are. The only knob is the profile slot: pull count, buffer size, read size, pacing and reply framing are constants, the read loop builds every frame from the typed commands, and it is also what logs the geometry - the CLI prints none, so no legacy constant appears in `src/main.rs` |
 | Packet I/O | `src/devices/keyboards/mod.rs`: `GenericKeyboard` does the profile packet I/O on the `device` handle it already owns - `connected_device` (the one handle accessor, shared with the lighting sends, same "Device not connected" message), `write_profile_packet` (its own output write - the lighting write path runs the hid optimizer, which would drop the chain's repeated frames), `send_feature`, `read_profile_feature_packet`, `read_profile_input_packet` (feature `onboard`); `apex_legacy_onboard` runs the read plan against `&GenericKeyboard`. No transport type: `OnboardTransport` with its `HandleTransport` and `PathTransport`, and the per-call path-open helpers (`send_feature_report_raw`, `read_feature_report_raw`, `write_output_report_raw`, `read_input_report_raw`) were all removed on 2026-10-17; Apex 7 wired works through hidapi |
 | Keyboard device | `src/devices/keyboards/apex7.rs`: `Apex7` wraps `GenericKeyboard` (its `HidReportBuilder` and the open `HidDevice`) and runs the read on its own handle; `onboard_family(pid)` selects `0x1612`, `0x1614`, `0x1616`, `0x1618` and `discovery::open_keyboard` wraps those PIDs in it **with or without the `onboard` feature** — only the read (`read_profile`, the transport, the read plan) is gated, so a family board keeps standard lighting in a default build |
 | Device API | `Keyboard::supports_onboard_profile`, `Keyboard::read_onboard_profile` (feature `onboard`, `[EXPERIMENTAL]`); every other keyboard answers "not supported" |
@@ -108,6 +110,6 @@ Two facts from the first Linux run (2026-10-15, Apex 7 `/dev/hidraw3`) that shap
   collection the capture's transfers ran on: the 2026-10-15 probe tried `1-3:1.4/input5`
   (`is_collection = true`), and the interface-1 node had no `input*` at all that day.
 - `usbhid` polls a collection's interrupt endpoint only while a descriptor on that node is open. A
-  per-report open (`/dev/hidrawN` opened for one report) has nowhere to deliver the opening-chain and
+  per-report open (`/dev/hidrawN` opened for one report) has nowhere to deliver the firmware-poll and
   pull answers, so `read_interrupt_report` saw none. The read avoids that: `Apex7` does its own packet
   I/O on the handle the device manager opened, and that handle stays open for the whole read.
