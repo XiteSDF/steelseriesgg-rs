@@ -497,12 +497,6 @@ pub struct OnboardFirmwareVersionCommand;
 impl OnboardFirmwareVersionCommand {
     /// Argument this crate polls with. GG's chain uses `0x01` as well; both answer.
     const ARG: u8 = 0x00;
-
-    /// Significant frame bytes behind the report number: `[0x90, 0x00]`.
-    #[must_use]
-    pub fn data_stage() -> [u8; 2] {
-        [CommandCode::FirmwareVersion as u8, Self::ARG]
-    }
 }
 
 impl HidCommand for OnboardFirmwareVersionCommand {
@@ -554,16 +548,6 @@ impl OnboardPullCommand {
     pub const FRAME_LEN: usize = 10;
     /// Largest pull the capture shows, the size of the keyboard's resource buffer.
     pub const MAX_SIZE: u16 = 1024;
-
-    /// Frame bytes behind the report number, for plan reporting. Built by [`HidCommand::serialize`].
-    #[must_use]
-    pub fn data_stage(&self) -> [u8; Self::FRAME_LEN] {
-        let mut buffer = [0u8; ONBOARD_OUTPUT_REPORT_SIZE];
-        serialize_stage(*self, &mut buffer);
-        let mut frame = [0u8; Self::FRAME_LEN];
-        frame.copy_from_slice(&buffer[1..Self::FRAME_LEN + 1]);
-        frame
-    }
 }
 
 impl HidCommand for OnboardPullCommand {
@@ -620,16 +604,6 @@ pub struct OnboardReadCommand {
 impl OnboardReadCommand {
     /// Significant frame bytes behind the report number.
     pub const FRAME_LEN: usize = 6;
-
-    /// Frame bytes behind the report number, for plan reporting. Built by [`HidCommand::serialize`].
-    #[must_use]
-    pub fn data_stage(&self) -> [u8; Self::FRAME_LEN] {
-        let mut buffer = [0u8; ONBOARD_FEATURE_REPORT_SIZE];
-        serialize_stage(*self, &mut buffer);
-        let mut frame = [0u8; Self::FRAME_LEN];
-        frame.copy_from_slice(&buffer[1..Self::FRAME_LEN + 1]);
-        frame
-    }
 }
 
 impl HidCommand for OnboardReadCommand {
@@ -669,11 +643,6 @@ impl HidCommand for OnboardReadCommand {
 /// Serialize a command into `buffer` for plan reporting. A command that does not validate serializes
 /// to zeros: plan builders validate the read configuration first, so the zeros are a report artifact,
 /// never bytes that reach the keyboard.
-fn serialize_stage<C: HidCommand>(command: C, buffer: &mut [u8]) {
-    let size = command.serialize(buffer, HidDeviceType::Keyboard);
-    debug_assert!(size.is_ok(), "{} plan frame is not serializable", command.description());
-}
-
 /// Reject a buffer that cannot hold a report of `report_size` bytes.
 fn check_report_buffer(buffer: &[u8], report_size: usize) -> Result<()> {
     if buffer.len() < report_size {
@@ -1746,11 +1715,6 @@ mod tests {
 
     #[test]
     fn firmware_poll_matches_one_answered_form() {
-        assert_eq!(
-            OnboardFirmwareVersionCommand::data_stage(),
-            [0x90, 0x00],
-            "90 00 is one of the two forms an Apex 7 answered on 2026-10-17"
-        );
         let mut buffer = [0u8; ONBOARD_OUTPUT_REPORT_SIZE];
         let size = OnboardFirmwareVersionCommand
             .serialize(&mut buffer, HidDeviceType::Keyboard)
@@ -1775,16 +1739,17 @@ mod tests {
             file_offset: 4096,
             size: 1024,
         };
-        assert_eq!(
-            cmd.data_stage(),
-            [0x85, 0x00, 0x01, 0x02, 0x00, 0x10, 0x00, 0x00, 0x00, 0x04]
-        );
         let mut buffer = [0u8; ONBOARD_OUTPUT_REPORT_SIZE];
         assert_eq!(
             cmd.serialize(&mut buffer, HidDeviceType::Keyboard).unwrap(),
             ONBOARD_OUTPUT_REPORT_SIZE
         );
         assert_eq!(buffer[0], 0x00);
+        assert_eq!(
+            &buffer[1..OnboardPullCommand::FRAME_LEN + 1],
+            [0x85, 0x00, 0x01, 0x02, 0x00, 0x10, 0x00, 0x00, 0x00, 0x04],
+            "the capture's frame bytes, behind the report number"
+        );
         assert!(buffer[11..].iter().all(|b| *b == 0));
         assert!(
             OnboardPullCommand {
@@ -1857,13 +1822,26 @@ mod tests {
             buffer_offset: 512,
             size: 512,
         };
-        assert_eq!(cmd.data_stage(), [0x83, 0x00, 0x00, 0x02, 0x00, 0x02]);
+        let mut buffer = [0u8; ONBOARD_FEATURE_REPORT_SIZE];
+        assert_eq!(
+            cmd.serialize(&mut buffer, HidDeviceType::Keyboard).unwrap(),
+            ONBOARD_FEATURE_REPORT_SIZE
+        );
+        assert_eq!(
+            &buffer[1..OnboardReadCommand::FRAME_LEN + 1],
+            [0x83, 0x00, 0x00, 0x02, 0x00, 0x02]
+        );
         assert_eq!(
             OnboardReadCommand {
                 buffer_offset: 0,
                 size: 2,
             }
-            .data_stage(),
+            .serialize(&mut buffer, HidDeviceType::Keyboard)
+            .unwrap(),
+            ONBOARD_FEATURE_REPORT_SIZE
+        );
+        assert_eq!(
+            &buffer[1..OnboardReadCommand::FRAME_LEN + 1],
             [0x83, 0x00, 0x00, 0x00, 0x02, 0x00]
         );
         let mut buffer = [0u8; ONBOARD_FEATURE_REPORT_SIZE];

@@ -2,9 +2,9 @@
 //!
 //! This module is the pure half of the read path: frame builders, reply parsing, payload assembly,
 //! struct decode, checksum reporting and JSON. It performs no I/O. The hardware loop is
-//! [`crate::devices::keyboards::apex_legacy_onboard`] (feature `onboard`).
+//! [`crate::devices::keyboards::apex_legacy_onboard`].
 //!
-//! It lives in this keyboard namespace, behind the same feature as its consumers, because everything
+//! It lives in this keyboard namespace next to its consumers, because everything
 //! in it belongs to this one platform: the reply framing, resource-buffer and window sizes, file-id
 //! base, payload sizes, schema words and the payload struct offsets all come from the legacy platform's
 //! own protocol module (`apexui.dll`). Nothing here is generic - the Gen3 platform (`0x1628`) reads its
@@ -964,7 +964,19 @@ pub fn to_json(image: &ProfileImage) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::devices::hid_reports::{CommandCode, OnboardPullCommand, OnboardReadCommand};
+    use crate::devices::hid_reports::{
+        CommandCode, HidCommand, HidDeviceType, ONBOARD_FEATURE_REPORT_SIZE, OnboardPullCommand, OnboardReadCommand,
+    };
+
+    /// The significant frame bytes a typed command serializes, behind its report-ID byte.
+    fn frame_of<C: HidCommand>(command: C, frame_len: usize) -> Vec<u8> {
+        let mut buffer = vec![0u8; ONBOARD_FEATURE_REPORT_SIZE];
+        let size = command
+            .serialize(&mut buffer, HidDeviceType::Keyboard)
+            .expect("the read plan sends this frame, so it is serializable");
+        assert!(frame_len < size, "{} fits in {size} bytes", command.description());
+        buffer[1..frame_len + 1].to_vec()
+    }
 
     fn synthetic_payload(schema: u16) -> Vec<u8> {
         let len = payload_len_for_schema(schema).unwrap();
@@ -998,12 +1010,14 @@ mod tests {
 
     #[test]
     fn pull_and_read_frames_come_from_the_typed_commands() {
-        let pull = OnboardPullCommand {
-            fs_id: profile_file_id(0),
-            file_offset: 0,
-            size: RESOURCE_BUFFER_LEN as u16,
-        }
-        .data_stage();
+        let pull = frame_of(
+            OnboardPullCommand {
+                fs_id: profile_file_id(0),
+                file_offset: 0,
+                size: RESOURCE_BUFFER_LEN as u16,
+            },
+            OnboardPullCommand::FRAME_LEN,
+        );
         assert_eq!(pull[0], CommandCode::OnboardPull as u8);
         assert_eq!(
             u16::from_le_bytes([pull[2], pull[3]]),
@@ -1011,11 +1025,13 @@ mod tests {
             "the file id sits behind the header"
         );
         assert_eq!(pull.len(), OnboardPullCommand::FRAME_LEN);
-        let read = OnboardReadCommand {
-            buffer_offset: 0,
-            size: READ_LEN as u16,
-        }
-        .data_stage();
+        let read = frame_of(
+            OnboardReadCommand {
+                buffer_offset: 0,
+                size: READ_LEN as u16,
+            },
+            OnboardReadCommand::FRAME_LEN,
+        );
         assert_eq!(read[0], CommandCode::OnboardPayloadRead as u8);
         assert_eq!(read.len(), OnboardReadCommand::FRAME_LEN);
     }
@@ -1025,12 +1041,14 @@ mod tests {
         let slot = 3;
         assert_eq!(profile_file_id(slot), 0x0204);
         for n in 0..DEFAULT_CHUNKS {
-            let pull = OnboardPullCommand {
-                fs_id: profile_file_id(slot),
-                file_offset: (n * RESOURCE_BUFFER_LEN) as u32,
-                size: RESOURCE_BUFFER_LEN as u16,
-            }
-            .data_stage();
+            let pull = frame_of(
+                OnboardPullCommand {
+                    fs_id: profile_file_id(slot),
+                    file_offset: (n * RESOURCE_BUFFER_LEN) as u32,
+                    size: RESOURCE_BUFFER_LEN as u16,
+                },
+                OnboardPullCommand::FRAME_LEN,
+            );
             assert_eq!(
                 u16::from_le_bytes([pull[2], pull[3]]),
                 0x0204,
@@ -1048,11 +1066,13 @@ mod tests {
             );
         }
         for n in 0..READS_PER_PULL {
-            let read = OnboardReadCommand {
-                buffer_offset: (n * READ_LEN) as u16,
-                size: READ_LEN as u16,
-            }
-            .data_stage();
+            let read = frame_of(
+                OnboardReadCommand {
+                    buffer_offset: (n * READ_LEN) as u16,
+                    size: READ_LEN as u16,
+                },
+                OnboardReadCommand::FRAME_LEN,
+            );
             assert_eq!(
                 u16::from_le_bytes([read[2], read[3]]),
                 (n * READ_LEN) as u16,
