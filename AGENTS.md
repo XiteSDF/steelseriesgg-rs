@@ -112,6 +112,7 @@ this is expected, CI builds and lints `audio` on Linux only.
 
 - **Search before reading**: `rg 'TypeName|fn_name' src/`, then read only the relevant lines. Large files: `src/main.rs`, `src/devices/hid_reports.rs`.
 - **Documents**: only create planning or analysis documents when explicitly requested.
+- **Commit messages**: one short imperative subject, no body; details belong in `PLAN.md` and `docs/`.
 
 ---
 
