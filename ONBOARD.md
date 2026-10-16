@@ -36,9 +36,10 @@ and never sent. Wire format, layout table and open questions: `docs/development/
    capture (engine session capture): every one of the 121 pulls is answered 1.7-3.7 ms later by the keyboard's ordinary
    input report `0x01` (63 bytes, all zero = no keys pressed), and the device's own read spec keeps **no**
    bytes of it (byte specifier `(0 0 0)` in `apex_7.lisp`). So the packet GG reads after a pull is a flow-control
-   token; every profile byte arrives through the `0x83` window replies. `ssgg onboard read` does the same
-   (`read_pull_ack` consumes one packet and inspects none of it). The capture kit's decoded response listing lists the
-   121 pulls as 64-byte "control responses" starting `85 00 …` - those are the requests GG submitted, which is
+   token; every profile byte arrives through the `0x83` window replies. **`ssgg onboard read` sends no pacing
+   read at all** (2026-10-17): with nothing to take from the packet, `read_pull_ack` and the per-pull input poll
+   were removed, and the read goes straight from the pull to its two payload reads. The capture kit's decoded response listing
+   lists the 121 pulls as 64-byte "control responses" starting `85 00 …` - those are the requests GG submitted, which is
    why pull replies were earlier described as constant 64-byte frames.
 
 Measured 2026-10-16 by comparing the GG capture with the ssgg run of 2026-10-15 on the same keyboard: the
