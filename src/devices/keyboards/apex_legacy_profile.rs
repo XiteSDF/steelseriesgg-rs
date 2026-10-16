@@ -53,8 +53,7 @@
 //!   All 121 pulls in the capture are followed by an all-zero `0x01` report 1.7-3.7 ms later, and so
 //!   are all 72 pushes of the write runs: the interrupt packet is a pacing token, not a status frame.
 //!   The `85 00 fs offset size` frames the capture kit lists as 64-byte "pull replies" are the
-//!   `SET_REPORT` requests themselves. **The read here sends no pacing read**: there is nothing to take
-//!   from the packet, so `onboard read` goes straight from the pull to the two payload reads.
+//!   `SET_REPORT` requests themselves.
 //! * payload read (`HIDFEATURE`, feature report ID `0x00`, 642 bytes on the wire, `SET_REPORT wValue
 //!   0x0300 wIndex 1`): `83 | 00 | offset u16 LE | size u16 LE | 00…` (6 frame bytes, 643-byte report buffer)
 //!   — returns `size` bytes of the resource buffer. GG reads the answer with `GET_REPORT wValue 0x0300
@@ -297,6 +296,10 @@ pub struct ChunkRecord {
     pub fs_id: u16,
     /// File offset the pull filled the resource buffer from.
     pub file_offset: u32,
+    /// Report ID the packet after the pull arrived on (`0x01` on an idle keyboard).
+    pub ack_report_id: u8,
+    /// First bytes of that packet, hex; content is discarded, GG's read spec takes zero bytes from it.
+    pub ack_hex: String,
     /// Payload reads drained from this pull.
     pub reads: Vec<ReadReply>,
 }
@@ -1142,6 +1145,8 @@ mod tests {
             index: chunk,
             fs_id: profile_file_id(0),
             file_offset: (chunk * RESOURCE_BUFFER_LEN) as u32,
+            ack_report_id: 0x85,
+            ack_hex: "85 00".to_string(),
             reads: (0..READS_PER_PULL)
                 .map(|read| {
                     let data = data(read);
@@ -1193,6 +1198,8 @@ mod tests {
             index: DEFAULT_CHUNKS,
             fs_id: profile_file_id(0),
             file_offset: PROFILE_FILE_LEN as u32,
+            ack_report_id: 0x85,
+            ack_hex: "85 00".to_string(),
             reads: (0..READS_PER_PULL)
                 .map(|read| ReadReply {
                     report_id: 0x83,
@@ -1316,6 +1323,8 @@ mod tests {
                     index: chunk,
                     fs_id: 0x0201,
                     file_offset: (chunk * RESOURCE_BUFFER_LEN) as u32,
+                    ack_report_id: 0x85,
+                    ack_hex: "85 00".to_string(),
                     reads: (0..reads_per_pull)
                         .map(|read| {
                             let i = chunk * reads_per_pull + read;
@@ -1354,6 +1363,8 @@ mod tests {
             index: 0,
             fs_id: profile_file_id(0),
             file_offset: 0,
+            ack_report_id: 0x85,
+            ack_hex: "85".to_string(),
             reads: (0..(RESOURCE_BUFFER_LEN / READ_LEN) * DEFAULT_CHUNKS)
                 .map(|i| ReadReply {
                     report_id: 0x83,
