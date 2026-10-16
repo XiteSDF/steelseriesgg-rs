@@ -286,8 +286,8 @@ pub(crate) struct OnboardReadArgs {
     #[command(flatten)]
     pub(crate) wire: OnboardWireArgs,
 
-    /// Device as `vid:pid`, a sysfs prefix, or a `/dev/hidrawN` node (default: the control
-    /// collection of the first legacy Apex keyboard found)
+    /// Device as `vid:pid` (default: the first Apex 7-family keyboard found). The read runs on that
+    /// keyboard's own handle, the collection the device manager opened
     #[arg(short, long)]
     pub(crate) device: Option<String>,
 
@@ -310,10 +310,6 @@ pub(crate) struct OnboardReadArgs {
     /// Read twice and compare the profile bytes
     #[arg(long)]
     pub(crate) verify: bool,
-
-    /// A reply header that disagrees with its request fails the read (research mode turns this off)
-    #[arg(long, default_value = "true")]
-    pub(crate) strict: bool,
 }
 
 #[cfg(feature = "onboard")]

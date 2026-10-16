@@ -35,10 +35,12 @@ wIndex 1 wLength 642` after every read request and takes the window from that co
 run sent none, so it collected nothing but 64-byte interrupt status. That is step 1a.
 
 1. **[HW] Path probe (Linux, Apex 7, GG stopped):** `ssgg --debug onboard read --yes --profile 0`. It
-   answers "is the profile protocol on the collection the device manager opened?" - the read runs on the
-   `Apex7` device handle. If it times out, the keyboard answers on another collection: run the same read
-   with `--device /dev/hidrawN` on each node of the keyboard. The 2026-10-15 probe answered on interface 4
-   (`/dev/hidraw3`, `0xFFC1`).
+   answers "is the profile protocol on the collection the device manager opened for the keyboard?" - the
+   read runs on the `Apex7` device handle, and `ssgg devices` shows which collection that is. The
+   2026-10-15 probe answered on interface 4 (`/dev/hidraw3`, `0xFFC1`), which is where the device manager
+   lands on that box. If a keyboard needs interface 1 (`wIndex 1` in the capture) and the manager opened a
+   different collection, that collection has to be discovered as its own device: the read no longer probes
+   nodes by path.
 1a. **[HW] Feature-report read-back:** the read path must ask for the reply the way GG does — report
    number **0**, 642 bytes, on the interface-1 collection. `HIDIOCGFEATURE` builds `wValue` from the
    buffer's first byte, and since 2026-10-17 every report buffer built in `src/devices/hid_reports.rs`
@@ -50,14 +52,15 @@ run sent none, so it collected nothing but 64-byte interrupt status. That is ste
    appears in the capture we take, and that the first bytes behind the report-ID byte are the schema word
    (`0b 00`).
 1b. **[HW] hidapi as the transport (code 2026-10-17, hardware unverified):** the hand-rolled raw-ioctl and
-   `write(2)` paths are deleted; every transfer is a hidapi call on a path opened for that call
-   (`send_feature_report`, `get_feature_report`, `write`, `read_timeout`). On Linux the `linux-native` backend issues
+   `write(2)` paths are deleted; every transfer is a hidapi call (`send_feature_report`, `get_feature_report`,
+   `write`, `read_timeout`) on the handle the device manager opened for the keyboard. On Linux the `linux-native` backend issues
    the kernel's own `HIDIOCSFEATURE`/`HIDIOCGFEATURE`/`HIDIOCSOUTPUT` (`hidapi-2.6.7/src/linux_native/ioctl.rs:20,26,38`),
    the direction-bit bug was fixed in 2.6.6 and 2.6.7 is pinned, so the `#[cfg(unix)]` split is gone. Output frames
    therefore leave as `SET_REPORT wValue 0x0200` control transfers, matching the reference capture, instead of a
-   `write(2)` to an OUT endpoint the profile collection does not have. **Open**: a descriptor held for the whole session
-   was implemented and reverted on 2026-10-17; `usbhid` polls the interrupt endpoint only while a descriptor on the node
-   is open, so the per-report polls in `read_input_report_raw` still miss the chain and pull answers (measured in
+   `write(2)` to an OUT endpoint the profile collection does not have. **Done 2026-10-17**: the per-call
+   path-open helpers (`*_report_raw`) are removed and the read runs on the device's own handle, which is open for the whole
+   read; `usbhid` polls the interrupt endpoint only while a descriptor on the node is open, which is why per-report opens
+   missed the chain and pull answers (measured in
    `docs/development/apex-7-onboard-profile-read.md`, "Input reports: the node must be open when the report arrives").
    The 2026-10-15 text `Inappropriate ioctls (errno 110)` is not evidence of what the kernel answered - that path
    formatted `last_os_error()` after unrelated calls on the same thread.
@@ -92,10 +95,10 @@ run sent none, so it collected nothing but 64-byte interrupt status. That is ste
 |-------|-------|
 | Wire types: `0x85` pull, `0x83` read, `0x03` init chain, the pacing frame `0x01 0x00 00 02 00 f4 01 60 00`, the 643-byte read buffer | `src/devices/hid_reports.rs` (`OnboardPullCommand`, `OnboardReadCommand`, `OnboardInitCommand`, `ONBOARD_INIT_CHAIN`) — not feature-gated, no raw byte arrays outside it |
 | Read plan, reply parsing, assembly, decode | `src/onboard_profile.rs` (`ReadConfig`, `plan_json`, `parse_read_reply`, `ProfileImage`, `decode`), feature `onboard` |
-| Transports | `src/devices/keyboards/apex_legacy_onboard.rs`: `OnboardTransport` (trait: `write_output`, `send_feature`, `read_feature`, `read_input`), `PathTransport` (one collection per open, used by `ssgg onboard` when `--device` names a node), `HandleTransport` (a handle the device manager keeps open) |
+| Transports | `src/devices/keyboards/apex_legacy_onboard.rs`: `OnboardTransport` (trait: `write_output`, `send_feature`, `read_feature`, `read_input`) with the single implementation `HandleTransport` - the handle the device manager keeps open for the whole read. The per-call path-open helpers (`send_feature_report_raw`, `read_feature_report_raw`, `write_output_report_raw`, `read_input_report_raw`) and `PathTransport` were removed on 2026-10-17; Apex 7 wired works through hidapi |
 | Keyboard device | `src/devices/keyboards/apex7.rs`: `Apex7` wraps `GenericKeyboard` (its `HidReportBuilder` and the open `HidDevice`) and runs the read on its own handle; `onboard_family(pid)` gates `0x1612`, `0x1614`, `0x1616`, `0x1618`; `discovery::open_keyboard` returns it for those PIDs |
 | Device API | `Keyboard::supports_onboard_profile`, `Keyboard::read_onboard_profile` (feature `onboard`, `[EXPERIMENTAL]`); every other keyboard answers "not supported" |
-| CLI | `ssgg onboard plan / read / decode` (`src/cli.rs`, `src/main.rs`); `read` uses the `Apex7` device when the target is on the family, and the candidate collections when `--device /dev/hidrawN` names a node |
+| CLI | `ssgg onboard plan / read / decode` (`src/cli.rs`, `src/main.rs`); `read` runs on the `Apex7` device (its own handle, `--device vid:pid` selects the keyboard), and fails with a clear message when the target is not on the family |
 
 Two facts from the first Linux run (2026-10-15, Apex 7 `/dev/hidraw3`) that shape the transport:
 

@@ -814,9 +814,6 @@ async fn cmd_profile(action: ProfileAction) -> Result<()> {
 /// docs/development/apex-7-onboard-profile-read.md and has never been replayed from this crate.
 #[cfg(feature = "onboard")]
 async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAction) -> Result<()> {
-    use steelseries_gg::STEELSERIES_VENDOR_ID;
-    use steelseries_gg::devices::keyboards::apex_legacy_onboard as hw;
-    use steelseries_gg::devices::product_ids::APEX_7;
     use steelseries_gg::onboard_profile::{hex_dump, plan_json, profile_json, schema_of, to_json};
 
     match action {
@@ -836,43 +833,38 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
             let Some(manager) = manager.as_mut() else {
                 return Err(Error::Other("the on-board profile read needs a device".to_string()));
             };
-            let keyboard = onboard_keyboard(manager, &args.device).await;
-            let paths = onboard_paths(manager, &args.device, STEELSERIES_VENDOR_ID, APEX_7)?;
+            let Some(keyboard) = onboard_keyboard(manager, &args.device).await else {
+                return Err(Error::DeviceNotFound(
+                    "no Apex 7-family keyboard found: the on-board profile read runs on the keyboard's own handle, selected with --device vid:pid"
+                        .to_string(),
+                ));
+            };
+            let label = onboard_device_label(keyboard.as_ref());
             print_onboard_banner();
             println!(
-                "profile slot {} (file id {:04X}): {} pulls of {} bytes, {} reads of {} bytes, strict replies: {}",
+                "profile slot {} (file id {:04X}): {} pulls of {} bytes, {} reads of {} bytes",
                 config.profile,
                 config.fs_id(),
                 config.chunks,
                 config.resource_len,
                 config.chunks * (config.resource_len / config.read_len),
-                config.read_len,
-                args.strict
+                config.read_len
             );
-            match keyboard.as_ref() {
-                Some(device) => println!("reading on the {} device", onboard_device_label(device.as_ref())),
-                None => println!("device paths to try: {}", paths.join(", ")),
-            }
+            println!("reading on the {label}");
             println!();
 
             if args.verify {
-                let (first, second, diff, path) = match keyboard.as_ref() {
-                    Some(device) => {
-                        let first = device.read_onboard_profile(&config).await?;
-                        let second = device.read_onboard_profile(&config).await?;
-                        let diff = first
-                            .data
-                            .iter()
-                            .zip(second.data.iter())
-                            .enumerate()
-                            .find(|(_, (a, b))| a != b)
-                            .map(|(offset, _)| offset);
-                        (first, second, diff, onboard_device_label(device.as_ref()))
-                    }
-                    None => hw::read_profile_verify(&paths, &config, args.strict).await?,
-                };
-                print_onboard_image(&first, &path);
-                print_onboard_image(&second, &path);
+                let first = keyboard.read_onboard_profile(&config).await?;
+                let second = keyboard.read_onboard_profile(&config).await?;
+                let diff = first
+                    .data
+                    .iter()
+                    .zip(second.data.iter())
+                    .enumerate()
+                    .find(|(_, (a, b))| a != b)
+                    .map(|(offset, _)| offset);
+                print_onboard_image(&first, &label);
+                print_onboard_image(&second, &label);
                 match diff {
                     Some(offset) => {
                         println!("the two reads differ at profile byte {offset}: treat this pairing as unverified")
@@ -894,14 +886,8 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
                     println!("JSON report of the first read written to {}", json.display());
                 }
             } else {
-                let (image, path) = match keyboard.as_ref() {
-                    Some(device) => (
-                        device.read_onboard_profile(&config).await?,
-                        onboard_device_label(device.as_ref()),
-                    ),
-                    None => hw::read_profile(&paths, &config, args.strict).await?,
-                };
-                print_onboard_image(&image, &path);
+                let image = keyboard.read_onboard_profile(&config).await?;
+                print_onboard_image(&image, &label);
                 if args.hex {
                     print!("{}", hex_dump(&image.data, 0, image.data.len()));
                 }
@@ -947,9 +933,8 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
 /// for the opening-chain and pull answers: it polls an interrupt endpoint only while a descriptor on
 /// the node is open.
 ///
-/// `None` when `--device` names a specific hidraw node (that call keeps meaning "read exactly this
-/// collection", so it stays on the path-based transport), and when the target is not on the platform
-/// the protocol was reverse-engineered from.
+/// `None` when no matching keyboard is openable, and when the target is not on the platform the
+/// protocol was reverse-engineered from (`Apex7::onboard_family`).
 #[cfg(feature = "onboard")]
 async fn onboard_keyboard(manager: &mut DeviceManager, device: &Option<String>) -> Option<Box<dyn Keyboard>> {
     use steelseries_gg::STEELSERIES_VENDOR_ID;
@@ -975,54 +960,6 @@ async fn onboard_keyboard(manager: &mut DeviceManager, device: &Option<String>) 
 #[cfg(feature = "onboard")]
 fn onboard_device_label(keyboard: &dyn Keyboard) -> String {
     format!("{} ({})", keyboard.info().name, keyboard.info().path)
-}
-
-#[cfg(feature = "onboard")]
-fn onboard_paths(
-    manager: &mut DeviceManager,
-    device: &Option<String>,
-    vendor_id: u16,
-    product_id: u16,
-) -> Result<Vec<String>> {
-    use steelseries_gg::devices::keyboards::apex_legacy_onboard::candidate_paths;
-
-    if let Some(path) = device.as_ref().filter(|d| d.starts_with('/')) {
-        let (vendor, product) = steelseries_gg::devices::keyboards::apex_legacy_onboard::hidraw_vendor_product(path)
-            .unwrap_or((vendor_id, product_id));
-        let paths = candidate_paths(Some(path), vendor, product);
-        if paths.is_empty() {
-            return Err(Error::DeviceNotFound(format!(
-                "{path} is not a hidraw node of a device with readable collections"
-            )));
-        }
-        return Ok(paths);
-    }
-
-    manager.refresh()?;
-
-    let (vendor, product) = match device.as_ref() {
-        Some(spec) => parse_vid_pid(spec).unwrap_or((vendor_id, product_id)),
-        None => (vendor_id, product_id),
-    };
-
-    let matching: Vec<&steelseries_gg::devices::DeviceInfo> = manager
-        .devices()
-        .into_iter()
-        .filter(|d| d.vendor_id == vendor && d.product_id == product)
-        .collect();
-
-    if matching.is_empty() {
-        return Err(Error::DeviceNotFound(format!(
-            "no device matching {vendor:04X}:{product:04X} found. Try 'ssgg devices'."
-        )));
-    }
-
-    let preferred = manager
-        .control_path(vendor, product)
-        .map(|p| p.to_string())
-        .or_else(|| matching.first().map(|d| d.path.clone()));
-
-    Ok(candidate_paths(preferred.as_deref(), vendor, product))
 }
 
 /// `vendor:pid` as used by `ssgg --device`.

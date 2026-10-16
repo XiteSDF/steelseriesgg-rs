@@ -59,6 +59,12 @@ uses the device when the target is on that family, and the candidate collections
 
 Lighting is the only part replayed from `ssgg` so far (one solid red, 2026-10-14).
 
+0. **[HW] `send_feature` transport test (code 2026-10-17, never measured on `0x1628`)**: `Keyboard::send_feature`
+   is back on the device's own hidapi handle - the 2026-10-15 path-based call (interface-1 lookup via sysfs) was
+   reverted without ever being measured. With GG stopped: `ssgg rgb color FF0000`, then `rgb color 00FF00`,
+   `rgb brightness 50`, `rgb effect wave`. If the keyboard ignores every direct-mode frame, the interface-1
+   reading is real: re-open interface 1 as its own collection (not the old path lookup) and record it here.
+
 1. **[HW] Lighting test matrix**, GG stopped, `.\target\debug\ssgg.exe`:
    - `rgb color 00FF00`, `rgb color 0000FF`, `rgb color FFFFFF` (all keys, correct colour?)
    - `rgb off`
@@ -244,6 +250,8 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   interfaces 0-4. `find_hidraw_for_interface` on Unix now compares the interface number `interface_from_phys`
   reads from `HID_PHYS` (its old `ends_with("/input{N}")` test never matched a multi-collection phys string,
   so interface 1 resolved to nothing).
+  *(superseded 2026-10-17: `candidate_paths`, `PathTransport` and the `*_report_raw` helpers are removed; the
+  read runs on the `Apex7` device handle - see P0 "Linux collection" and item 0 of this section.)*
   Next step (keyboard): ask the read-back of the collection that declares it - interface 1 (`0xFFC0`): the
   kernel validates GET_REPORT against the interface's report descriptor, and interface 1 answered `EPIPE` to
   the 2026-10-15 report-ID-framed writes. Then
