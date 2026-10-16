@@ -838,6 +838,7 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
             let Some(manager) = manager.as_mut() else {
                 return Err(Error::Other("the on-board profile read needs a device".to_string()));
             };
+            let keyboard = onboard_keyboard(manager, &args.device).await;
             let paths = onboard_paths(manager, &args.device, STEELSERIES_VENDOR_ID, APEX_7)?;
             print_onboard_banner();
             println!(
@@ -850,11 +851,28 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
                 config.read_len,
                 args.strict
             );
-            println!("device paths to try: {}", paths.join(", "));
+            match keyboard.as_ref() {
+                Some(device) => println!("reading on the {} device", onboard_device_label(device.as_ref())),
+                None => println!("device paths to try: {}", paths.join(", ")),
+            }
             println!();
 
             if args.verify {
-                let (first, second, diff, path) = hw::read_profile_verify(&paths, &config, args.strict).await?;
+                let (first, second, diff, path) = match keyboard.as_ref() {
+                    Some(device) => {
+                        let first = device.read_onboard_profile(&config).await?;
+                        let second = device.read_onboard_profile(&config).await?;
+                        let diff = first
+                            .data
+                            .iter()
+                            .zip(second.data.iter())
+                            .enumerate()
+                            .find(|(_, (a, b))| a != b)
+                            .map(|(offset, _)| offset);
+                        (first, second, diff, onboard_device_label(device.as_ref()))
+                    }
+                    None => hw::read_profile_verify(&paths, &config, args.strict).await?,
+                };
                 print_onboard_image(&first, &path);
                 print_onboard_image(&second, &path);
                 match diff {
@@ -878,7 +896,13 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
                     println!("JSON report of the first read written to {}", json.display());
                 }
             } else {
-                let (image, path) = hw::read_profile(&paths, &config, args.strict).await?;
+                let (image, path) = match keyboard.as_ref() {
+                    Some(device) => (
+                        device.read_onboard_profile(&config).await?,
+                        onboard_device_label(device.as_ref()),
+                    ),
+                    None => hw::read_profile(&paths, &config, args.strict).await?,
+                };
                 print_onboard_image(&image, &path);
                 if args.hex {
                     print!("{}", hex_dump(&image.data, 0, image.data.len()));
@@ -901,10 +925,14 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
             let Some(manager) = manager.as_mut() else {
                 return Err(Error::Other("the on-board profile read needs a device".to_string()));
             };
+            let keyboard = onboard_keyboard(manager, &args.device).await;
             let paths = onboard_paths(manager, &args.device, STEELSERIES_VENDOR_ID, APEX_7)?;
             let deadline = (args.deadline_ms > 0).then(|| Duration::from_millis(args.deadline_ms));
             print_onboard_banner();
-            println!("device paths to try: {}", paths.join(", "));
+            match keyboard.as_ref() {
+                Some(device) => println!("probing on the {} device", onboard_device_label(device.as_ref())),
+                None => println!("device paths to try: {}", paths.join(", ")),
+            }
             println!(
                 "probing with a {} ms budget per group of files{}",
                 args.deadline_ms,
@@ -915,16 +943,28 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
             if args.sweep {
                 println!("reply framing sweep on profile slot 0 (which framing length exposes a real schema word):");
                 for header in [0usize, 1, 2, 5, 6, 14, 19, 20, 21, 36] {
-                    let probe = hw::read_schema_probe(
-                        &paths,
-                        wire::PROFILE_FS_BASE,
-                        0,
-                        header,
-                        args.gap_ms,
-                        args.strict,
-                        deadline,
-                    )
-                    .await;
+                    let probe = match keyboard.as_ref() {
+                        Some(device) => {
+                            let mut probe_config = hw::schema_config(wire::PROFILE_FS_BASE, 0, args.gap_ms);
+                            probe_config.reply_header = header;
+                            device
+                                .read_onboard_schema(&probe_config)
+                                .await
+                                .map(|(word, raw)| (word, raw, onboard_device_label(device.as_ref())))
+                        }
+                        None => {
+                            hw::read_schema_probe(
+                                &paths,
+                                wire::PROFILE_FS_BASE,
+                                0,
+                                header,
+                                args.gap_ms,
+                                args.strict,
+                                deadline,
+                            )
+                            .await
+                        }
+                    };
                     match probe {
                         Ok((word, raw, path)) => {
                             let known = wire::payload_len_for_schema(word).ok();
@@ -947,7 +987,17 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
 
             for slot in 0..=hw::MAX_PROFILE_INDEX_FOR_READ {
                 let fs_id = wire::PROFILE_FS_BASE + u16::from(slot);
-                match hw::read_schema(&paths, slot, args.gap_ms, args.strict, deadline).await {
+                let probe = match keyboard.as_ref() {
+                    Some(device) => {
+                        let probe_config = hw::schema_config(wire::PROFILE_FS_BASE, slot, args.gap_ms);
+                        device
+                            .read_onboard_schema(&probe_config)
+                            .await
+                            .map(|(word, raw)| (word, raw, onboard_device_label(device.as_ref())))
+                    }
+                    None => hw::read_schema(&paths, slot, args.gap_ms, args.strict, deadline).await,
+                };
+                match probe {
                     Ok((word, raw, path)) => {
                         let payload = payload_len_for_schema(word).ok();
                         println!(
@@ -1041,6 +1091,42 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
 /// Device paths to try for a profile read: the control collection discovery ranked for this
 /// vendor/product pair (or the `--device` node) first, then the interface-1 collection of the same
 /// device, where the reference capture shows every profile transfer running.
+#[cfg(feature = "onboard")]
+/// The Apex 7 as a keyboard device, when the target carries the `[EXPERIMENTAL]` on-board profile
+/// protocol. The read then runs on the handle the device manager opened, which is what `usbhid` needs
+/// for the opening-chain and pull answers: it polls an interrupt endpoint only while a descriptor on
+/// the node is open.
+///
+/// `None` when `--device` names a specific hidraw node (that call keeps meaning "read exactly this
+/// collection", so it stays on the path-based transport), and when the target is not on the platform
+/// the protocol was reverse-engineered from.
+#[cfg(feature = "onboard")]
+async fn onboard_keyboard(manager: &mut DeviceManager, device: &Option<String>) -> Option<Box<dyn Keyboard>> {
+    use steelseries_gg::STEELSERIES_VENDOR_ID;
+    use steelseries_gg::devices::keyboards::apex7::onboard_family;
+    use steelseries_gg::devices::product_ids::APEX_7;
+
+    manager.refresh().ok()?;
+    let (vendor, product) = match device.as_ref() {
+        Some(spec) => parse_vid_pid(spec).unwrap_or((STEELSERIES_VENDOR_ID, APEX_7)),
+        None => (STEELSERIES_VENDOR_ID, APEX_7),
+    };
+    let info = manager.devices().into_iter().find(|d| {
+        d.vendor_id == vendor
+            && d.product_id == product
+            && onboard_family(d.product_id)
+            && matches!(d.device_type, steelseries_gg::devices::DeviceType::Keyboard)
+    })?;
+    let keyboard = manager.open_keyboard(info).ok()?;
+    keyboard.supports_onboard_profile().then_some(keyboard)
+}
+
+/// Where a device-driven read ran, in the same reporting form the path-based read prints.
+#[cfg(feature = "onboard")]
+fn onboard_device_label(keyboard: &dyn Keyboard) -> String {
+    format!("{} ({})", keyboard.info().name, keyboard.info().path)
+}
+
 #[cfg(feature = "onboard")]
 fn onboard_paths(
     manager: &mut DeviceManager,

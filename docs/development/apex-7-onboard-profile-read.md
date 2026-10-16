@@ -5,8 +5,11 @@ Apex 7, PID `0x1612`, 2026-10-15, firmware `4.16.8`). Every item below is `[EXPE
 it has been replayed from `ssgg` on real hardware. Code: `src/devices/hid_reports.rs` (the command codes
 and every report buffer: `OnboardInitCommand` and `ONBOARD_INIT_CHAIN`, `OnboardPullCommand`,
 `OnboardReadCommand`), `src/onboard_profile.rs` (read sequence plan, reply parsing, decode),
-`src/devices/keyboards/apex_legacy_onboard.rs` (transfers), `ssgg onboard` (`src/cli.rs`,
-`src/main.rs`); the read path is behind the `onboard` feature, the report builders are not.
+`src/devices/keyboards/apex_legacy_onboard.rs` (transfers, plus the `OnboardTransport` the device path
+uses), `src/devices/keyboards/apex7.rs` (`Apex7`: the keyboard device of the legacy Apex family, which
+wraps `GenericKeyboard` — its `HidReportBuilder` and open `HidDevice` — and runs the read on that
+handle), `ssgg onboard` (`src/cli.rs`, `src/main.rs`); the read path is behind the `onboard` feature,
+the report builders are not.
 
 The framing below is decoded from the capture's URBs (`hub-2.pcap`, parsed packet by packet: the 8-byte
 setup block of every control transfer plus its data stage), not from `reports.csv`. The CSV holds only

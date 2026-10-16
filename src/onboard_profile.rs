@@ -902,6 +902,17 @@ pub const LIGHTING_LEN: usize = 57;
 pub const NAME_OFFSET: usize = 2;
 /// Length of the profile name field.
 pub const NAME_LEN: usize = 24;
+/// Profile name of a payload: the [`NAME_LEN`] bytes at [`NAME_OFFSET`], cut at the first NUL. An
+/// empty string when the payload is too short or the name region is blank.
+#[must_use]
+pub fn profile_name(data: &[u8]) -> String {
+    if data.len() <= NAME_OFFSET {
+        return String::new();
+    }
+    let raw = &data[NAME_OFFSET..(NAME_OFFSET + NAME_LEN).min(data.len())];
+    let name_end = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
+    String::from_utf8_lossy(&raw[..name_end]).into_owned()
+}
 /// Offset of the META toggle HID byte.
 pub const META_TOGGLE_HID_OFFSET: usize = LIGHTING_OFFSET + LIGHTING_LEN;
 /// Length of the GUID field.

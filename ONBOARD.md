@@ -2,7 +2,7 @@ Above all, respect the original repository *.md files guidelines.
 
 Task: implement onboard profile read packet for Apex 7 keyboard on the `main` branch.
 
-Git status: `main` branch is checked out. `onboard-configs`, `onboard-configs-dev` and `qwen` branches should be ignored.
+Git status: `onboard-configs-dev` branch is checked out. `onboard-configs` and `qwen` branches should be ignored.
 
 Useful data:
 `docs/adding-hardware.md` - guidelines for adding hardware.
@@ -79,3 +79,26 @@ run sent none, so it collected nothing but 64-byte interrupt status. That is ste
    the control collection.
 7. Only after 1-4: extend to the lighting files (`0x0301`-`0x0305`, reply report ID `0x03`), then promote what
    worked to confirmed in `.claude/rules/experimental-protocol.md` with device model and date.
+
+---
+
+## Code layout (2026-10-17)
+
+| Piece | Where |
+|-------|-------|
+| Wire types: `0x85` pull, `0x83` read, `0x03` init chain, the pacing frame `0x01 0x00 00 02 00 f4 01 60 00`, the 643-byte read buffer | `src/devices/hid_reports.rs` (`OnboardPullCommand`, `OnboardReadCommand`, `OnboardInitCommand`, `ONBOARD_INIT_CHAIN`) — not feature-gated, no raw byte arrays outside it |
+| Read plan, reply parsing, assembly, decode | `src/onboard_profile.rs` (`ReadConfig`, `plan_json`, `parse_read_reply`, `ProfileImage`, `decode`), feature `onboard` |
+| Transports | `src/devices/keyboards/apex_legacy_onboard.rs`: `OnboardTransport` (trait: `write_output`, `send_feature`, `read_feature`, `read_input`), `PathTransport` (one collection per open, used by `ssgg onboard` when `--device` names a node), `HandleTransport` (a handle the device manager keeps open) |
+| Keyboard device | `src/devices/keyboards/apex7.rs`: `Apex7` wraps `GenericKeyboard` (its `HidReportBuilder` and the open `HidDevice`) and runs the read on its own handle; `onboard_family(pid)` gates `0x1612`, `0x1614`, `0x1616`, `0x1618`; `discovery::open_keyboard` returns it for those PIDs |
+| Device API | `Keyboard::supports_onboard_profile`, `Keyboard::read_onboard_profile`, `Keyboard::read_onboard_schema` (feature `onboard`, `[EXPERIMENTAL]`), default to an error on other keyboards |
+| CLI | `ssgg onboard plan / schema / read / decode` (`src/cli.rs`, `src/main.rs`); `schema` and `read` use the `Apex7` device when the target is on the family, and the candidate collections when `--device /dev/hidrawN` names a node |
+
+Two facts from the first Linux run (2026-10-15, Apex 7 `/dev/hidraw3`) that shape the transport:
+
+- Discovery opens the interface-4 collection (`usage 0xFFC1`) for this keyboard, not the interface-1
+  collection the capture's transfers ran on: `ssgg onboard schema` tried `1-3:1.4/input5`
+  (`is_collection = true`), and the interface-1 node had no `input*` at all that day.
+- `usbhid` polls a collection's interrupt endpoint only while a descriptor on that node is open. A
+  per-report open (`/dev/hidrawN` opened for one report) has nowhere to deliver the opening-chain and
+  pull answers, so `read_interrupt_report` saw none. `HandleTransport` avoids that: the read runs on the
+  handle the device manager opened, and it stays open for the whole read.

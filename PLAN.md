@@ -30,6 +30,28 @@ Protocol facts for the Apex Pro TKL 2023 are in `AGENTS.md` ("Protocol research 
 
 ---
 
+## P0 (onboard). Apex 7 on-board read: first hardware run on the device path
+
+Code is in place (2026-10-17, `onboard-configs-dev`): `Apex7` in `src/devices/keyboards/apex7.rs` wraps
+`GenericKeyboard` (its `HidReportBuilder` and the open `HidDevice`) and runs the read on its own handle
+through `HandleTransport`; `Keyboard::read_onboard_profile` / `read_onboard_schema` are the device API,
+`discovery::open_keyboard` returns `Apex7` for `0x1612`, `0x1614`, `0x1616`, `0x1618`. `ssgg onboard
+schema|read` use the device when the target is on that family, and the candidate collections when
+`--device /dev/hidrawN` names a node. Nothing has been replayed on hardware.
+
+1. **[HW] Collection check first:** `ls -l /sys/class/hidraw/hidrawN/device/../input*`. The 2026-10-15
+   run found the interface-1 collection (`/dev/hidraw3`) had no `input*`, so the device manager opened
+   interface 4 (`usage 0xFFC1`) — the collection with an `input*` node, not the one GG used. If interface
+   1 has no `input*`, boot once with the kernel argument `usbhid.poll_descriptor_ignores_interfaces=0`
+   (`sudo raspistop --bootcmd setusbhid` form from `ONBOARD.md` Step 1) and re-check.
+2. **[HW] Framing sweep on the device:** `ssgg --debug onboard schema --yes --sweep` — the `90` poll
+   answer in the log confirms the device path; record which `--reply-header` yields a real schema word.
+3. **[HW] Schema of slots 0..4**, then **read slot 0** with the winning framing
+   (`--out /tmp/p0.bin --json /tmp/p0.json`), then `--verify` and the `--gap-ms` ladder. Record the
+   checksum line and the decoded layout as `ONBOARD.md` "Next hardware steps" describes.
+4. **[HW] Windows:** same read through the hidapi path; confirms the interface choice for the control
+   collection.
+
 ## P1. Apex Pro TKL 2023 wired (`0x1628`): finish lighting
 
 Lighting is the only part replayed from `ssgg` so far (one solid red, 2026-10-14).
