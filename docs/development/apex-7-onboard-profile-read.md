@@ -218,6 +218,12 @@ its content is thrown away by design. All profile bytes arrive through the `0x83
 `GET_REPORT 0x0300` read-back), never through a pull's answer - which is what the read loop here does too
 (`apex_legacy_onboard::read_pull_ack` consumes one packet and looks at none of it).
 
+**The read is required on Linux, not just a GG habit.** On 2026-10-17 an Apex 7 `0xFFC1` collection was run with
+that per-pull input read removed: every payload read-back then failed with `io::read_exact: unexpected end of
+file`, and with the read restored the same collection read the profile. The step is
+`apex_legacy_onboard::read_pull_ack` (`PULL_ACK_LEN` = 64; GG's `read-chunk HIDIO 65` is that report plus its
+report-ID slot).
+
 The capture kit's decoded response listing lists 121 "control responses" of 64 bytes starting `85 00 <fs_id> <offset>
 <size>`: `capture.ps1` labels host-to-device control-endpoint data "control response", so those rows are the
 `SET_REPORT` requests GG submitted, not device answers (the same rows exist for the `05` and `83` requests,

@@ -39,6 +39,10 @@ itself on that handle; `Keyboard::read_onboard_profile` is the device API,
 the `onboard` feature** (2026-10-17: the device class is part of the device tree, only the read path is
 feature-gated). `ssgg onboard read` runs on that device. Nothing has been replayed on hardware.
 
+0. **[HW] The per-pull pacing read stays** (2026-10-17, Apex 7 `0xFFC1`): the pull's answer is the keyboard's
+   idle input report, and draining it per chunk is what lets the following feature read-back complete - a run
+   that removed the drain failed every payload read-back with `io::read_exact: unexpected end of file`. The step
+   is `apex_legacy_onboard::read_pull_ack` (`PULL_ACK_LEN` = 64 bytes, GG's `read-chunk HIDIO 65`).
 1. **[HW] Collection check first:** `ls -l the device sysfs input nodes`. The 2026-10-15
    run found the interface-1 collection (`the hidraw node`) had no `input*`, so the device manager opened
    interface 4 (`usage 0xFFC1`) — the collection with an `input*` node, not the one GG used. If interface
