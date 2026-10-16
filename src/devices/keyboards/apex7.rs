@@ -50,9 +50,6 @@ pub fn onboard_family(product_id: u16) -> bool {
 /// built with `onboard`: the device class is part of the device tree, only the read is feature-gated.
 pub struct Apex7 {
     inner: GenericKeyboard,
-    /// Slot read by [`Apex7::read_profile_slot`]. The geometry of the read is fixed.
-    #[cfg(feature = "onboard")]
-    onboard_slot: u8,
 }
 
 impl Apex7 {
@@ -61,11 +58,7 @@ impl Apex7 {
 
     /// Create from a generic keyboard.
     pub fn new(keyboard: GenericKeyboard) -> Self {
-        Self {
-            inner: keyboard,
-            #[cfg(feature = "onboard")]
-            onboard_slot: 0,
-        }
+        Self { inner: keyboard }
     }
 
     /// Whether this device's product ID is on the platform the read was reverse-engineered from.
@@ -75,20 +68,7 @@ impl Apex7 {
         onboard_family(self.inner.info().product_id)
     }
 
-    /// Slot [`Apex7::read_profile_slot`] reads.
-    #[cfg(feature = "onboard")]
-    #[must_use]
-    pub fn onboard_slot(&self) -> u8 {
-        self.onboard_slot
-    }
-
-    /// Set the slot [`Apex7::read_profile_slot`] reads.
-    #[cfg(feature = "onboard")]
-    pub fn set_onboard_slot(&mut self, slot: u8) {
-        self.onboard_slot = slot;
-    }
-
-    /// Read one on-board profile slot (slots `0..=4`; the rest of the read is fixed geometry).
+    /// Read one on-board profile slot (slots `0..=4`; everything else about the read is fixed geometry).
     ///
     /// # Errors
     ///
@@ -97,16 +77,6 @@ impl Apex7 {
     #[cfg(feature = "onboard")]
     pub async fn read_profile(&self, profile: u8) -> Result<ProfileImage> {
         apex_legacy_onboard::read_profile(&self.inner, profile, false).await
-    }
-
-    /// Reads the slot this device's [`Apex7::onboard_slot`] selects.
-    ///
-    /// # Errors
-    ///
-    /// As [`Apex7::read_profile`].
-    #[cfg(feature = "onboard")]
-    pub async fn read_profile_slot(&self) -> Result<ProfileImage> {
-        self.read_profile(self.onboard_slot).await
     }
 }
 
@@ -232,16 +202,13 @@ mod tests {
         }
 
         #[test]
-        fn the_device_starts_on_slot_zero() {
-            let mut keyboard = device_without_handle(product_ids::APEX_7);
-            assert_eq!(keyboard.onboard_slot(), 0);
+        fn a_read_asks_for_the_slot_it_names() {
+            // The device carries no slot state: the slot is an argument, and slot 0 is the file the
+            // capture read.
             assert_eq!(
-                crate::onboard_profile::profile_file_id(keyboard.onboard_slot()),
-                crate::onboard_profile::PROFILE_FS_BASE,
-                "slot 0 is the profile file the capture read"
+                crate::onboard_profile::profile_file_id(0),
+                crate::onboard_profile::PROFILE_FS_BASE
             );
-            keyboard.set_onboard_slot(4);
-            assert_eq!(keyboard.onboard_slot(), 4);
             assert_eq!(crate::onboard_profile::profile_file_id(4), 0x0205);
         }
     }
