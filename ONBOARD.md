@@ -19,7 +19,7 @@ Moved from `PLAN.md`:
 
 Implemented 2026-10-15 from the 2026-10-15 GG capture: GG's six-frame opening chain (`90 00`,
 `90 01`, `f4 00`, `6c 00 01`, `90 00`, `90 01` - the `90` poll answers the firmware version), `0x85`
-pulls, `0x83` payload reads, checksum, payload decode, `ssgg onboard plan|read|decode`. The 13-byte
+pulls, `0x83` payload reads, checksum, payload decode, `ssgg onboard read|decode`. The 13-byte
 "pacing frame" earlier versions sent is not in the capture and was removed. Every protocol byte in it is
 `[EXPERIMENTAL]` - nothing has been replayed on hardware. Read-only by design: the push command is named
 and never sent. Wire format, layout table and open questions: `docs/development/apex-7-onboard-profile-read.md`.
@@ -94,11 +94,11 @@ run sent none, so it collected nothing but 64-byte interrupt status. That is ste
 | Piece | Where |
 |-------|-------|
 | Wire types: `0x85` pull, `0x83` read, `0x03` init chain, the pacing frame `0x01 0x00 00 02 00 f4 01 60 00`, the 643-byte read buffer | `src/devices/hid_reports.rs` (`OnboardPullCommand`, `OnboardReadCommand`, `OnboardInitCommand`, `ONBOARD_INIT_CHAIN`) — not feature-gated, no raw byte arrays outside it |
-| Read geometry, reply parsing, assembly, decode | `src/onboard_profile.rs` (`ReadConfig` with `pull_frames` / `read_frames` / `reads_per_pull`, `parse_read_reply`, `ProfileImage`, `decode`), feature `onboard`. No transfer-sequence type: the read loop walks pulls and reads directly and the frames come from the typed commands |
+| Read geometry, reply parsing, assembly, decode | `src/onboard_profile.rs` (`ReadConfig`, `reads_per_pull`, `parse_read_reply`, `ProfileImage`, `decode`), feature `onboard`. No transfer-sequence type and no plan printer: the read loop walks pulls and reads directly and builds every frame from the typed commands |
 | Packet I/O | `src/devices/keyboards/mod.rs`: `GenericKeyboard` does the profile packet I/O on the `device` handle it already owns - `profile_device`, `packet_label`, `write_profile_packet`, `send_profile_feature_packet`, `read_profile_feature_packet`, `read_profile_input_packet` (feature `onboard`); `apex_legacy_onboard` runs the read plan against `&GenericKeyboard`. No transport type: `OnboardTransport` with its `HandleTransport` and `PathTransport`, and the per-call path-open helpers (`send_feature_report_raw`, `read_feature_report_raw`, `write_output_report_raw`, `read_input_report_raw`) were all removed on 2026-10-17; Apex 7 wired works through hidapi |
 | Keyboard device | `src/devices/keyboards/apex7.rs`: `Apex7` wraps `GenericKeyboard` (its `HidReportBuilder` and the open `HidDevice`) and runs the read on its own handle; `onboard_family(pid)` selects `0x1612`, `0x1614`, `0x1616`, `0x1618` and `discovery::open_keyboard` wraps those PIDs in it **with or without the `onboard` feature** — only the read (`read_profile`, the transport, the read plan) is gated, so a family board keeps standard lighting in a default build |
 | Device API | `Keyboard::supports_onboard_profile`, `Keyboard::read_onboard_profile` (feature `onboard`, `[EXPERIMENTAL]`); every other keyboard answers "not supported" |
-| CLI | `ssgg onboard plan / read / decode` (`src/cli.rs`, `src/main.rs`); `plan` prints the geometry of a read (pulls, payload reads, opening-chain frames, file ids, pacing, reply anchor) and touches no hardware, `read` runs on the `Apex7` device (its own handle, `--device vid:pid` selects the keyboard), and fails with a clear message when the target is not on the family |
+| CLI | `ssgg onboard read / decode` (`src/cli.rs`, `src/main.rs`); `read` runs on the `Apex7` device (its own handle, `--device vid:pid` selects the keyboard), fails with a clear message when the target is not on the family, and prints the geometry it is about to run (slot, file id, pulls, payload reads, pacing, reply anchor); `decode` works on a saved image and touches no device |
 
 Two facts from the first Linux run (2026-10-15, Apex 7 `/dev/hidraw3`) that shape the transport:
 

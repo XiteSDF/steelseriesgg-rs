@@ -97,10 +97,10 @@ for each chunk c in 0..12:
 12 pulls of 1024 bytes cover 12288 bytes, enough for the 11648-byte schema A payload and the
 11696-byte schema B payload. A schema-only read is the opening chain, one 2-byte pull of the file head
 and one 2-byte read (GG's own probe, kept in the transfer map; `ssgg onboard` has no schema-probing mode).
-`ssgg onboard plan` prints the geometry (pulls, payload reads, opening-chain frames, file ids, pacing,
-reply anchor) and `ssgg onboard read --yes` runs the whole read; frames are built per chunk from the typed
-commands - no transfer list is materialised ahead of the wire (`Step`, `StepKind`, `ReadConfig::steps()`,
-`init_steps()` and `plan_json` were removed 2026-10-17).
+`ssgg onboard read --yes` runs the whole read and prints its geometry first (slot, file id, pulls, payload
+reads, pacing, reply anchor); frames are built per chunk from the typed commands, nothing materialises a
+transfer list (`Step`, `StepKind`, `ReadConfig::steps()`, `init_steps()`, `plan_json` and the `onboard plan`
+subcommand were removed 2026-10-17).
 The reply framing length is `--reply-header` (default 0, the offset the capture's replies show); skip
 the chain itself with `--no-init-chain`.
 
@@ -188,8 +188,7 @@ carries a schema word the decoder knows; `ssgg onboard read --reply-header N` as
 Read-only code. `ssgg onboard` writes nothing to the keyboard: the push command (`0x05`) is named in
 `src/onboard_profile.rs` for completeness and nothing sends it. Do not add profile writes: the
 profile blob contains blocks this layout does not explain, and writing a synthetic blob can put the
-keyboard in a state GG itself cannot repair. `read` and `schema` require `--yes`; `plan` and
-`decode` never touch a device.
+keyboard in a state GG itself cannot repair. `read` requires `--yes`; `decode` never touches a device.
 
 ## What is not settled
 

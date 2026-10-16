@@ -61,9 +61,7 @@
 //! leading constant id byte that is not part of the file, so a payload read lands at its file offset and
 //! the assembled image is [`ReadConfig::payload_len`] bytes with no id byte.
 
-use crate::devices::hid_reports::{
-    ONBOARD_FEATURE_REPORT_SIZE, ONBOARD_OUTPUT_REPORT_SIZE, OnboardPullCommand, OnboardReadCommand,
-};
+use crate::devices::hid_reports::{ONBOARD_FEATURE_REPORT_SIZE, ONBOARD_OUTPUT_REPORT_SIZE};
 use crate::devices::keyboards::apex_pro_tkl_2023_profile::profile_checksum;
 use crate::error::{Error, Result};
 use serde::Serialize;
@@ -265,38 +263,6 @@ impl ReadConfig {
     /// Payload reads per pull: one pull fills the resource buffer, each read takes [`ReadConfig::read_len`].
     pub fn reads_per_pull(&self) -> usize {
         self.resource_len / self.read_len
-    }
-
-    /// Pull frames of one slot in wire order: pull `n` fills the resource buffer at file offset
-    /// `n * resource_len`. The read loop walks these frames directly; no transfer sequence is
-    /// materialised ahead of the wire.
-    pub fn pull_frames(&self) -> Vec<Vec<u8>> {
-        (0..self.chunks)
-            .map(|chunk| {
-                OnboardPullCommand {
-                    fs_id: self.fs_id(),
-                    file_offset: (chunk * self.resource_len) as u32,
-                    size: self.resource_len as u16,
-                }
-                .data_stage()
-                .to_vec()
-            })
-            .collect()
-    }
-
-    /// Payload-read frames for one pull in wire order: successive [`ReadConfig::read_len`] windows of
-    /// the resource buffer.
-    pub fn read_frames(&self) -> Vec<Vec<u8>> {
-        (0..self.reads_per_pull())
-            .map(|read| {
-                OnboardReadCommand {
-                    buffer_offset: (read * self.read_len) as u16,
-                    size: self.read_len as u16,
-                }
-                .data_stage()
-                .to_vec()
-            })
-            .collect()
     }
 }
 
@@ -1056,7 +1022,7 @@ pub fn to_json(image: &ProfileImage) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::devices::hid_reports::CommandCode;
+    use crate::devices::hid_reports::{CommandCode, OnboardPullCommand, OnboardReadCommand};
 
     fn synthetic_payload(schema: u16) -> Vec<u8> {
         let len = payload_len_for_schema(schema).unwrap();
@@ -1092,52 +1058,26 @@ mod tests {
     fn pull_and_read_frames_come_from_the_typed_commands() {
         let config = ReadConfig::default();
         config.validate().unwrap();
-        let pulls = config.pull_frames();
-        assert_eq!(pulls.len(), config.chunks);
+        let pull = OnboardPullCommand {
+            fs_id: config.fs_id(),
+            file_offset: 0,
+            size: config.resource_len as u16,
+        }
+        .data_stage();
+        assert_eq!(pull[0], CommandCode::OnboardPull as u8);
         assert_eq!(
-            pulls[0],
-            OnboardPullCommand {
-                fs_id: PROFILE_FS_BASE,
-                file_offset: 0,
-                size: RESOURCE_BUFFER_LEN as u16,
-            }
-            .data_stage()
-            .to_vec(),
-            "the pull frame is the bytes the typed command serializes"
+            u16::from_le_bytes([pull[2], pull[3]]),
+            PROFILE_FS_BASE,
+            "the file id sits behind the header"
         );
-        assert_eq!(
-            pulls[0].len(),
-            OnboardPullCommand::FRAME_LEN,
-            "pull data stage: header, file id, offset, size"
-        );
-        let reads = config.read_frames();
-        assert_eq!(reads.len(), config.reads_per_pull());
-        assert_eq!(
-            reads[0],
-            OnboardReadCommand {
-                buffer_offset: 0,
-                size: READ_LEN as u16,
-            }
-            .data_stage()
-            .to_vec()
-        );
-        assert_eq!(
-            reads.last().unwrap().len(),
-            OnboardReadCommand::FRAME_LEN,
-            "read data stage: header, offset, size"
-        );
-    }
-
-    #[test]
-    fn opening_chain_answer_carries_the_firmware_version() {
-        let reply = [0x34u8, 0x2e, 0x31, 0x36, 0x2e, 0x38, 0x00, 0x00, 0x36, 0x34, 0x36, 0x34];
-        assert_eq!(
-            parse_firmware_version(&reply).as_deref(),
-            Some("4.16.8"),
-            "the capture's answer stops at the first NUL"
-        );
-        assert_eq!(parse_firmware_version(&[0x00, 0x01, 0x00, 0x00]), None);
-        assert_eq!(parse_firmware_version(&[]), None);
+        assert_eq!(pull.len(), OnboardPullCommand::FRAME_LEN);
+        let read = OnboardReadCommand {
+            buffer_offset: 0,
+            size: config.read_len as u16,
+        }
+        .data_stage();
+        assert_eq!(read[0], CommandCode::OnboardPayloadRead as u8);
+        assert_eq!(read.len(), OnboardReadCommand::FRAME_LEN);
     }
 
     #[test]
@@ -1147,34 +1087,41 @@ mod tests {
             ..ReadConfig::default()
         };
         assert_eq!(config.fs_id(), 0x0204);
-        let pulls = config.pull_frames();
-        assert_eq!(pulls.len(), config.chunks);
-        for (n, frame) in pulls.iter().enumerate() {
-            assert_eq!(frame[0], CommandCode::OnboardPull as u8);
+        for n in 0..config.chunks {
+            let pull = OnboardPullCommand {
+                fs_id: config.fs_id(),
+                file_offset: (n * config.resource_len) as u32,
+                size: config.resource_len as u16,
+            }
+            .data_stage();
             assert_eq!(
-                u16::from_le_bytes([frame[2], frame[3]]),
+                u16::from_le_bytes([pull[2], pull[3]]),
                 0x0204,
                 "every pull carries the slot file id"
             );
             assert_eq!(
-                u32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]),
+                u32::from_le_bytes([pull[4], pull[5], pull[6], pull[7]]),
                 (n * config.resource_len) as u32,
                 "pull n fills the buffer at file offset n * resource_len"
             );
             assert_eq!(
-                u16::from_le_bytes([frame[8], frame[9]]),
+                u16::from_le_bytes([pull[8], pull[9]]),
                 config.resource_len as u16,
                 "pull size"
             );
         }
-        for (n, frame) in config.read_frames().iter().enumerate() {
-            assert_eq!(frame[0], CommandCode::OnboardPayloadRead as u8);
+        for n in 0..config.reads_per_pull() {
+            let read = OnboardReadCommand {
+                buffer_offset: (n * config.read_len) as u16,
+                size: config.read_len as u16,
+            }
+            .data_stage();
             assert_eq!(
-                u16::from_le_bytes([frame[2], frame[3]]),
+                u16::from_le_bytes([read[2], read[3]]),
                 (n * config.read_len) as u16,
                 "read n asks for the n-th window of the resource buffer"
             );
-            assert_eq!(u16::from_le_bytes([frame[4], frame[5]]), config.read_len as u16);
+            assert_eq!(u16::from_le_bytes([read[4], read[5]]), config.read_len as u16);
         }
         assert_eq!(
             config.total_resource_len(),

@@ -51,7 +51,7 @@ use crate::cli::{SonarAction, StreamerAction, parse_sonar_channel};
 use crate::cli::OnboardAction;
 
 #[cfg(feature = "onboard")]
-use steelseries_gg::onboard_profile::{ReadConfig, decode, hex_of};
+use steelseries_gg::onboard_profile::decode;
 
 #[cfg(feature = "audio")]
 use steelseries_gg::audio::AudioMixer;
@@ -817,12 +817,6 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
     use steelseries_gg::onboard_profile::{hex_dump, profile_json, schema_of, to_json};
 
     match action {
-        OnboardAction::Plan(wire_args) => {
-            let config = wire_args.to_config();
-            config.validate()?;
-            print_plan_summary(&config);
-        }
-
         OnboardAction::Read(args) => {
             let config = args.wire.to_config();
             config.validate()?;
@@ -986,33 +980,6 @@ fn print_onboard_banner() {
     println!("  reverse-engineered from one GG USBPcap capture, never replayed from this crate; reads only.");
     println!("  watch the keyboard while it runs: if lighting flickers, Ctrl-C stops the read.");
     println!();
-}
-
-#[cfg(feature = "onboard")]
-fn print_plan_summary(config: &ReadConfig) {
-    use steelseries_gg::devices::hid_reports::ONBOARD_INIT_CHAIN;
-
-    let pulls = config.chunks;
-    let reads = pulls * config.reads_per_pull();
-    let init = usize::from(config.send_init_chain) * ONBOARD_INIT_CHAIN.len();
-
-    println!();
-    println!(
-        "plan: {pulls} pull(s), {} payload read(s), {init} opening-chain frame(s)",
-        reads
-    );
-    println!("first pull:  {}", hex_of(&config.pull_frames()[0]));
-    println!("first read:  {}", hex_of(&config.read_frames()[0]));
-    println!(
-        "file ids {:#06X} .. {:#06X} (slot {}), {} bytes pulled for {} payload bytes, {} ms pacing, reply payload anchored at byte {}",
-        config.fs_base,
-        config.fs_base + u16::from(config.profile),
-        config.profile,
-        config.total_resource_len(),
-        config.payload_len,
-        config.gap_ms,
-        config.reply_header
-    );
 }
 
 #[cfg(feature = "onboard")]
