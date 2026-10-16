@@ -29,7 +29,8 @@
 //!   `6c 00 01` and then `90 00`, `90 01` again, 11 ms apart. The two `0x90` polls are answered on the
 //!   interrupt endpoint with the ASCII firmware version (`34 2e 31 36 2e 38 00…` = `4.16.8`, see
 //!   [`parse_firmware_version]), `f4 00` is answered with `00 01 00…`, and `6c 00 01` is not answered at
-//!   all. The meanings of `0xf4` and `0x6c` are unknown. See [`ONBOARD_INIT_CHAIN`]. The capture
+//!   all. The meanings of `0xf4` and `0x6c` are unknown. See
+//!   [`crate::devices::hid_reports::ONBOARD_INIT_CHAIN`]. The capture
 //!   contains no
 //!   13-byte transfer anywhere, so the pacing frame earlier versions of this module sent is not part of
 //!   GG's read.
@@ -57,11 +58,11 @@
 //! [`SCHEMA_A`].
 //!
 //! The payload starts at file offset 0 with the schema word; the engine's payload structs carry one
-//! leading constant id byte that is not part of the file, so `dest` in [`Step`] is the file offset and
+//! leading constant id byte that is not part of the file, so a payload read lands at its file offset and
 //! the assembled image is [`ReadConfig::payload_len`] bytes with no id byte.
 
 use crate::devices::hid_reports::{
-    ONBOARD_FEATURE_REPORT_SIZE, ONBOARD_INIT_CHAIN, ONBOARD_OUTPUT_REPORT_SIZE, OnboardPullCommand, OnboardReadCommand,
+    ONBOARD_FEATURE_REPORT_SIZE, ONBOARD_OUTPUT_REPORT_SIZE, OnboardPullCommand, OnboardReadCommand,
 };
 use crate::devices::keyboards::apex_pro_tkl_2023_profile::profile_checksum;
 use crate::error::{Error, Result};
@@ -161,53 +162,6 @@ pub fn parse_firmware_version(reply: &[u8]) -> Option<String> {
 /// full 642, so 636 is the ceiling both shapes agree on.
 pub const MAX_READ_LEN: usize = READ_REPORT_LEN - 1 - READ_REPLY_HEADER_LEN;
 
-/// One entry of the read sequence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct Step {
-    /// Transfer kind.
-    pub kind: StepKind,
-    /// Pull this step belongs to (`0` for the opening chain).
-    pub chunk: usize,
-    /// Frame bytes after the report ID byte.
-    pub frame: Vec<u8>,
-    /// Total report length on the wire, report ID byte included.
-    pub wire_len: usize,
-    /// Report ID expected in the reply, `None` for transfers GG does not read back. The opening-chain
-    /// answers are interrupt reports whose first byte is payload, not a report ID.
-    pub reply_report_id: Option<u8>,
-    /// Reply report length to read, report ID byte included.
-    pub reply_len: Option<usize>,
-    /// File offset the payload of a read lands at; `None` for pulls and opening-chain frames.
-    pub dest: Option<usize>,
-    /// Resource-buffer offset a read asks for; `None` for pulls and opening-chain frames.
-    pub buffer_offset: Option<u16>,
-    /// Payload size requested by a read.
-    pub size: u16,
-}
-
-/// Transfer kind of a [`Step`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StepKind {
-    /// One frame of the opening chain (output report, 64 data bytes, 65-byte report buffer).
-    Init,
-    /// Pull into the resource buffer (output report, 65 bytes).
-    Pull,
-    /// Payload read out of the resource buffer (feature report, 643 bytes).
-    Read,
-}
-
-impl std::fmt::Display for StepKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self {
-            StepKind::Init => "init",
-            StepKind::Pull => "pull",
-            StepKind::Read => "read",
-        };
-        f.write_str(name)
-    }
-}
-
 /// Parameters of one profile read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ReadConfig {
@@ -225,7 +179,8 @@ pub struct ReadConfig {
     pub payload_len: usize,
     /// Pacing between our transfers, in milliseconds.
     pub gap_ms: u64,
-    /// Send [`ONBOARD_INIT_CHAIN`] before the pull loop. GG always runs it; turning it off is a probe.
+    /// Send [`crate::devices::hid_reports::ONBOARD_INIT_CHAIN`] before the pull loop. GG always runs it;
+    /// turning it off is a probe.
     pub send_init_chain: bool,
     /// Framing bytes between the report-ID byte and the payload of a payload-read reply;
     /// [`READ_REPLY_FRAMING_LEN`] (0) matches the 2026-10-15 capture, 5 suits a keyboard that echoes
@@ -307,76 +262,42 @@ impl ReadConfig {
         Ok(())
     }
 
-    /// Full transfer sequence for one profile read, in wire order.
-    pub fn steps(&self) -> Vec<Step> {
-        let mut steps =
-            Vec::with_capacity(ONBOARD_INIT_CHAIN.len() + 1 + self.chunks * (1 + self.resource_len / self.read_len));
-        if self.send_init_chain {
-            steps.extend(init_steps());
-        }
-        let reads_per_pull = self.resource_len / self.read_len;
-        for chunk in 0..self.chunks {
-            let file_offset = chunk * self.resource_len;
-            steps.push(Step {
-                kind: StepKind::Pull,
-                chunk,
-                frame: OnboardPullCommand {
+    /// Payload reads per pull: one pull fills the resource buffer, each read takes [`ReadConfig::read_len`].
+    pub fn reads_per_pull(&self) -> usize {
+        self.resource_len / self.read_len
+    }
+
+    /// Pull frames of one slot in wire order: pull `n` fills the resource buffer at file offset
+    /// `n * resource_len`. The read loop walks these frames directly; no transfer sequence is
+    /// materialised ahead of the wire.
+    pub fn pull_frames(&self) -> Vec<Vec<u8>> {
+        (0..self.chunks)
+            .map(|chunk| {
+                OnboardPullCommand {
                     fs_id: self.fs_id(),
-                    file_offset: file_offset as u32,
+                    file_offset: (chunk * self.resource_len) as u32,
                     size: self.resource_len as u16,
                 }
                 .data_stage()
-                .to_vec(),
-                wire_len: PULL_REPORT_LEN,
-                reply_report_id: Some(PULL_REPLY_REPORT_ID),
-                reply_len: Some(INIT_REPLY_LEN),
-                dest: None,
-                buffer_offset: None,
-                size: self.resource_len as u16,
-            });
-            for read in 0..reads_per_pull {
-                let buffer_offset = read * self.read_len;
-                steps.push(Step {
-                    kind: StepKind::Read,
-                    chunk,
-                    frame: OnboardReadCommand {
-                        buffer_offset: buffer_offset as u16,
-                        size: self.read_len as u16,
-                    }
-                    .data_stage()
-                    .to_vec(),
-                    wire_len: READ_REPORT_LEN,
-                    reply_report_id: Some(REQUEST_REPORT_ID),
-                    reply_len: Some(READ_REPORT_LEN),
-                    dest: Some(file_offset + buffer_offset),
-                    buffer_offset: Some(buffer_offset as u16),
-                    size: self.read_len as u16,
-                });
-            }
-        }
-        steps
+                .to_vec()
+            })
+            .collect()
     }
-}
 
-/// The opening chain as plan steps: every [`ONBOARD_INIT_CHAIN`] frame as a 64-data-byte output
-/// report. The
-/// answers GG reads back are interrupt reports whose first byte is payload, so no reply report ID is
-/// claimed for them.
-fn init_steps() -> Vec<Step> {
-    ONBOARD_INIT_CHAIN
-        .iter()
-        .map(|frame| Step {
-            kind: StepKind::Init,
-            chunk: 0,
-            frame: frame.data_stage().to_vec(),
-            wire_len: INIT_REPORT_LEN,
-            reply_report_id: None,
-            reply_len: frame.expects_reply.then_some(INIT_REPLY_LEN),
-            dest: None,
-            buffer_offset: None,
-            size: 0,
-        })
-        .collect()
+    /// Payload-read frames for one pull in wire order: successive [`ReadConfig::read_len`] windows of
+    /// the resource buffer.
+    pub fn read_frames(&self) -> Vec<Vec<u8>> {
+        (0..self.reads_per_pull())
+            .map(|read| {
+                OnboardReadCommand {
+                    buffer_offset: (read * self.read_len) as u16,
+                    size: self.read_len as u16,
+                }
+                .data_stage()
+                .to_vec()
+            })
+            .collect()
+    }
 }
 
 /// Parsed header of a payload-read reply.
@@ -1132,31 +1053,6 @@ pub fn to_json(image: &ProfileImage) -> Result<String> {
     serde_json::to_string_pretty(&value).map_err(|e| Error::Profile(format!("serialize profile image: {e}")))
 }
 
-/// JSON representation of a read plan.
-pub fn plan_json(config: &ReadConfig) -> Result<String> {
-    let steps = config.steps();
-    let value = json!({
-        "profile_slot": config.profile,
-        "fs_id": format!("0x{:04X}", config.fs_id()),
-        "pulls": config.chunks,
-        "resource_buffer_len": config.resource_len,
-        "read_len": config.read_len,
-        "payload_len": config.payload_len,
-        "covered_len": config.total_resource_len(),
-        "gap_ms": config.gap_ms,
-        "reply_framing_len": config.reply_header,
-        "init_chain": {
-            "sent": config.send_init_chain,
-            "frames": ONBOARD_INIT_CHAIN
-            .iter()
-            .map(|f| hex_of(&f.data_stage()))
-            .collect::<Vec<String>>(),
-        },
-        "transfers": steps,
-    });
-    serde_json::to_string_pretty(&value).map_err(|e| Error::Profile(format!("serialize read plan: {e}")))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1193,13 +1089,13 @@ mod tests {
     }
 
     #[test]
-    fn plan_frames_come_from_the_typed_commands() {
+    fn pull_and_read_frames_come_from_the_typed_commands() {
         let config = ReadConfig::default();
         config.validate().unwrap();
-        let steps = config.steps();
-        let pull = steps.iter().find(|s| s.kind == StepKind::Pull).unwrap();
+        let pulls = config.pull_frames();
+        assert_eq!(pulls.len(), config.chunks);
         assert_eq!(
-            pull.frame,
+            pulls[0],
             OnboardPullCommand {
                 fs_id: PROFILE_FS_BASE,
                 file_offset: 0,
@@ -1207,12 +1103,17 @@ mod tests {
             }
             .data_stage()
             .to_vec(),
-            "the plan frame is the bytes the typed command serializes"
+            "the pull frame is the bytes the typed command serializes"
         );
-        assert_eq!(pull.wire_len, PULL_REPORT_LEN);
-        let read = steps.iter().find(|s| s.kind == StepKind::Read).unwrap();
         assert_eq!(
-            read.frame,
+            pulls[0].len(),
+            OnboardPullCommand::FRAME_LEN,
+            "pull data stage: header, file id, offset, size"
+        );
+        let reads = config.read_frames();
+        assert_eq!(reads.len(), config.reads_per_pull());
+        assert_eq!(
+            reads[0],
             OnboardReadCommand {
                 buffer_offset: 0,
                 size: READ_LEN as u16,
@@ -1220,11 +1121,10 @@ mod tests {
             .data_stage()
             .to_vec()
         );
-        assert_eq!(read.wire_len, READ_REPORT_LEN);
         assert_eq!(
-            steps[3].frame,
-            ONBOARD_INIT_CHAIN[3].data_stage().to_vec(),
-            "the opening-chain frames come from the same source"
+            reads.last().unwrap().len(),
+            OnboardReadCommand::FRAME_LEN,
+            "read data stage: header, offset, size"
         );
     }
 
@@ -1241,56 +1141,45 @@ mod tests {
     }
 
     #[test]
-    fn plan_is_init_chain_then_pull_read_read() {
-        let config = ReadConfig::default();
-        config.validate().unwrap();
-        let steps = config.steps();
-        assert_eq!(steps.len(), ONBOARD_INIT_CHAIN.len() + 12 * 3);
-        assert!(
-            steps[..ONBOARD_INIT_CHAIN.len()]
-                .iter()
-                .all(|s| s.kind == StepKind::Init),
-            "the read opens with GG's chain"
-        );
-        assert_eq!(steps[0].wire_len, INIT_REPORT_LEN, "64 data bytes plus report ID");
-        assert_eq!(steps[3].frame[0], CommandCode::OpenFiles as u8);
-        assert_eq!(steps[3].reply_len, None, "6c is not answered");
-        assert_eq!(steps[ONBOARD_INIT_CHAIN.len()].kind, StepKind::Pull);
-        assert_eq!(steps[ONBOARD_INIT_CHAIN.len() + 1].kind, StepKind::Read);
-        assert_eq!(steps[ONBOARD_INIT_CHAIN.len() + 2].kind, StepKind::Read);
-        let no_chain = ReadConfig {
-            send_init_chain: false,
-            ..ReadConfig::default()
-        };
-        assert_eq!(no_chain.steps().len(), 12 * 3);
-        assert_eq!(steps[7].dest, Some(0));
-        assert_eq!(steps[8].dest, Some(512));
-        assert_eq!(steps[10].dest, Some(1024));
-        let last = steps.last().unwrap();
-        assert_eq!(last.kind, StepKind::Read);
-        assert_eq!(last.dest, Some(11 * 1024 + 512));
-        assert_eq!(last.dest.unwrap() + usize::from(last.size), 12_288);
-        let pulls: Vec<usize> = steps
-            .iter()
-            .filter(|s| s.kind == StepKind::Pull)
-            .map(|s| u32::from_le_bytes([s.frame[4], s.frame[5], s.frame[6], s.frame[7]]) as usize)
-            .collect();
-        assert_eq!(pulls, (0..12).map(|i| i * 1024).collect::<Vec<usize>>());
-    }
-
-    #[test]
-    fn plan_targets_the_profile_file_id() {
+    fn pulls_walk_the_resource_buffer_and_carry_the_slot_file_id() {
         let config = ReadConfig {
             profile: 3,
             ..ReadConfig::default()
         };
         assert_eq!(config.fs_id(), 0x0204);
-        let steps = config.steps();
-        let pull = steps.iter().find(|s| s.kind == StepKind::Pull).unwrap();
+        let pulls = config.pull_frames();
+        assert_eq!(pulls.len(), config.chunks);
+        for (n, frame) in pulls.iter().enumerate() {
+            assert_eq!(frame[0], CommandCode::OnboardPull as u8);
+            assert_eq!(
+                u16::from_le_bytes([frame[2], frame[3]]),
+                0x0204,
+                "every pull carries the slot file id"
+            );
+            assert_eq!(
+                u32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]),
+                (n * config.resource_len) as u32,
+                "pull n fills the buffer at file offset n * resource_len"
+            );
+            assert_eq!(
+                u16::from_le_bytes([frame[8], frame[9]]),
+                config.resource_len as u16,
+                "pull size"
+            );
+        }
+        for (n, frame) in config.read_frames().iter().enumerate() {
+            assert_eq!(frame[0], CommandCode::OnboardPayloadRead as u8);
+            assert_eq!(
+                u16::from_le_bytes([frame[2], frame[3]]),
+                (n * config.read_len) as u16,
+                "read n asks for the n-th window of the resource buffer"
+            );
+            assert_eq!(u16::from_le_bytes([frame[4], frame[5]]), config.read_len as u16);
+        }
         assert_eq!(
-            u16::from_le_bytes([pull.frame[2], pull.frame[3]]),
-            0x0204,
-            "the pull frame carries the file id"
+            config.total_resource_len(),
+            DEFAULT_CHUNKS * RESOURCE_BUFFER_LEN,
+            "the default geometry covers the payload of the reference capture"
         );
     }
 
@@ -1602,16 +1491,6 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(value["schema_decoded"], "b");
         assert_eq!(value["data_len"], PAYLOAD_LEN_B);
-
-        let plan = plan_json(&ReadConfig::default()).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&plan).unwrap();
-        assert_eq!(value["pulls"], 12);
-        assert_eq!(value["transfers"].as_array().unwrap().len(), 42);
-        assert_eq!(value["reply_framing_len"], READ_REPLY_FRAMING_LEN);
-        assert!(
-            value["init_chain"]["sent"].as_bool().unwrap_or(false),
-            "the plan starts with the opening chain"
-        );
     }
 
     #[test]

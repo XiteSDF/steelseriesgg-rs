@@ -339,7 +339,7 @@ The code reads only: it never writes the on-board profile. Format and open quest
 ```bash
 cargo build --release --features onboard
 
-# no hardware touched: prints the 37-transfer plan of one profile read
+# no hardware touched: geometry of one profile read (pulls, payload reads, file ids, pacing)
 ssgg onboard plan
 
 # no hardware touched: decode a profile image saved by an earlier read
