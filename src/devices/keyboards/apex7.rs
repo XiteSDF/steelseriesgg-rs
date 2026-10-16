@@ -27,7 +27,7 @@ use crate::devices::zone_mapping::{ZoneEffect, ZoneMapping};
 use crate::devices::{Device, DeviceType};
 use crate::error::Result;
 #[cfg(feature = "onboard")]
-use crate::onboard_profile::{ProfileImage, ReadConfig};
+use crate::onboard_profile::ProfileImage;
 use crate::rgb::{Color, PerKeyEffect};
 
 /// Apex 7 and the boards of its platform that take the on-board profile protocol.
@@ -50,8 +50,9 @@ pub fn onboard_family(product_id: u16) -> bool {
 /// built with `onboard`: the device class is part of the device tree, only the read is feature-gated.
 pub struct Apex7 {
     inner: GenericKeyboard,
+    /// Slot read by [`Apex7::read_profile_slot`]. The geometry of the read is fixed.
     #[cfg(feature = "onboard")]
-    onboard: ReadConfig,
+    onboard_slot: u8,
 }
 
 impl Apex7 {
@@ -63,7 +64,7 @@ impl Apex7 {
         Self {
             inner: keyboard,
             #[cfg(feature = "onboard")]
-            onboard: ReadConfig::default(),
+            onboard_slot: 0,
         }
     }
 
@@ -74,38 +75,38 @@ impl Apex7 {
         onboard_family(self.inner.info().product_id)
     }
 
-    /// Read plan this device uses when the caller does not pass one.
+    /// Slot [`Apex7::read_profile_slot`] reads.
     #[cfg(feature = "onboard")]
     #[must_use]
-    pub fn onboard_config(&self) -> &ReadConfig {
-        &self.onboard
+    pub fn onboard_slot(&self) -> u8 {
+        self.onboard_slot
     }
 
-    /// Replace the read plan (slot, geometry, pacing, reply framing).
+    /// Set the slot [`Apex7::read_profile_slot`] reads.
     #[cfg(feature = "onboard")]
-    pub fn set_onboard_config(&mut self, config: ReadConfig) {
-        self.onboard = config;
+    pub fn set_onboard_slot(&mut self, slot: u8) {
+        self.onboard_slot = slot;
     }
 
-    /// Reads one on-board profile slot with an explicit plan.
+    /// Read one on-board profile slot (slots `0..=4`; the rest of the read is fixed geometry).
     ///
     /// # Errors
     ///
-    /// Returns an error when the plan is invalid, the collection rejects a frame, or it never answers
-    /// a payload read.
+    /// Returns an error when the slot is out of range, the collection rejects a frame, or it never
+    /// answers a payload read.
     #[cfg(feature = "onboard")]
-    pub async fn read_profile(&self, config: &ReadConfig) -> Result<ProfileImage> {
-        apex_legacy_onboard::read_profile(&self.inner, config, false).await
+    pub async fn read_profile(&self, profile: u8) -> Result<ProfileImage> {
+        apex_legacy_onboard::read_profile(&self.inner, profile, false).await
     }
 
-    /// Reads the slot this device's [`Apex7::onboard_config`] selects.
+    /// Reads the slot this device's [`Apex7::onboard_slot`] selects.
     ///
     /// # Errors
     ///
     /// As [`Apex7::read_profile`].
     #[cfg(feature = "onboard")]
     pub async fn read_profile_slot(&self) -> Result<ProfileImage> {
-        self.read_profile(&self.onboard.clone()).await
+        self.read_profile(self.onboard_slot).await
     }
 }
 
@@ -163,8 +164,8 @@ crate::impl_keyboard_with_delegation!(Apex7, {
     }
 
     #[cfg(feature = "onboard")]
-    async fn read_onboard_profile(&self, config: &ReadConfig) -> Result<ProfileImage> {
-        self.read_profile(config).await
+    async fn read_onboard_profile(&self, profile: u8) -> Result<ProfileImage> {
+        self.read_profile(profile).await
     }
 });
 
@@ -231,11 +232,17 @@ mod tests {
         }
 
         #[test]
-        fn the_device_starts_on_the_captured_read_plan() {
-            let keyboard = device_without_handle(product_ids::APEX_7);
-            let config = keyboard.onboard_config();
-            assert_eq!(config.fs_id(), crate::onboard_profile::PROFILE_FS_BASE);
-            assert_eq!(config.total_resource_len(), 12_288);
+        fn the_device_starts_on_slot_zero() {
+            let mut keyboard = device_without_handle(product_ids::APEX_7);
+            assert_eq!(keyboard.onboard_slot(), 0);
+            assert_eq!(
+                crate::onboard_profile::profile_file_id(keyboard.onboard_slot()),
+                crate::onboard_profile::PROFILE_FS_BASE,
+                "slot 0 is the profile file the capture read"
+            );
+            keyboard.set_onboard_slot(4);
+            assert_eq!(keyboard.onboard_slot(), 4);
+            assert_eq!(crate::onboard_profile::profile_file_id(4), 0x0205);
         }
     }
 }

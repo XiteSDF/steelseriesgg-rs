@@ -224,10 +224,7 @@ pub trait Keyboard: Device {
     /// `[EXPERIMENTAL]`: the protocol is reverse-engineered from a capture of official GG and
     /// has never completed a read on hardware from this code.
     #[cfg(feature = "onboard")]
-    async fn read_onboard_profile(
-        &self,
-        _config: &crate::onboard_profile::ReadConfig,
-    ) -> Result<crate::onboard_profile::ProfileImage> {
+    async fn read_onboard_profile(&self, _profile: u8) -> Result<crate::onboard_profile::ProfileImage> {
         Err(Error::DeviceCommunication(
             "on-board profile read is not supported by this keyboard".to_string(),
         ))

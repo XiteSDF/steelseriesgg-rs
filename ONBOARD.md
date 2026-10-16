@@ -19,14 +19,16 @@ Moved from `PLAN.md`:
 
 Implemented 2026-10-15 from the GG capture: GG's six-frame opening chain (`90 00`,
 `90 01`, `f4 00`, `6c 00 01`, `90 00`, `90 01` - the `90` poll answers the firmware version), `0x85`
-pulls, `0x83` payload reads, checksum, payload decode, `ssgg onboard read|decode`. The 13-byte
+pulls, `0x83` payload reads, checksum, payload decode, `ssgg onboard read|decode`. Only the profile slot is
+selectable (`--profile 0..4`); the geometry is compile-time constants. The 13-byte
 "pacing frame" earlier versions sent is not in the capture and was removed. Every protocol byte in it is
 `[EXPERIMENTAL]` - nothing has been replayed on hardware. Read-only by design: the push command is named
 and never sent. Wire format, layout table and open questions: `docs/development/apex-7-onboard-profile-read.md`.
 
-0. **[HW] Opening chain:** `ssgg onboard read --yes --profile 0 --chunks 1 --resource-len 512 --read-len 512`
-   first reports what the chain answered (the `firmware:` line is the `0x90` poll's answer). If the keyboard
-   answers `4.16.x`, the chain is accepted on our framing; `--no-init-chain` compares the same read without it.
+0. **[HW] Opening chain:** `ssgg onboard read --yes --profile 0` first reports what the chain answered (the
+   `firmware:` line is the `0x90` poll's answer). If the keyboard answers `4.16.x`, the chain is accepted on our
+   framing. The chain is part of every read: `--no-init-chain` is gone, so comparing with and without it needs a
+   code change, not a flag.
 
 Measured 2026-10-16 by comparing the GG capture with the ssgg run of 2026-10-15 on the same keyboard: the
 chain, the chain answers, the pull header and the `83` header all match, and the frames we send are answered
@@ -64,21 +66,21 @@ run sent none, so it collected nothing but 64-byte interrupt status. That is ste
    `docs/development/apex-7-onboard-profile-read.md`, "Input reports: the node must be open when the report arrives").
    The 2026-10-15 text `Inappropriate ioctls (errno 110)` is not evidence of what the kernel answered - that path
    formatted `last_os_error()` after unrelated calls on the same thread.
-2. **[HW] Reply framing:** one short read per candidate framing -
-   `ssgg --debug onboard read --yes --profile 0 --chunks 1 --resource-len 512 --read-len 512
-   --payload-len 512 --reply-header N` for `N` in `0, 1, 2, 5, 6, 14, 19, 20, 21, 36`. The framing that
-   yields schema `0x000B` with a readable name (`Config 1` .. `Config 5`) is where the payload really
-   starts on this keyboard.
-3. **[HW] Full read of one slot, then slot by slot:** `ssgg onboard read --yes --profile 0 --reply-header
-   <the framing from step 2> --out /tmp/p0.bin --json /tmp/p0.json`, then `--profile 1..4` - every read
+2. **[HW] Reply framing:** fixed at [`READ_REPLY_FRAMING_LEN`] = 0 (the offset the capture's replies
+   show) - `--reply-header` and the short-read framing sweep are gone, so a keyboard that anchors its payload
+   elsewhere is a code change, not a flag. Confirm from a `--debug` read that the bytes behind the report-ID byte
+   are a schema word (`0b 00`) with a readable name (`Config 1` .. `Config 5`); if they are not, record the
+   framing the keyboard actually uses and change the constant.
+3. **[HW] Full read of one slot, then slot by slot:** `ssgg onboard read --yes --profile 0 --out /tmp/p0.bin
+   --json /tmp/p0.json`, then `--profile 1..4` - every read
    prints that slot's schema word. Schema `0x000A` / `0x000B` means the decode applies; anything else is a
    third schema - record it, do not guess. A `checksum: stored ..., computed ..., match:
    true` would validate the CRC and the 12 x 1024 split at once; the capture does not predict it, because the
    payload-read reply is a file head that repeats the head (`0b 00` + the name) and never the requested
-   window - 241 GG reads give 33 distinct payloads, 179 of them all zero. Record what the answers look like, with `--reply-header 0` (the default, the framing the
-   capture shows) and with the framing found in step 2.
-4. **[HW] Reproducibility:** `ssgg onboard read --yes --profile 0 --out /tmp/p0b.bin --verify`, then
-   `--gap-ms 0`, `2`, `10` to find the lowest gap the keyboard tolerates; keep the measured value as the default.
+   window - 241 GG reads give 33 distinct payloads, 179 of them all zero.
+4. **[HW] Reproducibility:** `ssgg onboard read --yes --profile 0 --out /tmp/p0b.bin --verify`. Pacing is
+   `GG_GAP_MS`, a constant: a gap ladder needs a code change, and whatever the keyboard tolerates is recorded
+   there.
 5. **[HW] Layout check:** decode `/tmp/p0.bin` (`ssgg onboard decode`) and compare name, lighting colours,
    key mappings and macro count with what GG shows for that slot. This is the only way to settle the inferred
    offsets (GUID, OLED, Rapid Tap, macro) and the 260-byte tail.
@@ -94,11 +96,11 @@ run sent none, so it collected nothing but 64-byte interrupt status. That is ste
 | Piece | Where |
 |-------|-------|
 | Wire types: `0x85` pull, `0x83` read, `0x03` init chain, the pacing frame `0x01 0x00 00 02 00 f4 01 60 00`, the 643-byte read buffer | `src/devices/hid_reports.rs` (`OnboardPullCommand`, `OnboardReadCommand`, `OnboardInitCommand`, `ONBOARD_INIT_CHAIN`) — not feature-gated, no raw byte arrays outside it |
-| Read geometry, reply parsing, assembly, decode | `src/onboard_profile.rs` (`ReadConfig`, `reads_per_pull`, `parse_read_reply`, `ProfileImage`, `decode`), feature `onboard`. No transfer-sequence type and no plan printer: the read loop walks pulls and reads directly and builds every frame from the typed commands |
+| Read geometry, reply parsing, assembly, decode | `src/onboard_profile.rs` (`PROFILE_FILE_LEN`, `READS_PER_PULL`, `profile_file_id`, `validate_profile`, `parse_read_reply`, `ProfileImage`, `decode`), feature `onboard`. The only knob is the profile slot: pull count, buffer size, read size, pacing, opening chain and reply framing are constants, and the read loop builds every frame from the typed commands |
 | Packet I/O | `src/devices/keyboards/mod.rs`: `GenericKeyboard` does the profile packet I/O on the `device` handle it already owns - `profile_device`, `packet_label`, `write_profile_packet`, `send_profile_feature_packet`, `read_profile_feature_packet`, `read_profile_input_packet` (feature `onboard`); `apex_legacy_onboard` runs the read plan against `&GenericKeyboard`. No transport type: `OnboardTransport` with its `HandleTransport` and `PathTransport`, and the per-call path-open helpers (`send_feature_report_raw`, `read_feature_report_raw`, `write_output_report_raw`, `read_input_report_raw`) were all removed on 2026-10-17; Apex 7 wired works through hidapi |
 | Keyboard device | `src/devices/keyboards/apex7.rs`: `Apex7` wraps `GenericKeyboard` (its `HidReportBuilder` and the open `HidDevice`) and runs the read on its own handle; `onboard_family(pid)` selects `0x1612`, `0x1614`, `0x1616`, `0x1618` and `discovery::open_keyboard` wraps those PIDs in it **with or without the `onboard` feature** — only the read (`read_profile`, the transport, the read plan) is gated, so a family board keeps standard lighting in a default build |
 | Device API | `Keyboard::supports_onboard_profile`, `Keyboard::read_onboard_profile` (feature `onboard`, `[EXPERIMENTAL]`); every other keyboard answers "not supported" |
-| CLI | `ssgg onboard read / decode` (`src/cli.rs`, `src/main.rs`); `read` runs on the `Apex7` device (its own handle, `--device vid:pid` selects the keyboard), fails with a clear message when the target is not on the family, and prints the geometry it is about to run (slot, file id, pulls, payload reads, pacing, reply anchor); `decode` works on a saved image and touches no device |
+| CLI | `ssgg onboard read / decode` (`src/cli.rs`, `src/main.rs`); `read --profile 0..4` runs on the `Apex7` device (its own handle, `--device vid:pid` selects the keyboard), fails with a clear message when the target is not on the family, and prints the fixed geometry it is about to run (slot, file id, pulls, payload reads); `decode` works on a saved image and touches no device |
 
 Two facts from the first Linux run (2026-10-15, Apex 7 `the hidraw node`) that shape the transport:
 
