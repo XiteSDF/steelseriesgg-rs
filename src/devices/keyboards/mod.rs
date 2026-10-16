@@ -419,26 +419,35 @@ impl GenericKeyboard {
         result
     }
 
-    /// Send a HID feature report of arbitrary size (for Apex 2023 new protocol).
-    /// Goes through [`crate::devices::send_feature_report_raw`], which calls hidapi's `send_feature_report`,
-    /// i.e. the kernel's `HIDIOCSFEATURE` on Linux.
-    /// Resolves the hidraw path: `info.path` for the wired 2023 model, interface 1 for the original
-    /// Apex Pro, interface 3 for the others.
+    /// Send a HID feature report of arbitrary size (the Apex 2023 direct-mode packets): hidapi's
+    /// `send_feature_report`, i.e. the kernel's `HIDIOCSFEATURE` on Linux, on the handle the device
+    /// manager opened.
+    ///
+    /// `[EXPERIMENTAL]` - **needs a hardware test on the wired Apex Pro TKL 2023 (`0x1628`)**. This was
+    /// routed through the path-based `send_feature_report_raw` on 2026-10-15, on the reading that the
+    /// model takes feature reports on USB interface 1 while discovery opens the wireless layout
+    /// (interface 3); the raw call is the same `HIDIOCSFEATURE` ioctl on a path resolved by sysfs
+    /// lookup, so the interface question was never measured from this code. The Apex 7 profile read of
+    /// 2026-10-15/16 showed the same `SET_REPORT wValue 0x0300` shape going out on the collection hidapi
+    /// opened, so the special path is reverted. Test it on hardware (`ssgg rgb color FF0000` on `0x1628`
+    /// with GG stopped, then `rgb brightness` and an animated effect); if the keyboard ignores the
+    /// frames, re-open the interface-1 collection explicitly rather than restoring the path lookup.
     #[cfg(unix)]
     pub fn send_feature(&self, data: &[u8], report_len: usize) -> Result<()> {
-        use crate::devices::product_ids::{APEX_PRO, APEX_PRO_TKL_2023};
-        // The wired 2023 model takes feature reports on USB interface 1, the control collection
-        // discovery already selected; interface 3 is the wireless layout. OpenRGB opens the
-        // original Apex Pro on interface 1 [EXPERIMENTAL, untested here].
-        let interface = match self.info.product_id {
-            APEX_PRO_TKL_2023 => None,
-            APEX_PRO => Some(1),
-            _ => Some(3),
+        let device = self
+            .device
+            .as_ref()
+            .ok_or(Error::DeviceCommunication("Device not connected".to_string()))?;
+        let report = {
+            let mut report = vec![0u8; report_len.max(1)];
+            let copy_len = data.len().min(report.len());
+            report[..copy_len].copy_from_slice(&data[..copy_len]);
+            report
         };
-        let path = interface
-            .and_then(|i| super::find_hidraw_for_interface(self.info.vendor_id, self.info.product_id, i))
-            .unwrap_or_else(|| self.info.path.clone());
-        super::send_feature_report_raw(&path, data, report_len)
+        let device = device.lock();
+        device
+            .send_feature_report(&report)
+            .map_err(|e| Error::DeviceCommunication(e.to_string()))
     }
 
     #[cfg(not(unix))]

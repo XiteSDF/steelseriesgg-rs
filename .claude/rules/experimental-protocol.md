@@ -28,7 +28,12 @@ Protocol work has three states. Never mix them up or upgrade a status without ha
 
 ## Rules
 
-**HID transport:** transfers go through hidapi (`write`, `send_feature_report`, `get_feature_report`, `read_timeout`).
+**HID transport:** transfers go through hidapi (`write`, `send_feature_report`, `get_feature_report`, `read_timeout`) on a
+handle the device manager keeps open. The per-call path-open helpers (`send_feature_report_raw`, `read_feature_report_raw`,
+`write_output_report_raw`, `read_input_report_raw`) were removed on 2026-10-17; the Apex 7 profile read runs on the `Apex7`
+device handle and Apex 7 wired works through hidapi. **Open, needs hardware test:** `Keyboard::send_feature` for the wired
+Apex Pro TKL 2023 (`0x1628`) was reverted from the path-based call back to the device handle on 2026-10-17 and has not been
+re-measured on that keyboard (the interface-1 question behind the 2026-10-15 special case is unmeasured).
 The `linux-native` backend in the pinned 2.6.7 issues the kernel's own `HIDIOCSOUTPUT` / `HIDIOCSFEATURE` /
 `HIDIOCGFEATURE` (`hidapi-2.6.7/src/linux_native/ioctl.rs:20,26,38`), and the direction-bit bug the earlier native backend
 sent was fixed in 2.6.6 — do not add hand-rolled `ioctl` / `write(2)` paths. Known open issue: `usbhid` polls a

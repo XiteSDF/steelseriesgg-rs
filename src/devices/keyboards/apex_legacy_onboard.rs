@@ -37,27 +37,22 @@
 //! (`0x25EE1762`) is not the CRC of the bytes GG assembled. The schema word GG reads at payload
 //! offset 0 is `0x0000` on this device, i.e. the base schema of the platform.
 //!
-//! Every transfer opens the collection by path and closes it again: the frames go out through
-//! [`crate::devices::write_output_report_raw`] and [`crate::devices::send_feature_report_raw`], the payload
-//! comes back through [`crate::devices::read_feature_report_raw`], and the interrupt-endpoint reports -
-//! the opening-chain answers and the pull acknowledges - through
-//! [`crate::devices::read_input_report_raw`]. All of them are hidapi calls; on Linux the `linux-native`
-//! backend issues the kernel's own `HIDIOCSOUTPUT`, `HIDIOCSFEATURE` and `HIDIOCGFEATURE` ioctls, so this
-//! is one transport on every platform. `[EXPERIMENTAL]`: interrupt-endpoint reports collected this way
-//! timed out in the Linux run capture of 2026-10-16 - `usbhid` polls the endpoint only while a descriptor
-//! on the node is open, and a per-report reader opens it after the answer was dropped; see
-//! `docs/development/apex-7-onboard-profile-read.md`, "Input reports: the node must be open when the
-//! report arrives". Nothing in this path has been replayed on hardware.
-//!
-//! Nothing in this path has been replayed on hardware. This module never writes a profile.
+//! The transfers run on the keyboard's own open hidapi handle: [`HandleTransport`], built from the
+//! `GenericKeyboard` the device manager opened. `usbhid` polls a collection's interrupt endpoint only
+//! while a descriptor on that node is open, so the opening-chain answers and the pull acknowledges can
+//! only arrive on a handle that stays open for the whole read - measured on an Apex 7 in the 2026-10-16
+//! Linux run capture (`linux-read.pcapng`), where a reader that opened the node per report collected
+//! nothing; see `docs/development/apex-7-onboard-profile-read.md`, "Input reports: the node must be open
+//! when the report arrives". Apex 7 wired works through hidapi: the same `SET_REPORT wValue 0x0200` and
+//! `wValue 0x0300` shapes the reference capture shows, on the collection hidapi opened.
+//! `[EXPERIMENTAL]`: nothing in this path has been replayed on hardware. This module never writes a
+//! profile.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hidapi::HidDevice;
 use parking_lot::Mutex;
-
-use crate::devices::find_hidraw_for_interface;
 
 use crate::devices::hid_reports::{
     CommandCode, HidCommand, HidDeviceType, HidReportBuilder, ONBOARD_FEATURE_REPORT_SIZE, ONBOARD_INIT_CHAIN,
@@ -104,8 +99,8 @@ const INPUT_REPORT_MAX_LEN: usize = 1024;
 /// feature-report reply the payload comes back on, and the interrupt-endpoint reports the opening chain
 /// and the pull acknowledges arrive on.
 ///
-/// `[EXPERIMENTAL]`: only [`PathTransport`] has run against a keyboard, and it ran as far as the read
-/// request being accepted.
+/// `[EXPERIMENTAL]`: on hardware this has gone as far as the read request being accepted (Apex 7,
+/// 2026-10-15); no payload reply has been collected from a keyboard by this code.
 pub trait OnboardTransport: Send + Sync {
     /// Human-readable identity of the collection, for logs and error messages.
     fn label(&self) -> String;
@@ -118,43 +113,6 @@ pub trait OnboardTransport: Send + Sync {
     fn read_feature(&self, report_id: u8, len: usize) -> Result<Vec<u8>>;
     /// One interrupt-endpoint input report, waiting up to `timeout_ms`.
     fn read_input(&self, len: usize, timeout_ms: u64) -> Result<Vec<u8>>;
-}
-
-/// Profile collection addressed by device path: every transfer opens the node for the call and closes
-/// it again. `ssgg onboard` uses this.
-#[derive(Clone, Debug)]
-pub struct PathTransport {
-    path: String,
-}
-
-impl PathTransport {
-    /// Transport on a hidapi path (a `/dev/hidrawN` node on Linux).
-    pub fn new(path: impl Into<String>) -> Self {
-        Self { path: path.into() }
-    }
-
-    /// The path this transport runs on.
-    pub fn path(&self) -> &str {
-        &self.path
-    }
-}
-
-impl OnboardTransport for PathTransport {
-    fn label(&self) -> String {
-        self.path.clone()
-    }
-    fn write_output(&self, data: &[u8]) -> Result<()> {
-        crate::devices::write_output_report_raw(&self.path, data)
-    }
-    fn send_feature(&self, data: &[u8]) -> Result<()> {
-        crate::devices::send_feature_report_raw(&self.path, data, ONBOARD_FEATURE_REPORT_SIZE)
-    }
-    fn read_feature(&self, report_id: u8, len: usize) -> Result<Vec<u8>> {
-        crate::devices::read_feature_report_raw(&self.path, report_id, len)
-    }
-    fn read_input(&self, len: usize, timeout_ms: u64) -> Result<Vec<u8>> {
-        crate::devices::read_input_report_raw(&self.path, len, timeout_ms)
-    }
 }
 
 /// Profile collection a keyboard device holds open, the shape [`super::apex7::Apex7`] uses. A report
@@ -240,86 +198,18 @@ impl OnboardTransport for HandleTransport {
     }
 }
 
-/// Reads one profile slot from the first candidate collection that answers.
-///
-/// # Errors
-///
-/// Returns an error when no candidate path answers, a frame is rejected, or the read plan cannot be
-/// validated.
-pub async fn read_profile(paths: &[String], config: &ReadConfig, strict: bool) -> Result<(ProfileImage, String)> {
-    let paths = paths.to_vec();
-    let config = *config;
-    tokio::task::spawn_blocking(move || read_on_first_path(&paths, &config, strict, None))
-        .await
-        .map_err(|e| Error::Other(format!("onboard read task failed: {e}")))?
-}
-
-/// Runs one read plan on one collection a keyboard device holds open, which is how
+/// Reads one profile slot on one collection a keyboard device holds open, which is how
 /// [`super::apex7::Apex7`] reads its own on-board profiles.
 ///
 /// # Errors
 ///
-/// Returns an error when the collection rejects a frame or never answers a payload read.
-pub async fn read_profile_transport(
-    transport: HandleTransport,
-    config: &ReadConfig,
-    strict: bool,
-) -> Result<ProfileImage> {
+/// Returns an error when the collection rejects a frame, never answers a payload read, or the read plan
+/// cannot be validated.
+pub async fn read_profile(transport: HandleTransport, config: &ReadConfig, strict: bool) -> Result<ProfileImage> {
     let config = *config;
     tokio::task::spawn_blocking(move || read_image(&transport, &config, strict, None))
         .await
         .map_err(|e| Error::Other(format!("onboard read task failed: {e}")))?
-}
-
-/// Reads one profile slot twice and reports the first byte where the two reads disagree.
-///
-/// # Errors
-///
-/// Returns an error when the slot cannot be read twice.
-pub async fn read_profile_verify(
-    paths: &[String],
-    config: &ReadConfig,
-    strict: bool,
-) -> Result<(ProfileImage, ProfileImage, Option<usize>, String)> {
-    let (first, path) = read_profile(paths, config, strict).await?;
-    let (second, _) = read_profile(paths, config, strict).await?;
-    let diff = first
-        .data
-        .iter()
-        .zip(second.data.iter())
-        .enumerate()
-        .find(|(_, (a, b))| a != b)
-        .map(|(offset, _)| offset);
-    Ok((first, second, diff, path))
-}
-
-/// Runs the read plan on the first candidate path that answers, logging every path that did not.
-fn read_on_first_path(
-    paths: &[String],
-    config: &ReadConfig,
-    strict: bool,
-    deadline: Option<Duration>,
-) -> Result<(ProfileImage, String)> {
-    if paths.is_empty() {
-        return Err(Error::DeviceNotFound(
-            "no candidate device path for the on-board profile read".to_string(),
-        ));
-    }
-    let mut last = String::from("no candidate path answered");
-    for path in paths {
-        let started = Instant::now();
-        let transport = PathTransport::new(path.clone());
-        match read_image(&transport, config, strict, deadline) {
-            Ok(image) => return Ok((image, path.clone())),
-            Err(e) => {
-                tracing::debug!("onboard read on {path} failed after {:?}: {e}", started.elapsed());
-                last = format!("{path}: {e}");
-            }
-        }
-    }
-    Err(Error::DeviceCommunication(format!(
-        "no profile collection answered the read ({last})"
-    )))
 }
 
 /// Runs one read plan (the opening chain, then pulls with their payload reads) on one collection.
@@ -578,45 +468,6 @@ fn write_feature_command<T: OnboardTransport + ?Sized, C: HidCommand>(transport:
         )));
     }
     transport.send_feature(&buffer)
-}
-
-/// USB interface the profile transfers run on: every `SET_REPORT` and `GET_REPORT` of the reference
-/// capture carries `wIndex 1`, the control collection (`0xFFC0`) GG opens for profile traffic.
-const PROFILE_INTERFACE: usize = 1;
-
-/// Device paths to try for a profile read: the caller's preferred collection first, then the
-/// [`PROFILE_INTERFACE`] collection of the same device, which is where the capture shows the profile
-/// transfers running. On Windows the interface number cannot pick a collection, so
-/// [`find_hidraw_for_interface`] ranks by usage page there and returns the control collection.
-#[must_use]
-pub fn candidate_paths(preferred: Option<&str>, vendor_id: u16, product_id: u16) -> Vec<String> {
-    let mut paths: Vec<String> = Vec::new();
-    if let Some(path) = preferred {
-        paths.push(path.to_string());
-    }
-    if let Some(path) = find_hidraw_for_interface(vendor_id, product_id, PROFILE_INTERFACE) {
-        if !paths.contains(&path) {
-            paths.push(path);
-        }
-    }
-    paths
-}
-
-/// `vendor:pid` of a `/dev/hidrawN` node, read from its sysfs `uevent`.
-#[must_use]
-pub fn hidraw_vendor_product(path: &str) -> Option<(u16, u16)> {
-    let name = path.rsplit('/').next()?;
-    let text = std::fs::read_to_string(format!("/sys/class/hidraw/{name}/device/uevent")).ok()?;
-    for line in text.lines() {
-        if let Some(value) = line.strip_prefix("HID_ID=") {
-            let mut parts = value.split(':');
-            let (_bus, vendor, product) = (parts.next()?, parts.next()?, parts.next()?);
-            let vendor = u16::from_str_radix(vendor, 16).ok()?;
-            let product = u16::from_str_radix(product, 16).ok()?;
-            return Some((vendor, product));
-        }
-    }
-    None
 }
 
 #[cfg(test)]

@@ -23,12 +23,14 @@ transfer in the capture runs on **USB interface 1** (`wIndex 1`), the collection
 traffic; the counts below are from that file. On the Linux box used for the hardware probe
 (same keyboard family, firmware `2.4.3`) the collection that accepts the same frames is
 `the hidraw node`, usage page `0xFFC1`, interface 4, `max_report_size 644`, `max_input_report 1024`,
-`max_output_report 64`. `/dev/hidrawN` numbers are not enumeration order, so `ssgg onboard` takes a
-`--device` node first, then the **interface 1** collection of the same `vid:pid` (every profile transfer
-in the capture carries `wIndex 1`), and stops at the first one that answers. That 2026-10-15 box accepted
-the frames on interface 4, so a box whose frames are accepted on another collection needs an explicit
-`--device /dev/hidrawN`; on Windows the interface number cannot pick a collection and
-`find_hidraw_for_interface` ranks by usage page (`0xFFC0` first) there.
+`max_output_report 64`. `/dev/hidrawN` numbers are not enumeration order. Since 2026-10-17 the read runs on the collection the
+device manager opened for the keyboard (the handle `Apex7` owns), selected by `vid:pid`, not by node path
+and not by an interface-1 preference: the device manager picks a vendor-defined collection by usage page
+(`keyboards/mod.rs`, `find_best_device_info`), which on the 2026-10-15 box landed on interface 4 - the
+collection that accepted the frames there. **Open**: if a box needs interface 1 (the `wIndex 1` of every
+profile transfer in the capture) and the device manager opens another collection, that collection must be
+discovered as its own device; the old path-based probe that tried interface 1 first
+(`candidate_paths`, `PathTransport`) is gone.
 
 | Transfer | Control setup (from the capture) | Frame bytes (data stage) |
 |----------|------------------------------|------------------------|
@@ -308,9 +310,11 @@ as the kernel's own `HIDIOCSFEATURE`/`HIDIOCGFEATURE` (`hidapi-2.6.7/src/linux_n
 `HIDIOCSOUTPUT` (nr `0x0b`, `:38`) and `read_timeout` as `poll` + `read(2)`; the direction-bit bug the earlier native
 backend sent was fixed in 2.6.6 and 2.6.7 is pinned, so one code path serves Linux, Windows and macOS - the
 `#[cfg(unix)]`/`#[cfg(not(unix))]` pairs are deleted. `devices::send_feature_report_raw`,
-`read_feature_report_raw`, `write_output_report_raw` and `read_input_report_raw` are those four calls;
-`apex_legacy_onboard` uses them for frames, payload reads and endpoint polls, `Keyboard::send_feature` for the Apex
-2023 lighting path. Two consequences worth knowing: `HIDIOCSOUTPUT` puts output frames on the control port as
+`read_feature_report_raw`, `write_output_report_raw` and `read_input_report_raw` - one path opened per call - were then
+**removed the same day**: the Apex 7 profile read runs on the `Apex7` device handle (`HandleTransport`), because a reader
+that opens the node per report cannot collect the opening-chain answers or the pull acknowledges, and Apex 7 wired works
+through hidapi. `Keyboard::send_feature` (the Apex 2023 lighting path) is back on the device handle: the interface-1 reading
+behind its 2026-10-15 path special case was never measured, and **needs a hardware test on `0x1628`**. Two consequences worth knowing: `HIDIOCSOUTPUT` puts output frames on the control port as
 `SET_REPORT wValue 0x0200` - the shape the reference capture shows - where the raw `write(2)` this replaces went to an
 OUT endpoint the profile collection does not have; and `HidApi::new` enumerates the device tree per call. Nothing
 here is confirmed on hardware.

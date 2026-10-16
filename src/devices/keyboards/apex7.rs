@@ -98,7 +98,7 @@ impl Apex7 {
     /// Returns an error when the plan is invalid, the collection rejects a frame, or it never answers
     /// a payload read.
     pub async fn read_profile(&self, config: &ReadConfig) -> Result<ProfileImage> {
-        apex_legacy_onboard::read_profile_transport(self.transport()?, config, false).await
+        apex_legacy_onboard::read_profile(self.transport()?, config, false).await
     }
 
     /// Reads the slot this device's [`Apex7::onboard_config`] selects.
