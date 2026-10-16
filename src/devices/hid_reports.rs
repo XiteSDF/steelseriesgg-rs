@@ -48,7 +48,7 @@ pub enum CommandCode {
     /// `ProfileChunkCommand`.
     ProfileChunk = 0x03,
     /// [EXPERIMENTAL] Legacy Apex (Apex 7, Apex Raw, Apex 2014) resource-buffer pull (0x85), see
-    /// `OnboardPullCommand`.
+    /// `OnboardPullCommand`: answered by the keyboard's ordinary input report, not by a pull-specific one.
     OnboardPull = 0x85,
     /// [EXPERIMENTAL] Legacy Apex on-board payload read (0x83), see `OnboardReadCommand`.
     OnboardPayloadRead = 0x83,
@@ -530,8 +530,10 @@ impl HidCommand for OnboardFirmwareVersionCommand {
 
 /// Copy part of a profile file into the keyboard's resource buffer, `[EXPERIMENTAL]`:
 /// `85 | 00 | file id u16 LE | file offset u32 LE | size u16 LE | 00…` inside
-/// [`ONBOARD_OUTPUT_REPORT_SIZE`]. The keyboard answers with a 64-byte input report whose contents are
-/// not interpreted here.
+/// [`ONBOARD_OUTPUT_REPORT_SIZE`]. **The pull has no reply with content**: GG follows it with one input
+/// read and keeps none of the bytes (its read spec's byte specifier for the pull is zero length), and on the
+/// wire that packet is the keyboard's ordinary input report - report `0x01`, all-zero on an idle keyboard, in
+/// all 121 pulls of the capture. The pull is flow control; the profile bytes come from [`OnboardReadCommand`].
 ///
 /// Sizes and frame layout from the 2026-10-15 reference capture (121 pulls of 1024 bytes at file
 /// offsets 0, 4, 8, … 44 for the schema probe and 0..11264 for full files).

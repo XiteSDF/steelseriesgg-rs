@@ -4,8 +4,9 @@
 //! and the open [`HidDevice`](hidapi::HidDevice) — and adds the on-board profile read: packet reads
 //! and writes go through [`GenericKeyboard`]'s profile transfers on the collection the device manager
 //! opened, which stays open for the whole read (`usbhid` polls a
-//! collection's interrupt endpoint only while a descriptor on that node is open, so the opening-chain
-//! answers and the pull acknowledges have nowhere to arrive on a per-report open).
+//! collection's interrupt endpoint only while a descriptor on that node is open, so the interrupt
+//! reports the read consumes (the `0x90` answer, the packet after each pull) have nowhere to arrive on a
+//! per-report open).
 //!
 //! Frame construction, reply parsing, payload geometry and decode live in [`crate::devices::keyboards::apex_legacy_profile`].
 //!

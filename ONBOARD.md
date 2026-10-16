@@ -32,6 +32,15 @@ and never sent. Wire format, layout table and open questions: `docs/development/
    `90 01` the same way, so one poll is all the read needs; `f4 00` and `6c 00 01` (the other two frames of
    GG's chain) are not sent and their meanings are unknown.
 
+0a. **[HW] The pull is pacing, not a data transfer:** **Measured 2026-10-17** at the endpoint level of the
+   capture (engine session capture): every one of the 121 pulls is answered 1.7-3.7 ms later by the keyboard's ordinary
+   input report `0x01` (63 bytes, all zero = no keys pressed), and the device's own read spec keeps **no**
+   bytes of it (byte specifier `(0 0 0)` in `apex_7.lisp`). So the packet GG reads after a pull is a flow-control
+   token; every profile byte arrives through the `0x83` window replies. `ssgg onboard read` does the same
+   (`read_pull_ack` consumes one packet and inspects none of it). The capture kit's decoded response listing lists the
+   121 pulls as 64-byte "control responses" starting `85 00 …` - those are the requests GG submitted, which is
+   why pull replies were earlier described as constant 64-byte frames.
+
 Measured 2026-10-16 by comparing the GG capture with the ssgg run of 2026-10-15 on the same keyboard: the
 chain, the chain answers, the pull header and the `83` header all match, and the frames we send are answered
 exactly like GG's. What we never sent is the **read-back**: GG issues `GET_REPORT 0xa1 0x01 wValue 0x0300
