@@ -34,21 +34,24 @@ Protocol facts for the Apex Pro TKL 2023 are in `AGENTS.md` ("Protocol research 
 
 Code is in place (2026-10-17, `onboard-configs-dev`): `Apex7` in `src/devices/keyboards/apex7.rs` wraps
 `GenericKeyboard` (its `HidReportBuilder` and the open `HidDevice`) and runs the read on its own handle
-through `HandleTransport`; `Keyboard::read_onboard_profile` / `read_onboard_schema` are the device API,
-`discovery::open_keyboard` returns `Apex7` for `0x1612`, `0x1614`, `0x1616`, `0x1618`. `ssgg onboard
-schema|read` use the device when the target is on that family, and the candidate collections when
-`--device /dev/hidrawN` names a node. Nothing has been replayed on hardware.
+through `HandleTransport`; `Keyboard::read_onboard_profile` is the device API,
+`discovery::open_keyboard` returns `Apex7` for `0x1612`, `0x1614`, `0x1616`, `0x1618`. `ssgg onboard read`
+uses the device when the target is on that family, and the candidate collections when `--device
+/dev/hidrawN` names a node. Nothing has been replayed on hardware.
 
 1. **[HW] Collection check first:** `ls -l the device sysfs input nodes`. The 2026-10-15
    run found the interface-1 collection (`the hidraw node`) had no `input*`, so the device manager opened
    interface 4 (`usage 0xFFC1`) — the collection with an `input*` node, not the one GG used. If interface
    1 has no `input*`, boot once with the kernel argument `usbhid.poll_descriptor_ignores_interfaces=0`
    (`sudo raspistop --bootcmd setusbhid` form from `ONBOARD.md` Step 1) and re-check.
-2. **[HW] Framing sweep on the device:** `ssgg --debug onboard schema --yes --sweep` — the `90` poll
-   answer in the log confirms the device path; record which `--reply-header` yields a real schema word.
-3. **[HW] Schema of slots 0..4**, then **read slot 0** with the winning framing
-   (`--out /tmp/p0.bin --json /tmp/p0.json`), then `--verify` and the `--gap-ms` ladder. Record the
-   checksum line and the decoded layout as `ONBOARD.md` "Next hardware steps" describes.
+2. **[HW] Reply framing on the device:** short reads, one per candidate framing -
+   `ssgg --debug onboard read --yes --profile 0 --chunks 1 --resource-len 512 --read-len 512
+   --payload-len 512 --reply-header N` for `N` in `0, 1, 2, 5, 6, 14, 19, 20, 21, 36`; the `90` poll answer
+   in the log confirms the device path, and the framing whose answer carries schema `0x000B` with a
+   readable name is the anchor.
+3. **[HW] Read slot 0** with the winning framing (`--out /tmp/p0.bin --json /tmp/p0.json`), then slots
+   `1..4`, then `--verify` and the `--gap-ms` ladder. Record the checksum line and the decoded layout as
+   `ONBOARD.md` "Next hardware steps" describes.
 4. **[HW] Windows:** same read through the hidapi path; confirms the interface choice for the control
    collection.
 
@@ -244,8 +247,8 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   Next step (keyboard): ask the read-back of the collection that declares it - interface 1 (`0xFFC0`): the
   kernel validates GET_REPORT against the interface's report descriptor, and interface 1 answered `EPIPE` to
   the 2026-10-15 report-ID-framed writes. Then
-  with the keyboard: `ssgg --debug onboard schema --yes --sweep`, `ssgg --debug onboard read --yes
-  --reply-header <offset>`, and check in the capture that a control-IN transfer with 642 bytes of data
+  with the keyboard: `ssgg --debug onboard read --yes` and, per candidate framing, `ssgg --debug onboard
+  read --yes --reply-header <offset>`, and check in the capture that a control-IN transfer with 642 bytes of data
   appears; `--no-init-chain` and `--gap-ms 1` measure what the 2026-10-15 acceptance of `83`/`85` proves
   (GG runs the chain before every read session).
 - Old TODO items: clippy-ci / future-incompat errors (resolved, see Baseline); `ssgg_bug_report.json` triage

@@ -155,7 +155,7 @@ async fn main() -> Result<()> {
         Commands::Onboard { action } => {
             match &action {
                 // Only the two device-reading subcommands enumerate hardware.
-                OnboardAction::Read(_) | OnboardAction::Schema(_) => {
+                OnboardAction::Read(_) => {
                     let mut manager = new_device_manager()?;
                     cmd_onboard(Some(&mut manager), action).await?;
                 }
@@ -817,9 +817,7 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
     use steelseries_gg::STEELSERIES_VENDOR_ID;
     use steelseries_gg::devices::keyboards::apex_legacy_onboard as hw;
     use steelseries_gg::devices::product_ids::APEX_7;
-    use steelseries_gg::onboard_profile::{
-        self as wire, hex_dump, hex_of, payload_len_for_schema, plan_json, profile_json, schema_of, to_json,
-    };
+    use steelseries_gg::onboard_profile::{hex_dump, plan_json, profile_json, schema_of, to_json};
 
     match action {
         OnboardAction::Plan(wire_args) => {
@@ -915,154 +913,6 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
                     secure_write_async(json.clone(), to_json(&image)?).await?;
                     println!("JSON report written to {}", json.display());
                 }
-            }
-        }
-
-        OnboardAction::Schema(args) => {
-            if !args.yes {
-                return require_yes("read the on-board profile schema words");
-            }
-            let Some(manager) = manager.as_mut() else {
-                return Err(Error::Other("the on-board profile read needs a device".to_string()));
-            };
-            let keyboard = onboard_keyboard(manager, &args.device).await;
-            let paths = onboard_paths(manager, &args.device, STEELSERIES_VENDOR_ID, APEX_7)?;
-            let deadline = (args.deadline_ms > 0).then(|| Duration::from_millis(args.deadline_ms));
-            print_onboard_banner();
-            match keyboard.as_ref() {
-                Some(device) => println!("probing on the {} device", onboard_device_label(device.as_ref())),
-                None => println!("device paths to try: {}", paths.join(", ")),
-            }
-            println!(
-                "probing with a {} ms budget per group of files{}",
-                args.deadline_ms,
-                if deadline.is_some() { "" } else { " (no limit)" }
-            );
-            println!();
-
-            if args.sweep {
-                println!("reply framing sweep on profile slot 0 (which framing length exposes a real schema word):");
-                for header in [0usize, 1, 2, 5, 6, 14, 19, 20, 21, 36] {
-                    let probe = match keyboard.as_ref() {
-                        Some(device) => {
-                            let mut probe_config = hw::schema_config(wire::PROFILE_FS_BASE, 0, args.gap_ms);
-                            probe_config.reply_header = header;
-                            device
-                                .read_onboard_schema(&probe_config)
-                                .await
-                                .map(|(word, raw)| (word, raw, onboard_device_label(device.as_ref())))
-                        }
-                        None => {
-                            hw::read_schema_probe(
-                                &paths,
-                                wire::PROFILE_FS_BASE,
-                                0,
-                                header,
-                                args.gap_ms,
-                                args.strict,
-                                deadline,
-                            )
-                            .await
-                        }
-                    };
-                    match probe {
-                        Ok((word, raw, path)) => {
-                            let known = wire::payload_len_for_schema(word).ok();
-                            println!(
-                                "  framing {header:>2} bytes: schema {word:04X} raw {} -> {} ({path})",
-                                hex_of(&raw),
-                                known
-                                    .map(|len| format!("known schema, payload {len} bytes"))
-                                    .unwrap_or_else(|| "no known schema".to_string())
-                            );
-                        }
-                        Err(e) => println!("  framing {header:>2} bytes: no usable answer - {e}"),
-                    }
-                }
-                println!("re-run with --reply-header <the framing that produced a known schema>\n");
-            }
-
-            let mut rows: Vec<serde_json::Value> = Vec::new();
-            let mut failed = 0usize;
-
-            for slot in 0..=hw::MAX_PROFILE_INDEX_FOR_READ {
-                let fs_id = wire::PROFILE_FS_BASE + u16::from(slot);
-                let probe = match keyboard.as_ref() {
-                    Some(device) => {
-                        let probe_config = hw::schema_config(wire::PROFILE_FS_BASE, slot, args.gap_ms);
-                        device
-                            .read_onboard_schema(&probe_config)
-                            .await
-                            .map(|(word, raw)| (word, raw, onboard_device_label(device.as_ref())))
-                    }
-                    None => hw::read_schema(&paths, slot, args.gap_ms, args.strict, deadline).await,
-                };
-                match probe {
-                    Ok((word, raw, path)) => {
-                        let payload = payload_len_for_schema(word).ok();
-                        println!(
-                            "profile slot {slot} (file {fs_id:04X}): schema {word:04X} raw {} -> {} ({path})  [EXPERIMENTAL]",
-                            hex_of(&raw),
-                            payload
-                                .map(|len| format!("{len} bytes"))
-                                .unwrap_or_else(|| "unknown schema".to_string())
-                        );
-                        rows.push(serde_json::json!({
-                            "fs_id": fs_id,
-                            "kind": "profile",
-                            "slot": slot,
-                            "schema_word": format!("{word:04X}"),
-                            "schema_raw_hex": hex_of(&raw),
-                            "payload_len": payload,
-                        }));
-                    }
-                    Err(e) => {
-                        failed += 1;
-                        println!("profile slot {slot} (file {fs_id:04X}): no usable answer - {e}");
-                        rows.push(serde_json::json!({
-                            "fs_id": fs_id,
-                            "kind": "profile",
-                            "slot": slot,
-                            "error": e.to_string(),
-                        }));
-                    }
-                }
-            }
-
-            for fs_id in [wire::LIGHTING_FS_SHARED, wire::LIGHTING_FS_BASE] {
-                match hw::read_schema_file(&paths, fs_id, args.gap_ms, args.strict, deadline).await {
-                    Ok((word, raw, path)) => {
-                        println!(
-                            "lighting file {fs_id:04X}: schema {word:04X} raw {} ({path})  [EXPERIMENTAL]",
-                            hex_of(&raw)
-                        );
-                        rows.push(serde_json::json!({
-                            "fs_id": fs_id,
-                            "kind": "lighting",
-                            "schema_word": format!("{word:04X}"),
-                            "schema_raw_hex": hex_of(&raw),
-                        }));
-                    }
-                    Err(e) => {
-                        failed += 1;
-                        println!("lighting file {fs_id:04X}: no usable answer - {e}");
-                        rows.push(serde_json::json!({
-                            "fs_id": fs_id,
-                            "kind": "lighting",
-                            "error": e.to_string(),
-                        }));
-                    }
-                }
-            }
-
-            if let Some(json) = args.json.as_ref() {
-                let text = serde_json::to_string_pretty(&serde_json::Value::Array(rows.clone()))
-                    .map_err(|e| Error::Other(format!("serialize schema report: {e}")))?;
-                secure_write_async(json.clone(), text).await?;
-                println!("JSON schema report written to {}", json.display());
-            }
-            if failed > 0 {
-                println!("{failed} file(s) never answered. An all-zero schema word is an unused slot, not a schema.");
             }
         }
 

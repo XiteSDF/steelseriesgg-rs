@@ -233,16 +233,6 @@ pub trait Keyboard: Device {
             "on-board profile read is not supported by this keyboard".to_string(),
         ))
     }
-
-    /// Probe the schema word of one on-board file, answering with the word and the raw reply.
-    ///
-    /// `[EXPERIMENTAL]`: see [`Keyboard::read_onboard_profile`].
-    #[cfg(feature = "onboard")]
-    async fn read_onboard_schema(&self, _config: &crate::onboard_profile::ReadConfig) -> Result<(u16, Vec<u8>)> {
-        Err(Error::DeviceCommunication(
-            "on-board profile read is not supported by this keyboard".to_string(),
-        ))
-    }
 }
 
 /// Generic SteelSeries keyboard implementation.

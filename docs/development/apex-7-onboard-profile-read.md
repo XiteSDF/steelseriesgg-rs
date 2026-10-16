@@ -93,8 +93,8 @@ for each chunk c in 0..12:
 
 12 pulls of 1024 bytes cover 12288 bytes, enough for the 11648-byte schema A payload and the
 11696-byte schema B payload. A schema-only read is the opening chain, one 2-byte pull of the file head
-and one 2-byte read. `ssgg onboard plan` prints the sequence, `ssgg onboard schema` runs the 2-byte
-probe (with `--sweep` it probes several reply framings), `ssgg onboard read --yes` runs the whole read.
+and one 2-byte read (GG's own probe, kept in the transfer map; `ssgg onboard` has no schema-probing mode).
+`ssgg onboard plan` prints the sequence and `ssgg onboard read --yes` runs the whole read.
 The reply framing length is `--reply-header` (default 0, the offset the capture's replies show); skip
 the chain itself with `--no-init-chain`.
 
@@ -157,8 +157,7 @@ replies, and a profile name appears in five — one each of `Config 1`, `Config 
 and `Config 5`, never twice in one session. The requested buffer offset and the requested file offset do
 not change the answer: 100 of the 120 buffer-512 replies are byte-identical to the buffer-0 reply of the
 same pull. So the read-back carries the file head (schema word, and a name) and never the requested
-window, which is why `ssgg onboard` reads the schema probe and assembles payloads only as a labelled
-experiment: reassembling GG's 24 reads of file `0x0201` with framing 0 gives an image whose schema word
+window, which is why `ssgg onboard read` assembles payloads only as a labelled experiment: reassembling GG's 24 reads of file `0x0201` with framing 0 gives an image whose schema word
 reads `0x000B` and whose name reads `Config 1`, with no checksum word at the offsets the schema A and
 schema B layouts predict (CRC-32/STM32 over the 11648-byte and 11696-byte regions, as u32 and as u16
 words, matches nothing). `decode` prints stored and computed checksum words side by side and never claims
@@ -173,9 +172,10 @@ exports that prefix every report row with the capture's own USBPcap/usbmon heade
 shapes at all. Re-derive anything here from the raw pcaps, which are the capture's source of truth.
 
 The framing stays a CLI knob because the keyboard this lands on has not been measured: the Apex 7
-accepted 6 on 2026-10-15, and 5 suits a keyboard that echoes the request header. `ssgg onboard schema
---sweep` probes framings `0, 1, 2, 5, 6, 14, 19, 20, 21, 36` on one file and prints which yield a schema
-word the decoder knows; `ssgg onboard read --reply-header N` assembles with that anchor.
+accepted 6 on 2026-10-15, and 5 suits a keyboard that echoes the request header. Find the anchor with
+short reads at each framing `0, 1, 2, 5, 6, 14, 19, 20, 21, 36` (`ssgg onboard read --yes --chunks 1
+--resource-len 512 --read-len 512 --payload-len 512 --reply-header N`) and keep the one whose answer
+carries a schema word the decoder knows; `ssgg onboard read --reply-header N` assembles with that anchor.
 
 ## Safety
 

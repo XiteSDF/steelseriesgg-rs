@@ -34,11 +34,11 @@ exactly like GG's. What we never sent is the **read-back**: GG issues `GET_REPOR
 wIndex 1 wLength 642` after every read request and takes the window from that control-IN data stage; our
 run sent none, so it collected nothing but 64-byte interrupt status. That is step 1a.
 
-1. **[HW] Path probe (Linux, Apex 7, GG stopped):** `ssgg onboard schema --yes`. It answers "is the
-   profile protocol on the interface-1 collection GG uses?" (`apex_legacy_onboard::candidate_paths` tries
-   the discovery path, then interface 1). If every candidate path times out, this box answers elsewhere -
-   the 2026-10-15 probe answered on interface 4 (`the hidraw node`, `0xFFC1`) - and the probe needs an
-   explicit `--device /dev/hidrawN`.
+1. **[HW] Path probe (Linux, Apex 7, GG stopped):** `ssgg --debug onboard read --yes --profile 0`. It
+   answers "is the profile protocol on the collection the device manager opened?" - the read runs on the
+   `Apex7` device handle. If it times out, the keyboard answers on another collection: run the same read
+   with `--device /dev/hidrawN` on each node of the keyboard. The 2026-10-15 probe answered on interface 4
+   (`the hidraw node`, `0xFFC1`).
 1a. **[HW] Feature-report read-back:** the read path must ask for the reply the way GG does — report
    number **0**, 642 bytes, on the interface-1 collection. `HIDIOCGFEATURE` builds `wValue` from the
    buffer's first byte, and since 2026-10-17 every report buffer built in `src/devices/hid_reports.rs`
@@ -61,15 +61,19 @@ run sent none, so it collected nothing but 64-byte interrupt status. That is ste
    `docs/development/apex-7-onboard-profile-read.md`, "Input reports: the node must be open when the report arrives").
    The 2026-10-15 text `Inappropriate ioctls (errno 110)` is not evidence of what the kernel answered - that path
    formatted `last_os_error()` after unrelated calls on the same thread.
-2. **[HW] Schema words of all five slots:** `ssgg onboard schema --yes` prints the word of slot 0 plus the
-   lighting file; sweep `--profile 0..4`. Schema `0x000A` / `0x000B` means the decode applies; anything
-   else is a third schema - record it, do not guess.
-3. **[HW] Full read of one slot:** `ssgg onboard read --yes --profile 0 --out /tmp/p0.bin --json /tmp/p0.json`.
-   Expect the read to complete and the schema probe to answer. A `checksum: stored ..., computed ..., match:
+2. **[HW] Reply framing:** one short read per candidate framing -
+   `ssgg --debug onboard read --yes --profile 0 --chunks 1 --resource-len 512 --read-len 512
+   --payload-len 512 --reply-header N` for `N` in `0, 1, 2, 5, 6, 14, 19, 20, 21, 36`. The framing that
+   yields schema `0x000B` with a readable name (`Config 1` .. `Config 5`) is where the payload really
+   starts on this keyboard.
+3. **[HW] Full read of one slot, then slot by slot:** `ssgg onboard read --yes --profile 0 --reply-header
+   <the framing from step 2> --out /tmp/p0.bin --json /tmp/p0.json`, then `--profile 1..4` - every read
+   prints that slot's schema word. Schema `0x000A` / `0x000B` means the decode applies; anything else is a
+   third schema - record it, do not guess. A `checksum: stored ..., computed ..., match:
    true` would validate the CRC and the 12 x 1024 split at once; the capture does not predict it, because the
    payload-read reply is a file head that repeats the head (`0b 00` + the name) and never the requested
    window - 241 GG reads give 33 distinct payloads, 179 of them all zero. Record what the answers look like, with `--reply-header 0` (the default, the framing the
-   capture shows) and with `schema --sweep` if the schema probe answers nothing.
+   capture shows) and with the framing found in step 2.
 4. **[HW] Reproducibility:** `ssgg onboard read --yes --profile 0 --out /tmp/p0b.bin --verify`, then
    `--gap-ms 0`, `2`, `10` to find the lowest gap the keyboard tolerates; keep the measured value as the default.
 5. **[HW] Layout check:** decode `/tmp/p0.bin` (`ssgg onboard decode`) and compare name, lighting colours,
@@ -90,13 +94,13 @@ run sent none, so it collected nothing but 64-byte interrupt status. That is ste
 | Read plan, reply parsing, assembly, decode | `src/onboard_profile.rs` (`ReadConfig`, `plan_json`, `parse_read_reply`, `ProfileImage`, `decode`), feature `onboard` |
 | Transports | `src/devices/keyboards/apex_legacy_onboard.rs`: `OnboardTransport` (trait: `write_output`, `send_feature`, `read_feature`, `read_input`), `PathTransport` (one collection per open, used by `ssgg onboard` when `--device` names a node), `HandleTransport` (a handle the device manager keeps open) |
 | Keyboard device | `src/devices/keyboards/apex7.rs`: `Apex7` wraps `GenericKeyboard` (its `HidReportBuilder` and the open `HidDevice`) and runs the read on its own handle; `onboard_family(pid)` gates `0x1612`, `0x1614`, `0x1616`, `0x1618`; `discovery::open_keyboard` returns it for those PIDs |
-| Device API | `Keyboard::supports_onboard_profile`, `Keyboard::read_onboard_profile`, `Keyboard::read_onboard_schema` (feature `onboard`, `[EXPERIMENTAL]`), default to an error on other keyboards |
-| CLI | `ssgg onboard plan / schema / read / decode` (`src/cli.rs`, `src/main.rs`); `schema` and `read` use the `Apex7` device when the target is on the family, and the candidate collections when `--device /dev/hidrawN` names a node |
+| Device API | `Keyboard::supports_onboard_profile`, `Keyboard::read_onboard_profile` (feature `onboard`, `[EXPERIMENTAL]`); every other keyboard answers "not supported" |
+| CLI | `ssgg onboard plan / read / decode` (`src/cli.rs`, `src/main.rs`); `read` uses the `Apex7` device when the target is on the family, and the candidate collections when `--device /dev/hidrawN` names a node |
 
 Two facts from the first Linux run (2026-10-15, Apex 7 `the hidraw node`) that shape the transport:
 
 - Discovery opens the interface-4 collection (`usage 0xFFC1`) for this keyboard, not the interface-1
-  collection the capture's transfers ran on: `ssgg onboard schema` tried `1-3:1.4/input5`
+  collection the capture's transfers ran on: the 2026-10-15 probe tried `1-3:1.4/input5`
   (`is_collection = true`), and the interface-1 node had no `input*` at all that day.
 - `usbhid` polls a collection's interrupt endpoint only while a descriptor on that node is open. A
   per-report open (`/dev/hidrawN` opened for one report) has nowhere to deliver the opening-chain and
