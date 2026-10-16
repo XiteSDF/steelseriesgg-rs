@@ -51,7 +51,7 @@ use crate::cli::{SonarAction, StreamerAction, parse_sonar_channel};
 use crate::cli::OnboardAction;
 
 #[cfg(feature = "onboard")]
-use steelseries_gg::onboard_profile::decode;
+use steelseries_gg::devices::keyboards::apex_legacy_profile::decode;
 
 #[cfg(feature = "audio")]
 use steelseries_gg::audio::AudioMixer;
@@ -814,7 +814,7 @@ async fn cmd_profile(action: ProfileAction) -> Result<()> {
 /// docs/development/apex-7-onboard-profile-read.md and has never been replayed from this crate.
 #[cfg(feature = "onboard")]
 async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAction) -> Result<()> {
-    use steelseries_gg::onboard_profile::{
+    use steelseries_gg::devices::keyboards::apex_legacy_profile::{
         DEFAULT_CHUNKS, READ_LEN, READS_PER_PULL, RESOURCE_BUFFER_LEN, hex_dump, profile_file_id, profile_json,
         schema_of, to_json,
     };
@@ -982,8 +982,8 @@ fn print_onboard_banner() {
 }
 
 #[cfg(feature = "onboard")]
-fn print_onboard_image(image: &steelseries_gg::onboard_profile::ProfileImage, path: &str) {
-    use steelseries_gg::onboard_profile::decode;
+fn print_onboard_image(image: &steelseries_gg::devices::keyboards::apex_legacy_profile::ProfileImage, path: &str) {
+    use steelseries_gg::devices::keyboards::apex_legacy_profile::decode;
 
     println!("read {} profile bytes from {path}", image.data.len());
     match image.firmware.as_deref() {
@@ -1006,8 +1006,10 @@ fn print_onboard_image(image: &steelseries_gg::onboard_profile::ProfileImage, pa
 }
 
 #[cfg(feature = "onboard")]
-fn print_onboard_profile(profile: &steelseries_gg::onboard_profile::OnboardProfile) {
-    use steelseries_gg::onboard_profile::{Color, PAYLOAD_LEN_A, PAYLOAD_LEN_B, SCHEMA_B_FIRMWARE};
+fn print_onboard_profile(profile: &steelseries_gg::devices::keyboards::apex_legacy_profile::OnboardProfile) {
+    use steelseries_gg::devices::keyboards::apex_legacy_profile::{
+        Color, PAYLOAD_LEN_A, PAYLOAD_LEN_B, SCHEMA_B_FIRMWARE,
+    };
 
     fn color(c: &Color) -> String {
         format!("#{:02X}{:02X}{:02X}", c.r, c.g, c.b)

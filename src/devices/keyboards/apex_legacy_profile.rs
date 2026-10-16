@@ -1,8 +1,15 @@
 //! [EXPERIMENTAL] On-board profile read-back for the legacy/"macho" Apex platform.
 //!
-//! This module is the pure half of the read path: frame builders, the read sequence plan, reply
-//! parsing, payload assembly, struct decode, checksum reporting and JSON. It performs no I/O. The
-//! hardware loop is [`crate::devices::keyboards::apex_legacy_onboard`] (feature `onboard`).
+//! This module is the pure half of the read path: frame builders, reply parsing, payload assembly,
+//! struct decode, checksum reporting and JSON. It performs no I/O. The hardware loop is
+//! [`crate::devices::keyboards::apex_legacy_onboard`] (feature `onboard`).
+//!
+//! It lives in this keyboard namespace, behind the same feature as its consumers, because everything
+//! in it belongs to this one platform: the reply framing, resource-buffer and window sizes, file-id
+//! base, payload sizes, schema words and the payload struct offsets all come from the legacy platform's
+//! own protocol module (`apexui.dll`). Nothing here is generic - the Gen3 platform (`0x1628`) reads its
+//! on-board profile through a completely different transport (see
+//! [`crate::devices::keyboards::apex_pro_tkl_2023_profile`]) and shares none of it.
 //!
 //! Protocol status: reverse-engineered. The file ids, chunk geometry, frame layouts and the payload
 //! struct layout below are reproduced from the Windows engine's device descriptors, and the wire part of
