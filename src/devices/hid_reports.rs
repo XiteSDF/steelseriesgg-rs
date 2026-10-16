@@ -488,9 +488,14 @@ pub const ONBOARD_MAX_READ_LEN: usize = ONBOARD_REPLY_REPORT_SIZE - 1;
 /// (`34 2e 31 36 2e 38 00…` = `4.16.8` in the reference capture).
 ///
 /// The argument byte does not matter on hardware: an Apex 7 wired answered `90 00` and `90 01` the same
-/// way (2026-10-17). GG's chain polls with both 11 ms apart; one poll is enough, so this crate sends
-/// `90 00`. The chain's other frames, `f4 00` ([`CommandCode::EngineStatus`]) and `6c 00 01`
-/// ([`CommandCode::OpenFiles`]), have unknown meanings and are not sent here.
+/// way (2026-10-17). GG's chain polls with both 11 ms apart; this crate sends the whole chain
+/// ([`ONBOARD_INIT_CHAIN`]) in front of the first pull, which starts with this poll. The chain's other
+/// frames, `f4 00` ([`CommandCode::EngineStatus`]) and `6c 00 01` ([`CommandCode::OpenFiles`]), have
+/// unknown meanings and are sent because the read needs them (see [`OnboardInitCommand`]).
+///
+/// The read sends this frame as the first entry of [`ONBOARD_INIT_CHAIN`] (the chain's bytes for frame 1
+/// are identical to this builder's, asserted in `firmware_poll_matches_one_answered_form`); this named
+/// builder stays as the hardware-confirmed `90 00` poll itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OnboardFirmwareVersionCommand;
 
@@ -519,6 +524,83 @@ impl HidCommand for OnboardFirmwareVersionCommand {
 
     fn description(&self) -> String {
         "On-board firmware version poll: 90 00".to_string()
+    }
+}
+
+/// Number of frames in GG's legacy Apex opening chain, see [`ONBOARD_INIT_CHAIN`].
+pub const ONBOARD_INIT_FRAME_COUNT: usize = 6;
+
+/// [EXPERIMENTAL] GG's legacy Apex opening chain, sent once in front of the first pull, `[report
+/// number][command][argument bytes][0…]` in 64-byte output reports
+/// (`SET_REPORT wValue 0x0200 wIndex 1 wLength 64`, 8-14 ms apart, median 11 ms, in the reference
+/// capture).
+///
+/// **The chain is required on hardware.** A read that sends only the [`OnboardFirmwareVersionCommand`]
+/// poll is answered on the wire, but the payload replies come back as scrambled bytes; with this chain
+/// sent the same read collects a profile slot (Apex 7, 2026-10-18). Which frame arms the resource buffer
+/// is not known: in the capture `f4 00` ([`CommandCode::EngineStatus`]) answers `00 01 00 …` and `6c 00 01`
+/// ([`CommandCode::OpenFiles`]) is answered by nothing, so this crate sends all six frames the way GG does.
+/// `90 00` and `90 01` ([`CommandCode::FirmwareVersion`]) answer with the ASCII firmware version on
+/// hardware (2026-10-17).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OnboardInitCommand {
+    /// Frame command code.
+    pub command: CommandCode,
+    /// The two bytes behind the command, zero padded into the 64-byte report.
+    pub argument: [u8; 2],
+}
+
+/// The chain in GG's order: `90 00`, `90 01`, `f4 00`, `6c 00 01`, `90 00`, `90 01`.
+pub const ONBOARD_INIT_CHAIN: [OnboardInitCommand; ONBOARD_INIT_FRAME_COUNT] = [
+    OnboardInitCommand {
+        command: CommandCode::FirmwareVersion,
+        argument: [0x00, 0x00],
+    },
+    OnboardInitCommand {
+        command: CommandCode::FirmwareVersion,
+        argument: [0x01, 0x00],
+    },
+    OnboardInitCommand {
+        command: CommandCode::EngineStatus,
+        argument: [0x00, 0x00],
+    },
+    OnboardInitCommand {
+        command: CommandCode::OpenFiles,
+        argument: [0x00, 0x01],
+    },
+    OnboardInitCommand {
+        command: CommandCode::FirmwareVersion,
+        argument: [0x00, 0x00],
+    },
+    OnboardInitCommand {
+        command: CommandCode::FirmwareVersion,
+        argument: [0x01, 0x00],
+    },
+];
+
+impl HidCommand for OnboardInitCommand {
+    fn command_code(&self) -> CommandCode {
+        self.command
+    }
+
+    fn serialize(&self, buffer: &mut [u8], _device_type: HidDeviceType) -> Result<usize> {
+        check_report_buffer(buffer, ONBOARD_OUTPUT_REPORT_SIZE)?;
+        let report = &mut buffer[..ONBOARD_OUTPUT_REPORT_SIZE];
+        report.fill(0);
+        report[1] = self.command as u8;
+        report[2..4].copy_from_slice(&self.argument);
+        Ok(ONBOARD_OUTPUT_REPORT_SIZE)
+    }
+
+    fn validate(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn description(&self) -> String {
+        format!(
+            "On-board opening chain frame: {:#04X} {:02X} {:02X}",
+            self.command as u8, self.argument[0], self.argument[1]
+        )
     }
 }
 
@@ -1730,6 +1812,47 @@ mod tests {
             OnboardFirmwareVersionCommand.command_code(),
             CommandCode::FirmwareVersion
         );
+    }
+
+    #[test]
+    fn opening_chain_matches_the_capture_frames() {
+        let builder = HidReportBuilder::new(HidDeviceType::Keyboard);
+        let expected: [(u8, [u8; 2]); ONBOARD_INIT_FRAME_COUNT] = [
+            (0x90, [0x00, 0x00]),
+            (0x90, [0x01, 0x00]),
+            (0xf4, [0x00, 0x00]),
+            (0x6c, [0x00, 0x01]),
+            (0x90, [0x00, 0x00]),
+            (0x90, [0x01, 0x00]),
+        ];
+        assert_eq!(ONBOARD_INIT_CHAIN.len(), ONBOARD_INIT_FRAME_COUNT);
+        for (index, frame) in ONBOARD_INIT_CHAIN.iter().enumerate() {
+            let mut buffer = [0u8; ONBOARD_OUTPUT_REPORT_SIZE];
+            let size = builder
+                .build_report(*frame, &mut buffer)
+                .expect("chain frame builds in a 64-byte report");
+            let (command, argument) = expected[index];
+            assert_eq!(size, ONBOARD_OUTPUT_REPORT_SIZE);
+            assert_eq!(buffer[0], 0x00, "report number 0, as the capture's wValue 0x0200");
+            assert_eq!(
+                &buffer[1..4],
+                &[command, argument[0], argument[1]],
+                "chain frame {} in GG's order",
+                index + 1
+            );
+            assert!(buffer[4..].iter().all(|b| *b == 0), "zero padded data stage");
+        }
+
+        // The chain's first frame is the `90 00` firmware poll, byte for byte.
+        let mut poll = [0u8; ONBOARD_OUTPUT_REPORT_SIZE];
+        let mut chain = [0u8; ONBOARD_OUTPUT_REPORT_SIZE];
+        OnboardFirmwareVersionCommand
+            .serialize(&mut poll, HidDeviceType::Keyboard)
+            .unwrap();
+        ONBOARD_INIT_CHAIN[0]
+            .serialize(&mut chain, HidDeviceType::Keyboard)
+            .unwrap();
+        assert_eq!(poll, chain);
     }
 
     #[test]

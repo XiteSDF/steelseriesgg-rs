@@ -21,9 +21,9 @@
 //! accepted a pull and a payload-read request on its interface-4 vendor collection and answered a pull
 //! on the interrupt endpoint; the payload read timed out there, which is why the reply is read on the
 //! control endpoint first. Since the read-back fix of 2026-10-17 a full slot read completes on an Apex 7
-//! under Linux (reported 2026-10-18; model, firmware and the decoded bytes are not recorded in this repo
-//! yet). Nothing here writes a profile, and the payload struct offsets stay unverified until a read is
-//! compared with what GG shows for that slot.
+//! under Linux (reported 2026-10-18, with GG's opening chain sent; the read without it answered on the
+//! wire with scrambled payload bytes). Nothing here writes a profile, and the payload struct offsets stay
+//! unverified until a read is compared with what GG shows for that slot.
 //!
 //! # Wire format
 //!
@@ -34,15 +34,15 @@
 //! is the report ID.
 //!
 //! * firmware poll (output report ID `0x00`, 64 data bytes on the wire, `SET_REPORT wValue 0x0200 wIndex
-//!   1 wLength 64`): this crate sends `90 00` and reads the answer on the interrupt endpoint, where it
-//!   is the ASCII firmware version (`34 2e 31 36 2e 38 00…` = `4.16.8`, see [`parse_firmware_version]).
-//!   An Apex 7 wired answered `90 00` and `90 01` identically on 2026-10-17, so one poll is enough and
-//!   the crate sends one: see
-//!   [`crate::devices::hid_reports::OnboardFirmwareVersionCommand`]. GG's own opening chain is longer -
-//!   `90 00`, `90 01`, `f4 00`, `6c 00 01`, then `90 00` and `90 01` again, 11 ms apart - and the
-//!   meanings of `f4 00` (answered `00 01 00…`) and `6c 00 01` (never answered in the capture) are
-//!   unknown, so the chain is not replayed here. The capture contains no 13-byte transfer anywhere, so
-//!   the pacing frame earlier versions of this module sent is not part of GG's read.
+//!   1 wLength 64`): `90 00`, answered on the interrupt endpoint with the ASCII firmware version
+//!   (`34 2e 31 36 2e 38 00…` = `4.16.8`, see [`parse_firmware_version]). An Apex 7 wired answered `90 00`
+//!   and `90 01` identically on 2026-10-17. This crate sends it inside GG's opening chain - `90 00`,
+//!   `90 01`, `f4 00`, `6c 00 01`, then `90 00` and `90 01` again, 11 ms apart
+//!   ([`crate::devices::hid_reports::ONBOARD_INIT_CHAIN`]), which is what a read needs on hardware: with
+//!   only the poll the replies come back scrambled (2026-10-18). The meanings of `f4 00` (answered
+//!   `00 01 00…`) and `6c 00 01` (never answered in the capture) are unknown. The capture contains no
+//!   13-byte transfer anywhere, so the pacing frame earlier versions of this module sent is not part of
+//!   GG's read.
 //! * pull (`HIDIO`, output report ID `0x00`, 64 bytes on the wire, `SET_REPORT wValue 0x0200 wIndex 1`):
 //!   `85 | 00 | file_id u16 LE | offset u32 LE | size u16 LE | 00…` (10 frame bytes, 11-byte report buffer)
 //!   — copies `size` bytes of the profile file into the device's resource buffer at buffer offset 0.
@@ -136,9 +136,11 @@ pub const READ_REPORT_LEN: usize = ONBOARD_FEATURE_REPORT_SIZE;
 /// wIndex 1 wLength 64`): the firmware poll and every pull. The report number the transport prefixes
 /// is not part of it.
 pub const OUTPUT_REPORT_DATA_LEN: usize = ONBOARD_OUTPUT_REPORT_SIZE - 1;
-/// Length of the interrupt-endpoint answer to the `0x90` firmware poll: the 64-byte data stage of the
-/// frame that poll was sent as.
-pub const FIRMWARE_REPLY_LEN: usize = OUTPUT_REPORT_DATA_LEN;
+/// Input-report size GG reads on the interrupt endpoint: its `read-chunk HIDIO 65` is a report-ID slot
+/// plus 64 data bytes. The same read serves the pacing packet after a pull and the answers of the opening
+/// chain (`0x6E` with the ASCII firmware version, `0x12` with `00 01 …`), so this is the length the read
+/// loop asks hidapi for. A 64-byte ask works but truncates the last byte of a full 65-byte answer.
+pub const GG_INPUT_READ_BYTES: usize = OUTPUT_REPORT_DATA_LEN + 1;
 /// Header of a header-echoing payload-read reply, report ID byte excluded: `reserved, offset u16, size u16`.
 pub const READ_REPLY_HEADER_LEN: usize = 5;
 /// Framing bytes between the report-ID byte and the payload of a payload-read reply (`GET_REPORT

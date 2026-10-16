@@ -20,23 +20,33 @@ Moved from `PLAN.md`:
 Implemented 2026-10-15 from the 2026-10-15 GG capture: a `0x90` firmware-version poll, `0x85` pulls,
 `0x83` payload reads, checksum, payload decode, `ssgg onboard read|decode`. Only the profile slot is
 selectable (`--profile 0..4`); the geometry is compile-time constants. The 13-byte "pacing frame" earlier
-versions sent is not in the capture and was removed, and so was GG's six-frame opening chain (`90 00`,
-`90 01`, `f4 00`, `6c 00 01`, `90 00`, `90 01`), removed 2026-10-17: the read sends the single `90 00`
-poll it needs, because on hardware `90 00` and `90 01` answer identically and `f4 00` and `6c 00 01`
-have no known meaning. Every protocol byte in it is `[EXPERIMENTAL]`. Read-only by design: the push
+versions sent is not in the capture and was removed. GG's six-frame opening chain (`90 00`,
+`90 01`, `f4 00`, `6c 00 01`, `90 00`, `90 01`) was removed on 2026-10-17 as unnecessary (only the `90`
+polls were known to answer) and **restored on 2026-10-18: the read sends all six (`ONBOARD_INIT_CHAIN`),
+because a read that sends only the `90 00` poll is answered on the wire and its payload replies come back as
+scrambled bytes.** `f4 00` and `6c 00 01` have no known meaning, and which frame of the six the keyboard
+needs is open. Every protocol byte in it is `[EXPERIMENTAL]`. Read-only by design: the push
 command is named and never sent. Wire format, layout table and open questions:
 `docs/development/apex-7-onboard-profile-read.md`.
 
 **Read status (2026-10-18):** `ssgg onboard read --yes --profile N` completes a full slot read on an Apex 7
 under Linux. That closes the transport questions (steps 1, 1a, 1b) and the framing question (step 2). It is
 reported without the run log, so record the model, firmware, slot contents and the checksum line from the run
-here before anything is promoted to confirmed - the label stays until then. Steps 3-5 (slot by slot, the
-double read, the layout compare with GG) are what is left.
+here before anything is promoted to confirmed - the label stays until then. The chain is part of that
+finding: the read only produces readable payload bytes with `ONBOARD_INIT_CHAIN` sent. Steps 3-5 (slot by
+slot, the double read, the layout compare with GG) and the chain question (which frame arms the resource
+buffer) are what is left.
 
-0. **[HW] Firmware poll:** `ssgg onboard read --yes --profile 0` starts with the single `90 00` poll and
-   prints its answer in the `firmware:` line. **Measured 2026-10-17:** an Apex 7 wired answered `90 00` and
-   `90 01` the same way, so one poll is all the read needs; `f4 00` and `6c 00 01` (the other two frames of
-   GG's chain) are not sent and their meanings are unknown.
+0. **[HW] Opening chain and firmware poll:** `ssgg onboard read --yes --profile 0` starts with GG's six-frame
+   chain (`90 00`, `90 01`, `f4 00`, `6c 00 01`, `90 00`, `90 01`, 11 ms apart) and prints the firmware version
+   answered by the first `90 00` in the `firmware:` line. **Measured 2026-10-17:** an Apex 7 wired answered
+   `90 00` and `90 01` the same way. **Measured 2026-10-18:** the chain is required - with only the `90 00`
+   poll the read is answered and the payload comes back scrambled, so all six frames are sent; the meanings of
+   `f4 00` and `6c 00 01` are still unknown. **Measured 2026-10-18 as well:** the chain is answered **one frame
+   at a time** - a chain run that drained only the first answer collected the answers of `90 00` and `90 01`
+   and nothing from frame 3 on, with all six frames on the wire - so `send_init_chain` reads one input report
+   after every frame (GG's `read-chunk HIDIO 65`, `GG_INPUT_READ_BYTES`). Why an unread answer silences the
+   frames after it is inference, not measured.
 
 0a. **[HW] The pull is pacing, not a data transfer:** **Measured 2026-10-17** at the endpoint level of the
    capture (`dev.pcap`): every one of the 121 pulls is answered 1.7-3.7 ms later by the keyboard's ordinary
@@ -49,6 +59,13 @@ double read, the layout compare with GG) are what is left.
    `reports.csv` lists the
    121 pulls as 64-byte "control responses" starting `85 00 …` - those are the requests GG submitted, which is
    why pull replies were earlier described as constant 64-byte frames.
+
+0b. **[HW] Which chain frame arms the resource buffer:** drop the chain frames one at a time (a code change
+    in `ONBOARD_INIT_CHAIN`) on a run that reads a slot whose contents you know from GG, and record here
+    which frame the keyboard needs. Today all six frames are sent, and the answer is what lets the read drop
+    the ones that do nothing. **Drain one input report after every frame while testing:** a frame set tested
+    without draining looks dead when the only fault is the unread answer (step 0, 2026-10-18). Which frame
+    arms the buffer is still unmeasured.
 
 Measured 2026-10-16 by comparing the GG capture with the ssgg run of 2026-10-15 on the same keyboard: the
 chain, the chain answers, the pull header and the `83` header all match, and the frames we send are answered
@@ -110,7 +127,7 @@ not the interface 1 (`wIndex 1`) the Windows capture used). The read does not pr
 
 | Piece | Where |
 |-------|-------|
-| Wire types: `0x85` pull, `0x83` read, `0x90` firmware poll, the 643-byte read buffer | `src/devices/hid_reports.rs` (`OnboardPullCommand`, `OnboardReadCommand`, `OnboardFirmwareVersionCommand`) — not feature-gated, no raw byte arrays outside it. `OnboardInitCommand`/`ONBOARD_INIT_CHAIN` are gone (2026-10-17, see the firmware-poll row of `.claude/rules/experimental-protocol.md`): the chain's `f4 00` and `6c 00 01` stay documented as `CommandCode::EngineStatus`/`OpenFiles`, meanings unknown, sent by nothing |
+| Wire types: `0x85` pull, `0x83` read, `0x90` firmware poll, the opening chain, the 643-byte read buffer | `src/devices/hid_reports.rs` (`OnboardPullCommand`, `OnboardReadCommand`, `OnboardFirmwareVersionCommand`, `OnboardInitCommand` + `ONBOARD_INIT_CHAIN`) — not feature-gated, no raw byte arrays outside it. The chain is `90 00`, `90 01`, `f4 00`, `6c 00 01`, `90 00`, `90 01` and the read sends all of it: a read with only the `90 00` poll answers with scrambled payload bytes (Apex 7, 2026-10-18). `CommandCode::EngineStatus` (`f4 00`) and `CommandCode::OpenFiles` (`6c 00 01`) name the chain's two unexplained frames; they were removed 2026-10-17 and restored 2026-10-18 |
 | Read geometry, reply parsing, assembly, decode | `src/devices/keyboards/apex_legacy_profile.rs` (`PULLS_PER_FILE`, `DEVICE_RESOURCE_BUFFER_LEN`, `PAYLOAD_READ_LEN`, `PROFILE_FILE_BYTES`, `READS_PER_PULL`, `profile_file_id`, `validate_profile`, `parse_read_reply`, `ProfileImage`, `decode`), core code. It was `src/onboard_profile.rs` until 2026-10-17, when it moved into the legacy Apex namespace: its constants are all `apexui.dll` facts of the legacy ("macho") platform - reply framing, resource-buffer size, payload sizes, schema words, struct offsets - and there is nothing there another family can share. The only knob is the profile slot: pull count, buffer size, window size, pacing and reply framing are constants, the read loop builds every frame from the typed commands, and it is also what logs the geometry - the CLI prints none, so no legacy constant appears in `src/main.rs`. Renamed 2026-10-18 so the names say **fact**, not **default**: `DEFAULT_CHUNKS` → `PULLS_PER_FILE`, `READ_LEN` → `PAYLOAD_READ_LEN`, `RESOURCE_BUFFER_LEN` → `DEVICE_RESOURCE_BUFFER_LEN`, `PROFILE_FILE_LEN` → `PROFILE_FILE_BYTES`, `SCHEMA_B_FIRMWARE` → `SCHEMA_B_FIRMWARE_VERSION` (documentation only - the read takes its schema from the word it reads). Deleted as unused: `PROFILE_FS_LEN` (the 0xA000 flash region), `PULL_REPORT_LEN`, `INIT_REPORT_LEN`, `LIGHTING_FS_SHARED` |
 | Packet I/O | `src/devices/keyboards/mod.rs`: `GenericKeyboard` does the profile packet I/O on the `device` handle it already owns - `connected_device` (the one handle accessor, shared with the lighting sends, same "Device not connected" message), `write_profile_packet` (its own output write - the lighting write path runs the hid optimizer, which would drop the repeated frames of a read), `send_feature`, `read_profile_feature_packet`, `read_profile_input_packet`, core code; `apex_legacy_onboard` runs the read plan against `&GenericKeyboard` on a scoped thread (`std::thread::scope`, 2026-10-18, which replaced `spawn_blocking` fed by an `unsafe` transmute to `&'static` - the scoped borrow is checked, and the read blocks the task's thread for its ~2 s). The plan takes the slot only: `strict` (no flag fed it) and the `deadline` reply-budget plumbing (always `None`) are gone, one payload read has one fixed `REPLY_BUDGET_MS`. No transport type: `OnboardTransport` with its `HandleTransport` and `PathTransport`, and the per-call path-open helpers (`send_feature_report_raw`, `read_feature_report_raw`, `write_output_report_raw`, `read_input_report_raw`) were all removed on 2026-10-17; Apex 7 wired works through hidapi |
 | Keyboard device | `src/devices/keyboards/apex7.rs`: `Apex7` wraps `GenericKeyboard` (its `HidReportBuilder` and the open `HidDevice`) and runs the read on its own handle; `onboard_family(pid)` selects `0x1612`, `0x1614`, `0x1616`, `0x1618` and `discovery::open_keyboard` wraps those PIDs in it - the read path is core code, labelled `[EXPERIMENTAL]`, so a family board keeps standard lighting in every build |
