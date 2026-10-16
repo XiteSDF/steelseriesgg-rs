@@ -33,8 +33,8 @@ Protocol facts for the Apex Pro TKL 2023 are in `AGENTS.md` ("Protocol research 
 ## P0 (onboard). Apex 7 on-board read: first hardware run on the device path
 
 Code is in place (2026-10-17, `onboard-configs-dev`): `Apex7` in `src/devices/keyboards/apex7.rs` wraps
-`GenericKeyboard` (its `HidReportBuilder` and the open `HidDevice`) and runs the read on its own handle
-through `HandleTransport`; `Keyboard::read_onboard_profile` is the device API,
+`GenericKeyboard` (its `HidReportBuilder` and the open `HidDevice`) and does the read's packet I/O
+itself on that handle; `Keyboard::read_onboard_profile` is the device API,
 `discovery::open_keyboard` returns `Apex7` for `0x1612`, `0x1614`, `0x1616`, `0x1618` - **with or without
 the `onboard` feature** (2026-10-17: the device class is part of the device tree, only the read path is
 feature-gated). `ssgg onboard read` runs on that device. Nothing has been replayed on hardware.

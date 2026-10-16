@@ -1,10 +1,9 @@
 //! [EXPERIMENTAL] Apex 7 and the rest of the legacy "macho" Apex family.
 //!
 //! Wraps [`GenericKeyboard`] — its [`HidReportBuilder`](crate::devices::hid_reports::HidReportBuilder)
-//! and the open [`HidDevice`](hidapi::HidDevice) — and adds the on-board profile read, which runs on
-//! the device's own handle: the frames go out through the transport in
-//! [`apex_legacy_onboard`](super::apex_legacy_onboard), the payload comes back on the same collection
-//! the device manager opened, and the collection stays open for the whole read (`usbhid` polls a
+//! and the open [`HidDevice`](hidapi::HidDevice) — and adds the on-board profile read: this object
+//! performs the packet reads and writes itself, on the handle of the collection the device manager
+//! opened, and that collection stays open for the whole read (`usbhid` polls a
 //! collection's interrupt endpoint only while a descriptor on that node is open, so the opening-chain
 //! answers and the pull acknowledges have nowhere to arrive on a per-report open).
 //!
@@ -16,11 +15,19 @@
 //! and this device writes no profile: there is no read-back command for the family.
 
 use std::ops::{Deref, DerefMut};
+#[cfg(feature = "onboard")]
+use std::sync::Arc;
+
+#[cfg(feature = "onboard")]
+use parking_lot::Mutex;
+
+#[cfg(feature = "onboard")]
+use hidapi::HidDevice;
 
 use async_trait::async_trait;
 
 #[cfg(feature = "onboard")]
-use super::apex_legacy_onboard::{self, HandleTransport};
+use super::apex_legacy_onboard;
 use super::{GenericKeyboard, Keyboard};
 use crate::devices::key_mapping::{KeyId, KeyMapping};
 use crate::devices::product_ids;
@@ -90,18 +97,18 @@ impl Apex7 {
         self.onboard = config;
     }
 
-    /// The transport this device reads on: its own open handle.
+    /// The profile collection this device reads on: its own open HID handle, which the read keeps
+    /// locked per transfer.
     ///
     /// # Errors
     ///
     /// Returns an error when the device was created without a hidapi handle.
     #[cfg(feature = "onboard")]
-    fn transport(&self) -> Result<HandleTransport> {
-        let handle = self
-            .inner
+    fn profile_handle(&self) -> Result<Arc<Mutex<HidDevice>>> {
+        self.inner
             .hid_handle()
-            .ok_or_else(|| Error::DeviceCommunication("Apex 7 has no open HID handle".to_string()))?;
-        Ok(HandleTransport::new(handle.clone()))
+            .cloned()
+            .ok_or_else(|| Error::DeviceCommunication("Apex 7 has no open HID handle".to_string()))
     }
 
     /// Reads one on-board profile slot with an explicit plan.
@@ -112,7 +119,7 @@ impl Apex7 {
     /// a payload read.
     #[cfg(feature = "onboard")]
     pub async fn read_profile(&self, config: &ReadConfig) -> Result<ProfileImage> {
-        apex_legacy_onboard::read_profile(self.transport()?, config, false).await
+        apex_legacy_onboard::read_profile(self.profile_handle()?, config, false).await
     }
 
     /// Reads the slot this device's [`Apex7::onboard_config`] selects.
@@ -237,8 +244,8 @@ mod tests {
         #[test]
         fn a_device_without_a_handle_says_so() {
             let keyboard = device_without_handle(product_ids::APEX_7);
-            match keyboard.transport() {
-                Ok(_) => panic!("a device without a handle must not report a transport"),
+            match keyboard.profile_handle() {
+                Ok(_) => panic!("a device without a handle must not report a profile collection"),
                 Err(error) => assert!(
                     error.to_string().contains("no open HID handle"),
                     "the error names the missing handle: {error}"
