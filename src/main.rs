@@ -808,7 +808,8 @@ async fn cmd_profile(action: ProfileAction) -> Result<()> {
 /// [EXPERIMENTAL] Read the on-board profile of a legacy Apex keyboard.
 ///
 /// Reads only. The protocol is reverse-engineered from the GG USBPcap capture written up in
-/// docs/development/apex-7-onboard-profile-read.md and has never been replayed from this crate.
+/// docs/development/apex-7-onboard-profile-read.md; a full slot read has completed on an Apex 7, the
+/// decoded layout and the checksum words are still unverified.
 async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAction) -> Result<()> {
     use steelseries_gg::devices::keyboards::apex_legacy_profile::{hex_dump, profile_json, schema_of, to_json};
 
@@ -903,9 +904,6 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
     Ok(())
 }
 
-/// Device paths to try for a profile read: the control collection discovery ranked for this
-/// vendor/product pair (or the `--device` node) first, then the interface-1 collection of the same
-/// device, where the reference capture shows every profile transfer running.
 /// The Apex 7 as a keyboard device, when the target carries the `[EXPERIMENTAL]` on-board profile
 /// protocol. The read then runs on the handle the device manager opened, which is what `usbhid` needs
 /// for the firmware-poll answer and the pacing packet after every pull: it polls an interrupt endpoint only
@@ -933,7 +931,7 @@ async fn onboard_keyboard(manager: &mut DeviceManager, device: &Option<String>) 
     keyboard.supports_onboard_profile().then_some(keyboard)
 }
 
-/// Where a device-driven read ran, in the same reporting form the path-based read prints.
+/// Where a device-driven read ran: the keyboard's name and the collection the manager opened.
 fn onboard_device_label(keyboard: &dyn Keyboard) -> String {
     format!("{} ({})", keyboard.info().name, keyboard.info().path)
 }
@@ -949,15 +947,16 @@ fn parse_vid_pid(spec: &str) -> Option<(u16, u16)> {
 
 fn require_yes(what: &str) -> Result<()> {
     println!("Refusing to {what} without --yes:");
-    println!("  this is experimental, reverse-engineered protocol code that has never been replayed on");
-    println!("  hardware, and it talks to a keyboard through a raw device node.");
+    println!("  this is experimental, reverse-engineered protocol code that talks to a keyboard through");
+    println!("  a raw device node. It reads the on-board profile and writes nothing.");
     println!("Add --yes when you accept that.");
     Ok(())
 }
 
 fn print_onboard_banner() {
     println!("[EXPERIMENTAL] legacy Apex on-board profile read");
-    println!("  reverse-engineered from one GG USBPcap capture, never replayed from this crate; reads only.");
+    println!("  reverse-engineered from one GG USBPcap capture; reads only, never writes.");
+    println!("  slot layout, checksums and the decode are still unverified - compare a read with GG.");
     println!("  watch the keyboard while it runs: if lighting flickers, Ctrl-C stops the read.");
     println!();
 }

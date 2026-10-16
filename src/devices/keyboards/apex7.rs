@@ -68,12 +68,16 @@ impl Apex7 {
 
     /// Read one on-board profile slot (slots `0..=4`; everything else about the read is fixed geometry).
     ///
+    /// The read plan polls the device and sleeps for GG's inter-frame pacing, so it runs on a scoped
+    /// thread and blocks this task's thread until the read finishes (about 2 s for a slot on the
+    /// reference capture's cadence).
+    ///
     /// # Errors
     ///
     /// Returns an error when the slot is out of range, the collection rejects a frame, or it never
     /// answers a payload read.
     pub async fn read_profile(&self, profile: u8) -> Result<ProfileImage> {
-        apex_legacy_onboard::read_profile(&self.inner, profile, false).await
+        apex_legacy_onboard::read_profile(&self.inner, profile).await
     }
 }
 

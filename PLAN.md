@@ -37,25 +37,26 @@ Code is in place (2026-10-17, `onboard-configs-dev`): `Apex7` in `src/devices/ke
 itself on that handle; `Keyboard::read_onboard_profile` is the device API,
 `discovery::open_keyboard` returns `Apex7` for `0x1612`, `0x1614`, `0x1616`, `0x1618` - the whole read path is
 core code (2026-10-17: the `onboard` feature flag was removed, the device class and the read path are both in
-the default build). `ssgg onboard read` runs on that device. Nothing has been replayed on hardware.
+the default build). `ssgg onboard read` runs on that device. **Status 2026-10-18:** a full profile slot read
+completes on an Apex 7 under Linux, so this section is the validation backlog: record the model, firmware, slot
+bytes and the checksum line from the run log - that is what promotes any of it to confirmed.
 
 0. **[HW] The per-pull pacing read stays** (2026-10-17, Apex 7 `0xFFC1`): the pull's answer is the keyboard's
    idle input report, and draining it per chunk is what lets the following feature read-back complete - a run
    that removed the drain failed every payload read-back with `io::read_exact: unexpected end of file`. The step
    is `apex_legacy_onboard::read_pull_ack` (`PULL_ACK_LEN` = 64 bytes, GG's `read-chunk HIDIO 65`).
-1. **[HW] Collection check first:** `ls -l /sys/class/hidraw/hidrawN/device/../input*`. The 2026-10-15
-   run found the interface-1 collection (`/dev/hidraw3`) had no `input*`, so the device manager opened
-   interface 4 (`usage 0xFFC1`) — the collection with an `input*` node, not the one GG used. If interface
-   1 has no `input*`, boot once with the kernel argument `usbhid.poll_descriptor_ignores_interfaces=0`
-   (`sudo raspistop --bootcmd setusbhid` form from `ONBOARD.md` Step 1) and re-check.
-2. **[HW] Reply framing on the device:** short reads, one per candidate framing -
-   `ssgg --debug onboard read --yes --profile 0`; the geometry, pacing, opening chain and reply framing are
-   constants since 2026-10-17 (`ReadConfig` and its CLI tunables are gone), so the framing candidates
-   `0, 1, 2, 5, 6, 14, 19, 20, 21, 36` are read from the `--debug` capture and applied in code; the `90` poll answer
-   in the log confirms the device path, and the framing whose answer carries schema `0x000B` with a
-   readable name is the anchor.
-3. **[HW] Read slot 0** (`--out /tmp/p0.bin --json /tmp/p0.json`), then slots
-   `1..4`, then `--verify`; pacing is the `GG_GAP_MS` constant, so a gap ladder is a code change. Record the checksum line and the decoded layout as
+1. **[HW] Collection check - answered 2026-10-17/18:** the read reads the profile on the collection the device
+   manager opened (`usage 0xFFC1`, interface 4 on that box), so the interface-1 question is not blocking. Keep the
+   sysfs check (`ls -l /sys/class/hidraw/hidrawN/device/../input*`) when a box behaves differently; if a keyboard
+   needs interface 1 (`wIndex 1` in the capture) and the manager opens another collection, that collection has to be
+   discovered as its own device.
+2. **[HW] Reply framing on the device - answered 2026-10-17/18:** framing 0 ([`READ_REPLY_FRAMING_LEN`]) is what the
+   reads collect profile bytes with, matching the capture. The geometry, pacing, opening chain and reply framing are
+   constants (`ReadConfig` and its CLI tunables are gone), so a keyboard that anchors its payload elsewhere is a code
+   change measured from a `--debug` capture first; the `90` poll answer in the log confirms the device path.
+3. **[HW] Slots `1..4`, then `--verify`** (slot 0 reads since 2026-10-17/18): `ssgg onboard read --yes --profile N
+   --out /tmp/pN.bin --json /tmp/pN.json`; every read
+   prints that slot's schema word. Pacing is the `GG_GAP_MS` constant, so a gap ladder is a code change. Record the checksum line and the decoded layout as
    `ONBOARD.md` "Next hardware steps" describes.
 4. **[HW] Windows:** same read through the hidapi path; confirms the interface choice for the control
    collection.
@@ -280,13 +281,20 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   so interface 1 resolved to nothing).
   *(superseded 2026-10-17: `candidate_paths`, `PathTransport` and the `*_report_raw` helpers are removed; the
   read runs on the `Apex7` device handle - see P0 "Linux collection" and item 0 of this section.)*
-  Next step (keyboard): ask the read-back of the collection that declares it - interface 1 (`0xFFC0`): the
-  kernel validates GET_REPORT against the interface's report descriptor, and interface 1 answered `EPIPE` to
-  the 2026-10-15 report-ID-framed writes. Then
-  with the keyboard: `ssgg --debug onboard read --yes --profile 0`, and check in the capture that a control-IN
-  transfer with 642 bytes of data appears and where its payload starts; the reply framing, the opening chain and
-  the pacing are constants in code, so what the CLI used to sweep by flag is now measured from the capture and
-  applied to the constants (GG runs the chain before every read session).
+  *(superseded 2026-10-18: that read-back arrived - the reads of 2026-10-17/18 collect a 642-byte control-IN
+  reply, framing 0, on the collection the device manager opened for the keyboard.)*
+- 2026-10-18: cleanup after the first successful profile reads. Protocol constants are named as facts, not as
+  tunables: `DEFAULT_CHUNKS` → `PULLS_PER_FILE`, `READ_LEN` → `PAYLOAD_READ_LEN`, `RESOURCE_BUFFER_LEN` →
+  `DEVICE_RESOURCE_BUFFER_LEN`, `PROFILE_FILE_LEN` → `PROFILE_FILE_BYTES`, `SCHEMA_B_FIRMWARE` →
+  `SCHEMA_B_FIRMWARE_VERSION` (documentation only - the read takes its schema from the word it reads). Deleted as
+  unused: `PROFILE_FS_LEN`, `PULL_REPORT_LEN`, `INIT_REPORT_LEN`, `LIGHTING_FS_SHARED`,
+  `MAX_PROFILE_INDEX_FOR_READ`, the read plan's `strict` flag (no CLI flag fed it) and its always-`None`
+  `deadline`/reply-budget plumbing (one payload read now has one fixed `REPLY_BUDGET_MS`). The read loop runs on
+  `std::thread::scope` instead of `spawn_blocking` fed by an `unsafe` transmute to `&'static` - the scoped borrow is
+  checked, and the read blocks the task's thread for its ~2 s. Read status recorded in `ONBOARD.md` (steps 1, 1a, 1b,
+  2 closed), `docs/development/apex-7-onboard-profile-read.md` (intro, transport section) and
+  `.claude/rules/experimental-protocol.md`; `ONBOARD.md` steps 3-5 are what is left, starting with the model,
+  firmware and decoded bytes of a run.
 - Old TODO items: clippy-ci / future-incompat errors (resolved, see Baseline); `ssgg_bug_report.json` triage
   (dropped: the file was never provided); issue #6 Arch compile (closed `not_planned`).
 - `docs/development/` consolidation (2026-10-15): capture-note "Transport" section matches the 645-byte /

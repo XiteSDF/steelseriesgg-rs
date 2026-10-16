@@ -1,8 +1,11 @@
 # Apex 7 on-board profile read
 
 Source: `ssgg-capture-1612-20261015-004400` (Windows USBPcap capture of SteelSeries GG talking to an
-Apex 7, PID `0x1612`, 2026-10-15, firmware `4.16.8`). Every item below is `[EXPERIMENTAL]`: nothing of
-it has been replayed from `ssgg` on real hardware. Code: `src/devices/hid_reports.rs` (the command codes
+Apex 7, PID `0x1612`, 2026-10-15, firmware `4.16.8`). Every item below is `[EXPERIMENTAL]`. Read status
+2026-10-18: `ssgg onboard read` completes a full slot read on an Apex 7 under Linux (operator-reported;
+model, firmware and the decoded bytes are not recorded here), so the **read** is replayed on hardware —
+what is not verified is the decode (slot layout, checksum words, the per-slot compare against GG). Nothing
+in this protocol writes to the device. Code: `src/devices/hid_reports.rs` (the command codes
 and every report buffer: `OnboardFirmwareVersionCommand`, `OnboardPullCommand`,
 `OnboardReadCommand`), `src/devices/keyboards/apex_legacy_profile.rs` (reply framing, payload geometry, reply parsing, decode - the module moved there on 2026-10-17, from `src/onboard_profile.rs`, because everything in it is specific to this legacy platform),
 `src/devices/keyboards/apex_legacy_onboard.rs` (read plan, reply assembly, polling),
@@ -349,9 +352,9 @@ Hidapi's `read_timeout` is the same `poll` + `read(2)` pair (`hidapi-2.6.7 src/l
 `linux-native` backend this crate builds; `open` is `O_RDWR | O_CLOEXEC`, `src/linux_native.rs:451`; the C backend is
 `etc/hidapi/linux/hid.c:1108`) and returns `0` on timeout, which keeps "nothing arrived" apart from "the read failed" -
 the 2026-10-15 run's `EAGAIN` came from a `read(2)` issued after its `poll` had timed out. The read path was switched
-briefly to one descriptor held open for the whole session, which is what the endpoint-polling rule above argues for,
-and reverted 2026-10-17 back to per-call opens: the gap behaviour this section measures is therefore **live in the
-current code** and unverified on hardware.
+briefly to one descriptor held open for the whole session, reverted the same day back to per-call opens, and ended up on
+the keyboard's own handle (commit `05c7bc7`, 2026-10-17), which is one open descriptor for the whole read: what the
+endpoint-polling rule above argues for. The 2026-10-17/18 runs that read a profile ran on that handle.
 
 The kernel's own read-back owns the endpoint for its duration: `usb_get_report()` unlinks the in-flight URB, issues
 `GET_REPORT`, copies the answer into the URB buffer, queues it to `hidraw`, then resubmits the URB
@@ -372,8 +375,8 @@ that opens the node per report cannot collect the opening-chain answers or the p
 through hidapi. `Keyboard::send_feature` (the Apex 2023 lighting path) is back on the device handle: the interface-1 reading
 behind its 2026-10-15 path special case was never measured, and **needs a hardware test on `0x1628`**. Two consequences worth knowing: `HIDIOCSOUTPUT` puts output frames on the control port as
 `SET_REPORT wValue 0x0200` - the shape the reference capture shows - where the raw `write(2)` this replaces went to an
-OUT endpoint the profile collection does not have; and `HidApi::new` enumerates the device tree per call. Nothing
-here is confirmed on hardware.
+OUT endpoint the profile collection does not have; and `HidApi::new` enumerates the device tree per call. The read is
+confirmed on hardware (Apex 7, 2026-10-18); the geometry of the decoded payload is not.
 
 Measured 2026-10-16 on the usbmon capture of a full `ssgg onboard read` run (`linux-read.pcapng`, 1428 URBs,
 bus 1 device 24, 1.026 s): the chain answered `4.16.8` (68 reports) and `00 01`, `6c 00 01` answered
