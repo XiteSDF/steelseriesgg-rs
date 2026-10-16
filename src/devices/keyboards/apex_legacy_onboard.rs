@@ -40,7 +40,8 @@
 //! The transfers run on the handle [`GenericKeyboard`] already owns - the collection the device manager
 //! opened, held open for the whole read (see the packet methods named below). `usbhid` polls a
 //! collection's interrupt endpoint only
-//! while a descriptor on that node is open, so the opening-chain answers and the pull acknowledges can
+//! while a descriptor on that node is open, so the interrupt reports the read consumes (the `0x90`
+//! answer and the packet after each pull) can
 //! only arrive on a handle that stays open for the whole read - measured on an Apex 7 in the 2026-10-16
 //! Linux run capture (`linux-read.pcapng`), where a reader that opened the node per report collected
 //! nothing; see `docs/development/apex-7-onboard-profile-read.md`, "Input reports: the node must be open
@@ -79,7 +80,10 @@ const READ_REPLY_ID: u8 = 0x00;
 const READ_REPLY_WIRE_LEN: usize = ONBOARD_REPLY_REPORT_SIZE;
 /// Poll acknowledges and status reports the reply collector skips.
 const ACK_REPORT_IDS: [u8; 2] = [0x0B, 0x12];
-/// Wire length of the pull answer the capture shows (64 bytes on report `0x85`).
+/// Wire length to ask for when collecting the packet that follows a pull. The pull has no answer of
+/// its own: the device keeps streaming its ordinary input reports on the interrupt endpoint (report
+/// `0x01`, all-zero on an idle keyboard, 1.7-3.7 ms after the pull in the capture) and GG consumes one
+/// packet per chunk as pacing, taking no bytes from it.
 const PULL_ACK_LEN: usize = 64;
 /// Polls per reply collection round, in milliseconds.
 const REPLY_POLL_MS: i32 = 50;
@@ -174,7 +178,7 @@ fn read_image(
         let (ack_report_id, ack_hex) = match ack.as_deref() {
             Some(report) if !report.is_empty() => (report[0], hex_of(report)),
             _ => {
-                tracing::debug!("onboard pull answer missing for chunk {chunk} on {path}");
+                tracing::debug!("no input report arrived after the pull for chunk {chunk} on {path}");
                 (0, String::new())
             }
         };
@@ -314,7 +318,8 @@ fn read_reply_report(keyboard: &GenericKeyboard, payload_len: usize, overall: Op
     )))
 }
 
-/// Reads the pull answer (the capture shows a 64-byte report on report `0x85` after each pull).
+/// Consumes the interrupt packet that follows a pull (flow control, the content is not looked at -
+/// GG's read specifiers keep zero bytes of it), so the next payload read starts from a clean queue.
 fn read_pull_ack(keyboard: &GenericKeyboard) -> Option<Vec<u8>> {
     read_interrupt_report(keyboard, PULL_ACK_LEN, PULL_ACK_ATTEMPTS)
 }

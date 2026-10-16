@@ -36,7 +36,7 @@ discovered as its own device; the old path-based probe that tried interface 1 fi
 | Transfer | Control setup (from the capture) | Frame bytes (data stage) |
 |----------|------------------------------|------------------------|
 | firmware poll (1 frame, once) | `SET_REPORT`, `bmRequestType 0x21`, `wValue 0x0200`, `wIndex 1`, `wLength 64` | `90 00 …` zero-padded to 64, answered on the interrupt endpoint with the ASCII firmware version (`34 2e 31 36 2e 38 00…` = `4.16.8`). **This is all the read sends.** GG's opening chain occupies the same slot with six frames 11 ms apart (`90 00`, `90 01`, `f4 00`, `6c 00 01`, `90 00`, `90 01`): `90 00` and `90 01` answer identically — measured on an Apex 7 wired on 2026-10-17, which is why one poll is enough — `f4 00` answers `00 01 00…`, `6c 00 01` answers nothing, and the meanings of both are unknown. `OnboardInitCommand`/`ONBOARD_INIT_CHAIN` were removed 2026-10-17; the codes stay as `CommandCode::{FirmwareVersion, EngineStatus, OpenFiles}` |
-| pull | `SET_REPORT`, `wValue 0x0200`, `wIndex 1`, `wLength 64` | `85 00 <file selector u16 LE> <file offset u32 LE> <size u16 LE>`, then zeros to 64 |
+| pull | `SET_REPORT`, `wValue 0x0200`, `wIndex 1`, `wLength 64` | `85 00 <file selector u16 LE> <file offset u32 LE> <size u16 LE>`, then zeros to 64 — answered by an ordinary input report (`0x01`, all-zero on an idle keyboard), see "What a pull is answered by" |
 | payload read | `SET_REPORT`, `wValue 0x0300`, `wIndex 1`, `wLength 642` | `83 00 <resource-buffer offset u16 LE> <size u16 LE>`, then zeros to 642 |
 | payload write | `SET_REPORT`, `wValue 0x0300`, `wIndex 1`, `wLength 642` | `03 00 <buffer offset u16 LE> <size u16 LE> <payload…>` — GG's write direction, 144 transfers, not sent by `ssgg` |
 | payload reply | `GET_REPORT`, `wValue 0x0300`, `wIndex 1`, `wLength 642` | 643 bytes on the wire: report-ID byte `03`, then a payload that carries the file head (`0b 00` + name) and not the requested window (see "Reply framing") |
@@ -72,9 +72,11 @@ So a 1024-byte pull is drained by two 512-byte reads, and GG never asks for more
 read. The 121 pulls are: one head probe of file `0x0201` at offset 0 with size 2 (its 2-byte read is the
 schema probe), then 12 pulls of
 1024 bytes per file at offsets `0, 1024, …, 11264` for each of the five profile files `0x0201`-`0x0205`
-and the five lighting files `0x0301`-`0x0305`. Median gap between two consecutive replies is 5 ms; one
-pull with its two reads takes about 9.5 ms; the submit-to-completion latency of a payload read is
-1-3 ms; the six opening-chain frames are 11 ms apart.
+and the five lighting files `0x0301`-`0x0305`. At the control-endpoint level the submit-to-completion latency of a
+payload read is 1-3 ms and the six opening-chain frames are 11 ms apart; at the endpoint level of `dev.pcap` (see
+"What answers a pull") a pull is answered in 1.7-3.7 ms, its two reads are answered by their `GET_REPORT` 3.4 ms
+(median) after the request, and GG's whole collection of the profile files - 121 pulls with 241 read-backs, lighting
+frames interleaved - takes 1.8 s, i.e. about 15 ms per chunk, matching the 11 ms pacing plus transfer latency.
 
 
 ## Procedure
@@ -87,7 +89,7 @@ write feature report 0, 642 bytes: 83 00 | 0 u16 | 2 u16
 GET_REPORT wValue 0x0300 wLength 642 -> the file bytes behind the report-ID byte
 for each chunk c in 0..12:
     write output report 0, 64 bytes: 85 00 | fs_id u16 | (c * 1024) u32 | 1024 u16   # fill the buffer
-    read the pull answer (the capture carries it as an input report)
+    read 65 bytes of interrupt input (read-chunk HIDIO 65) and keep 0 bytes of it  # pacing, see below
     for buffer_offset in {0, 512}:
         write feature report 0, 642 bytes: 83 00 | buffer_offset u16 | 512 u16
         GET_REPORT wValue 0x0300 wLength 642 -> the file bytes behind the report-ID byte
@@ -178,8 +180,9 @@ An earlier version of this section claimed all 241 answers start with 20 fixed b
 is `B5`, `B6` or `B7`, that the name of slot 0 sits at framing offset 18, and that slots 2-5 read as
 `Config 2`, `Config 3`, `Config 4`. None of that is on the wire: `summary.md` and `reports.csv` are text
 exports that prefix every report row with the capture's own USBPcap/usbmon header
-(`80 02 00 00 00 00 00 00 ff ff …`), and `reports.csv` lists responses only, so it cannot show request
-shapes at all. Re-derive anything here from the raw pcaps, which are the capture's source of truth.
+(`80 02 00 00 00 00 00 00 ff ff …`), and its "control response" rows are host-to-device control-endpoint data - the
+requests - not device answers (see "What answers a pull"). Re-derive anything here from the raw pcaps, which are the
+capture's source of truth.
 
 The framing is a constant now ([`READ_REPLY_FRAMING_LEN`] = 0, the offset the 2026-10-15 capture shows).
 It was a CLI knob while the landing keyboard was unmeasured - the Apex 7 accepted 6 on 2026-10-15, and 5
@@ -187,6 +190,45 @@ suits a keyboard that echoes the request header - and the short-read sweep over
 `0, 1, 2, 5, 6, 14, 19, 20, 21, 36` is no longer runnable from the CLI. Measure it from a capture
 (`ssgg --debug onboard read`), record the result, and change the constant; the framing a keyboard uses is
 visible in the read output: the schema word appears at byte 0 of the payload only when the anchor is right.
+
+## What answers a pull (decoded 2026-10-17 from the raw pcaps and the engine's read spec)
+
+A pull has **no reply with content**. Three independent lines of evidence:
+
+1. **The engine's own read spec** (`apex_7.lisp`, the read/write APIs of the `0x1612` device): the API is
+   `write-chunk HIDIO 64` + `write-chunk HIDFEATURE 643` and then per chunk
+   `repeat 12 (read-chunk HIDIO 65, read-chunk HIDFEATURE 643, read-chunk HIDFEATURE 643)`. Its byte
+   specifier is `(0 0 1) (repeat 12 ((0 0 0) (1 512 0) (1 512 0)))`: the pull's `HIDIO` read has **zero
+   length**, it contributes no bytes to the assembled image, and the two `HIDFEATURE` reads contribute 512
+   payload bytes each from offset 1. GG discards whatever packet answers a pull.
+2. **Endpoint level of `dev.pcap`** (the engine's own session, 121 pulls): **121 of 121 pulls are followed,
+   1.7-3.7 ms later, by report `0x01`, 63 bytes, every byte zero** - the ordinary input report of an idle
+   keyboard. No pull is followed by a report `0x85`, `0x83` or any pull-specific frame; all 72 `0x05`
+   lighting pushes of the write runs behave the same way. The only command answers on the interrupt endpoint
+   in the whole capture are report `0x2e` (ASCII firmware version `.16.8`, the answers of the `90` polls)
+   and report `0x34` (ASCII serial `464233229222200029`); the all-zero `0x01` stream fills the rest (1649
+   reports, median gap 14 ms = the keyboard's own poll interval).
+3. **The engine's transport** (`SSEdevice.dll`, `HandleHIDCmd`): chunk types 5 and 6 are thin wrappers over
+   the device transport's write/read virtual methods, and chunk types above `0x10` return `0xbadaf6` - there
+   is no richer reply path.
+
+So the packet GG reads after a pull is a **pacing token**: one HID read of the device's input stream
+(65 bytes = the report-ID slot plus the 64-byte report), issued so the kernel serialises the transfer, and
+its content is thrown away by design. All profile bytes arrive through the `0x83` window replies (the
+`GET_REPORT 0x0300` read-back), never through a pull's answer - which is what the read loop here does too
+(`apex_legacy_onboard::read_pull_ack` consumes one packet and looks at none of it).
+
+The capture kit's `reports.csv` lists 121 "control responses" of 64 bytes starting `85 00 <fs_id> <offset>
+<size>`: `capture.ps1` labels host-to-device control-endpoint data "control response", so those rows are the
+`SET_REPORT` requests GG submitted, not device answers (the same rows exist for the `05` and `83` requests,
+72 and 241 of them). Reading them as replies is what produced the earlier claim that pull replies are
+constant, byte-identical frames.
+
+Timing at that level: a pull is answered in **1.7-3.7 ms**; a read request is answered by its `GET_REPORT`
+**3.4 ms** later (median); GG's collection of the profile files (121 pulls, 241 read-backs, lighting frames
+interleaved) takes **1.8 s**, i.e. about 15 ms per chunk - its 11 ms pacing plus transfer latency. The kit
+summary's "about 2 s per chunk" is a pairing artifact: it pairs the 42 `0x85` pulls of the write runs with
+the 144 `0x03` payload writes spread over the whole session.
 
 ## Safety
 

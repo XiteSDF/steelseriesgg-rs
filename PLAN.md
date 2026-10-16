@@ -246,6 +246,21 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   every buffer starts with report number **0** (`wValue 0x0200 wLength 64`, `wValue 0x0300 wLength 642` -
   GG's shape, replacing `0x0290`/`0x0285`/`0x0383`), the read-back asks report number 0
   (`READ_REPLY_ID = 0x00`, `wValue 0x0300`) and `onboard_profile` keeps plan/parse/decode only. Same day:
+- 2026-10-17: **what answers a pull** (decoded at the endpoint level of `dev.pcap` plus the engine's read spec).
+  The pull is pacing, not a data transfer: all 121 pulls are followed 1.7-3.7 ms later by the keyboard's ordinary
+  input report `0x01` (63 bytes, all-zero = no keys pressed), and the read API keeps **zero** payload bytes of it -
+  the byte specifier of the pull chunk is `(0 0 0)`, the payload bytes come from the two `0x83` window replies
+  (`(1 512 0)` each). The 121 "64-byte pull replies" the capture kit lists as control responses starting `85 00 …`
+  are the `SET_REPORT` requests GG submitted (`capture.ps1` labels host-to-device control data "control response"),
+  which is where the earlier constant-reply claim came from; the same applies to all 72 `0x05` lighting pushes.
+  Cadence from the same re-read: pull answered in 1.7-3.7 ms, read request answered by its `GET_REPORT` 3.4 ms
+  later (median), GG's collection of the profile files takes 1.8 s (~15 ms per chunk) - the kit's "about 2 s per
+  chunk" paired pulls with the 144 payload writes of the write runs. Ghidra side-check (`SSEdevice.dll
+  HandleHIDCmd`): chunk types 5/6 are thin write/read wrappers over the device transport, types above `0x10`
+  return `0xbadaf6`, so no richer reply path exists. Written into
+  `docs/development/apex-7-onboard-profile-read.md` ("What answers a pull"), `ONBOARD.md` item 0a, the `0x85` row of
+  `.claude/rules/experimental-protocol.md`, and the comments of `apex_legacy_profile.rs` /
+  `apex_legacy_onboard.rs` (the packet after a pull is consumed, never parsed);
 - 2026-10-17: same-day follow-ups after review - the materialised transfer plan (`OnboardTransferPlan`, `plan_frames`, `plan` and its CLI wiring), the schema probe (`OnboardSchemaProbe`, `read_config.schema_probe`), the transport layer (`OnboardTransport`, `HandleTransport`, `PathTransport`, the per-call path-open helpers) and the per-device stored slot (`Apex7::onboard_slot`, `set_onboard_slot`, `read_profile_slot`) were all removed, the read API takes the slot as an argument, every send on `GenericKeyboard` now shares one `connected_device` accessor, and `src/onboard_profile.rs` moved to `src/devices/keyboards/apex_legacy_profile.rs` (feature-gated) because its geometry, framing, payload sizes, schema words and struct offsets are all specific to this legacy platform. Same day: the CLI stopped printing that
   geometry and the schema-length line (they quoted legacy constants); the opening chain was removed from the read -
   `OnboardInitCommand`/`ONBOARD_INIT_CHAIN` are gone, `OnboardFirmwareVersionCommand` (`90 00`) is the one poll the

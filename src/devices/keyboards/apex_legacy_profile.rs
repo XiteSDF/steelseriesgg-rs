@@ -44,8 +44,16 @@
 //! * pull (`HIDIO`, output report ID `0x00`, 64 bytes on the wire, `SET_REPORT wValue 0x0200 wIndex 1`):
 //!   `85 | 00 | file_id u16 LE | offset u32 LE | size u16 LE | 00…` (10 frame bytes, 11-byte report buffer)
 //!   — copies `size` bytes of the profile file into the device's resource buffer at buffer offset 0.
-//!   The keyboard answers with input report `0x85` (64 bytes on `0x82`, constant in the capture, contents
-//!   not interpreted here).
+//!   **The pull has no answer of its own.** The interrupt endpoint streams the keyboard's ordinary
+//!   input reports (endpoint `0x82`, report `0x01`, 63 bytes, all-zero = no keys; median gap 14 ms =
+//!   the poll interval), and GG's read API consumes exactly one of them per chunk with
+//!   `read-chunk HIDIO 65`, keeping **no bytes** of it: the byte specifier for the pull chunk in the
+//!   read API is `(0 0 0)` - zero length. The read answer is what carries the data ([`READ_LEN`] bytes
+//!   from reply byte 1 in GG's specifiers, our framing constant's offset behind the report-ID byte).
+//!   All 121 pulls in the capture are followed by an all-zero `0x01` report 1.7-3.7 ms later, and so
+//!   are all 72 pushes of the write runs: the interrupt packet is a pacing token, not a status frame.
+//!   The `85 00 fs offset size` frames the capture kit lists as 64-byte "pull replies" are the
+//!   `SET_REPORT` requests themselves.
 //! * payload read (`HIDFEATURE`, feature report ID `0x00`, 642 bytes on the wire, `SET_REPORT wValue
 //!   0x0300 wIndex 1`): `83 | 00 | offset u16 LE | size u16 LE | 00…` (6 frame bytes, 643-byte report buffer)
 //!   — returns `size` bytes of the resource buffer. GG reads the answer with `GET_REPORT wValue 0x0300
@@ -112,7 +120,8 @@ pub const CMD_PUSH_PAYLOAD: u8 = 0x05;
 pub const REQUEST_REPORT_ID: u8 = 0x00;
 /// Report ID of a payload-read reply.
 pub const READ_REPLY_REPORT_ID: u8 = 0x83;
-/// Report ID of a pull reply.
+/// Command byte of a pull, which is what the capture kit recorded in the frames it labels pull
+/// replies; the device answers a pull with its ordinary `0x01` input report, not with `0x85`.
 pub const PULL_REPLY_REPORT_ID: u8 = 0x85;
 /// Report ID of a lighting-config payload-read reply.
 pub const LIGHTING_READ_REPLY_REPORT_ID: u8 = 0x03;
@@ -287,9 +296,9 @@ pub struct ChunkRecord {
     pub fs_id: u16,
     /// File offset the pull filled the resource buffer from.
     pub file_offset: u32,
-    /// Report ID the pull answer arrived on.
+    /// Report ID the packet after the pull arrived on (`0x01` on an idle keyboard).
     pub ack_report_id: u8,
-    /// First bytes of the pull answer, hex; its layout is not known.
+    /// First bytes of that packet, hex; content is discarded, GG's read spec takes zero bytes from it.
     pub ack_hex: String,
     /// Payload reads drained from this pull.
     pub reads: Vec<ReadReply>,
