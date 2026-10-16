@@ -198,7 +198,7 @@ pub(crate) enum Commands {
 /// [EXPERIMENTAL] Read the on-board profile of a legacy Apex keyboard.
 ///
 /// `plan` and `decode` work on the wire format and on saved files only; they never touch a device.
-/// `read` and `schema` talk to a keyboard and need `--yes`.
+/// `read` talks to a keyboard and needs `--yes`.
 #[cfg(feature = "onboard")]
 #[derive(Subcommand)]
 pub(crate) enum OnboardAction {
@@ -207,9 +207,6 @@ pub(crate) enum OnboardAction {
 
     /// Read one profile from a legacy Apex keyboard. Requires --yes.
     Read(OnboardReadArgs),
-
-    /// Read the schema word of every profile slot and of the lighting files. Requires --yes.
-    Schema(OnboardSchemaArgs),
 
     /// Decode a profile image saved by an earlier read (no device, no hardware).
     Decode(OnboardDecodeArgs),
@@ -317,39 +314,6 @@ pub(crate) struct OnboardReadArgs {
     /// A reply header that disagrees with its request fails the read (research mode turns this off)
     #[arg(long, default_value = "true")]
     pub(crate) strict: bool,
-}
-
-#[cfg(feature = "onboard")]
-#[derive(clap::Args)]
-pub(crate) struct OnboardSchemaArgs {
-    /// Device as `vid:pid`, a sysfs prefix, or a `/dev/hidrawN` node
-    #[arg(short, long)]
-    pub(crate) device: Option<String>,
-
-    /// Confirm the device read (required: experimental protocol code, talks to hardware)
-    #[arg(short, long)]
-    pub(crate) yes: bool,
-
-    /// Write the JSON report here
-    #[arg(long)]
-    pub(crate) json: Option<PathBuf>,
-
-    /// Gap between transfers, in milliseconds
-    #[arg(long, default_value = "5")]
-    pub(crate) gap_ms: u64,
-
-    /// Stop the probe after this many milliseconds per path group (0 removes the limit)
-    #[arg(long, default_value = "30000")]
-    pub(crate) deadline_ms: u64,
-
-    /// Reject a pull answer on an unexpected report ID
-    #[arg(long, default_value = "true")]
-    pub(crate) strict: bool,
-
-    /// Probe the schema word with each candidate reply framing length (research mode: finds the
-    /// offset the payload really starts at on this keyboard)
-    #[arg(long)]
-    pub(crate) sweep: bool,
 }
 
 #[cfg(feature = "onboard")]

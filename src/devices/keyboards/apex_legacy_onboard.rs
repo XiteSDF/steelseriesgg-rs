@@ -65,8 +65,8 @@ use crate::devices::hid_reports::{
 };
 use crate::error::{Error, Result};
 use crate::onboard_profile::{
-    ChunkRecord, INIT_REPLY_LEN, MAX_PROFILE_INDEX, PROFILE_FS_BASE, ProfileImage, ReadConfig, ReadReply,
-    SCHEMA_READ_LEN, hex_of, parse_firmware_version, parse_read_reply_at, reply_mismatch, schema_of,
+    ChunkRecord, INIT_REPLY_LEN, MAX_PROFILE_INDEX, ProfileImage, ReadConfig, ReadReply, hex_of,
+    parse_firmware_version, parse_read_reply_at, reply_mismatch,
 };
 
 /// Highest profile slot this read supports.
@@ -291,90 +291,6 @@ pub async fn read_profile_verify(
         .find(|(_, (a, b))| a != b)
         .map(|(offset, _)| offset);
     Ok((first, second, diff, path))
-}
-
-/// Reads the schema word of profile slot `slot`, i.e. [`PROFILE_FS_BASE`] + slot.
-///
-/// # Errors
-///
-/// Returns an error when no candidate path answers a 2-byte schema read.
-pub async fn read_schema(
-    paths: &[String],
-    slot: u8,
-    gap_ms: u64,
-    strict: bool,
-    deadline: Option<Duration>,
-) -> Result<(u16, Vec<u8>, String)> {
-    let config = schema_config(PROFILE_FS_BASE, slot, gap_ms);
-    read_schema_words(paths, &config, strict, deadline).await
-}
-
-/// Reads the schema word with an explicit reply framing length, the knob `ssgg onboard schema
-/// --sweep` uses to find where this keyboard puts the payload behind the report-ID byte.
-///
-/// # Errors
-///
-/// Returns an error when no candidate path answers a 2-byte schema read.
-pub async fn read_schema_probe(
-    paths: &[String],
-    fs_id: u16,
-    slot: u8,
-    reply_header: usize,
-    gap_ms: u64,
-    strict: bool,
-    deadline: Option<Duration>,
-) -> Result<(u16, Vec<u8>, String)> {
-    let mut config = schema_config(fs_id, slot, gap_ms);
-    config.reply_header = reply_header;
-    read_schema_words(paths, &config, strict, deadline).await
-}
-
-/// Reads the schema word of an arbitrary file selector (the lighting files `0x0102` and `0x0301`).
-///
-/// # Errors
-///
-/// Returns an error when no candidate path answers a 2-byte schema read for that file.
-pub async fn read_schema_file(
-    paths: &[String],
-    fs_id: u16,
-    gap_ms: u64,
-    strict: bool,
-    deadline: Option<Duration>,
-) -> Result<(u16, Vec<u8>, String)> {
-    let config = schema_config(fs_id, 0, gap_ms);
-    read_schema_words(paths, &config, strict, deadline).await
-}
-
-async fn read_schema_words(
-    paths: &[String],
-    config: &ReadConfig,
-    strict: bool,
-    deadline: Option<Duration>,
-) -> Result<(u16, Vec<u8>, String)> {
-    let paths = paths.to_vec();
-    let config = *config;
-    let (image, path) = tokio::task::spawn_blocking(move || read_on_first_path(&paths, &config, strict, deadline))
-        .await
-        .map_err(|e| Error::Other(format!("onboard schema probe task failed: {e}")))??;
-    let raw = image.data;
-    Ok((schema_of(&raw), raw, path))
-}
-
-/// Read plan for a schema-only probe: the opening chain, one pull of 2 bytes, drained by one 2-byte
-/// payload read.
-#[must_use]
-pub fn schema_config(fs_base: u16, profile: u8, gap_ms: u64) -> ReadConfig {
-    ReadConfig {
-        profile,
-        fs_base,
-        chunks: 1,
-        resource_len: SCHEMA_READ_LEN,
-        read_len: SCHEMA_READ_LEN,
-        payload_len: SCHEMA_READ_LEN,
-        gap_ms,
-        send_init_chain: true,
-        reply_header: crate::onboard_profile::READ_REPLY_FRAMING_LEN,
-    }
 }
 
 /// Runs the read plan on the first candidate path that answers, logging every path that did not.
@@ -707,22 +623,6 @@ pub fn hidraw_vendor_product(path: &str) -> Option<(u16, u16)> {
 mod tests {
     use super::*;
     use crate::onboard_profile::{PROFILE_FS_BASE, RESOURCE_BUFFER_LEN};
-
-    #[test]
-    fn schema_config_covers_two_bytes_in_one_pull() {
-        let config = schema_config(PROFILE_FS_BASE, 2, 5);
-        assert_eq!(config.fs_id(), PROFILE_FS_BASE + 2);
-        assert_eq!(config.total_resource_len(), SCHEMA_READ_LEN);
-        // opening chain + one pull + one payload read
-        assert_eq!(config.steps().len(), 8);
-        config.validate().expect("schema probe plan is valid");
-    }
-
-    #[test]
-    fn lighting_schema_config_addresses_the_shared_file() {
-        let config = schema_config(0x0102, 0, 5);
-        assert_eq!(config.fs_id(), 0x0102);
-    }
 
     #[test]
     fn reply_carries_payload_needs_room_behind_the_report_id() {

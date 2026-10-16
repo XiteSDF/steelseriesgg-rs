@@ -52,9 +52,9 @@
 //! buffer offsets 0 and 512. The profile files are addressed by id: [`PROFILE_FS_BASE`] plus the
 //! profile index (`0..=4`).
 //!
-//! The first two payload bytes are the profile schema, so a schema-only read is one pull of 2 bytes
-//! followed by one payload read of 2 bytes ([`schema_read_steps`]). Firmware `4.16.3` selects schema
-//! [`SCHEMA_B`]; older firmware uses [`SCHEMA_A`].
+//! The first two payload bytes are the profile schema: GG probes a file with one 2-byte pull of the file
+//! head and one 2-byte payload read. Firmware `4.16.3` selects schema [`SCHEMA_B`]; older firmware uses
+//! [`SCHEMA_A`].
 //!
 //! The payload starts at file offset 0 with the schema word; the engine's payload structs carry one
 //! leading constant id byte that is not part of the file, so `dest` in [`Step`] is the file offset and
@@ -136,7 +136,6 @@ pub const READ_REPLY_HEADER_LEN: usize = 5;
 /// probe accepted 6; `ssgg onboard read --reply-header` changes it.
 pub const READ_REPLY_FRAMING_LEN: usize = 0;
 /// Bytes in a profile schema word, and the size of a schema-only payload read.
-pub const SCHEMA_READ_LEN: usize = 2;
 /// Median gap between two device replies during a GG profile read in the reference capture, in
 /// milliseconds. Used as the default pacing between our own transfers; the opening-chain frames GG
 /// sends are 11 ms apart.
@@ -357,57 +356,6 @@ impl ReadConfig {
         }
         steps
     }
-}
-
-/// Schema pulls tried by the probe: the reference implementation pulls 2 bytes, the reference capture shows
-/// GG pulling 0 bytes at the file head before a 2-byte read. Both are tried, so a keyboard that only
-/// understands one of them still answers.
-pub const SCHEMA_PULL_SIZES: [u16; 2] = [2, 0];
-
-/// Transfer sequence for a schema-only read: the opening chain, one pull, one payload read of 2 bytes.
-pub fn schema_read_steps(fs_id: u16) -> Vec<Step> {
-    schema_read_steps_with(fs_id, SCHEMA_PULL_SIZES[0])
-}
-
-/// Transfer sequence for a schema-only read with a chosen pull size (see [`SCHEMA_PULL_SIZES`]).
-pub fn schema_read_steps_with(fs_id: u16, pull_size: u16) -> Vec<Step> {
-    let mut steps = init_steps();
-    steps.extend([
-        Step {
-            kind: StepKind::Pull,
-            chunk: 0,
-            frame: OnboardPullCommand {
-                fs_id,
-                file_offset: 0,
-                size: pull_size,
-            }
-            .data_stage()
-            .to_vec(),
-            wire_len: PULL_REPORT_LEN,
-            reply_report_id: Some(PULL_REPLY_REPORT_ID),
-            reply_len: Some(INIT_REPLY_LEN),
-            dest: None,
-            buffer_offset: None,
-            size: pull_size,
-        },
-        Step {
-            kind: StepKind::Read,
-            chunk: 0,
-            frame: OnboardReadCommand {
-                buffer_offset: 0,
-                size: SCHEMA_READ_LEN as u16,
-            }
-            .data_stage()
-            .to_vec(),
-            wire_len: READ_REPORT_LEN,
-            reply_report_id: Some(READ_REPLY_REPORT_ID),
-            reply_len: Some(READ_REPORT_LEN),
-            dest: Some(0),
-            buffer_offset: Some(0),
-            size: SCHEMA_READ_LEN as u16,
-        },
-    ]);
-    steps
 }
 
 /// The opening chain as plan steps: every [`ONBOARD_INIT_CHAIN`] frame as a 64-data-byte output
@@ -1346,21 +1294,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn schema_read_is_one_pull_of_two_bytes() {
-        let steps = schema_read_steps(0x0203);
-        assert_eq!(steps.len(), ONBOARD_INIT_CHAIN.len() + 2);
-        let pull = &steps[ONBOARD_INIT_CHAIN.len()];
-        assert_eq!(pull.kind, StepKind::Pull);
-        assert_eq!(pull.size, 2);
-        assert_eq!(
-            u32::from_le_bytes([pull.frame[4], pull.frame[5], pull.frame[6], pull.frame[7]]),
-            0,
-            "the schema pull reads from the file head"
-        );
-        assert_eq!(steps[steps.len() - 1].size, 2);
-        assert_eq!(steps[steps.len() - 1].dest, Some(0));
-    }
     #[test]
     fn reply_header_is_echoed_and_payload_starts_at_six() {
         let mut reply = vec![0x83u8, 0x00, 0x00, 0x02, 0x00, 0x02];

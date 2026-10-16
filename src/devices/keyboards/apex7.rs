@@ -26,7 +26,7 @@ use crate::devices::product_ids;
 use crate::devices::zone_mapping::{ZoneEffect, ZoneMapping};
 use crate::devices::{Device, DeviceType};
 use crate::error::{Error, Result};
-use crate::onboard_profile::{ProfileImage, ReadConfig, profile_name, schema_of};
+use crate::onboard_profile::{ProfileImage, ReadConfig};
 use crate::rgb::{Color, PerKeyEffect};
 
 /// Apex 7 and the boards of its platform that take the on-board profile protocol.
@@ -109,29 +109,6 @@ impl Apex7 {
     pub async fn read_profile_slot(&self) -> Result<ProfileImage> {
         self.read_profile(&self.onboard.clone()).await
     }
-
-    /// Probes the schema word of one on-board file, answering with the word, the raw reply and the
-    /// profile name the reply carries (empty for the lighting files).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the collection rejects a frame or never answers the probe read.
-    pub async fn read_schema(&self, config: &ReadConfig) -> Result<(u16, Vec<u8>, String)> {
-        let image = apex_legacy_onboard::read_profile_transport(self.transport()?, config, false).await?;
-        let raw = image.data;
-        Ok((schema_of(&raw), raw.clone(), profile_name(&raw)))
-    }
-
-    /// Probes the schema word of profile slot `slot` at this device's pacing.
-    ///
-    /// # Errors
-    ///
-    /// As [`Apex7::read_schema`].
-    pub async fn read_schema_slot(&self, slot: u8) -> Result<(u16, Vec<u8>, String)> {
-        let config =
-            apex_legacy_onboard::schema_config(crate::onboard_profile::PROFILE_FS_BASE, slot, self.onboard.gap_ms);
-        self.read_schema(&config).await
-    }
 }
 
 // Deref gives the Device trait methods of the wrapped keyboard.
@@ -188,11 +165,6 @@ crate::impl_keyboard_with_delegation!(Apex7, {
 
     async fn read_onboard_profile(&self, config: &ReadConfig) -> Result<ProfileImage> {
         self.read_profile(config).await
-    }
-
-    async fn read_onboard_schema(&self, config: &ReadConfig) -> Result<(u16, Vec<u8>)> {
-        let (schema, raw, _) = self.read_schema(config).await?;
-        Ok((schema, raw))
     }
 });
 
