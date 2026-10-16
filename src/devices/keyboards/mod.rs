@@ -397,7 +397,8 @@ impl GenericKeyboard {
     }
 
     /// Send a HID feature report of arbitrary size (for Apex 2023 new protocol).
-    /// Uses direct ioctl to bypass hidapi's broken HIDIOCSFEATURE direction bits.
+    /// Goes through [`crate::devices::send_feature_report_raw`], which calls hidapi's `send_feature_report`,
+    /// i.e. the kernel's `HIDIOCSFEATURE` on Linux.
     /// Resolves the hidraw path: `info.path` for the wired 2023 model, interface 1 for the original
     /// Apex Pro, interface 3 for the others.
     #[cfg(unix)]

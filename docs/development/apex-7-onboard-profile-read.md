@@ -268,7 +268,49 @@ passes that number to the device as `wLength`, and the device's report is 642 by
 (the report-ID byte counted twice) makes the control transfer never complete, which is the
 `Connection timed out (os error 110)` recorded on 2026-10-15 after the read request was accepted. The
 64-byte input reports this collection carries are poll and status reports (report IDs `0x0B`, `0x12`);
-the collector skips them and keeps the interrupt endpoint as a fallback reply channel.
+the collector skips them and keeps the interrupt endpoint as a fallback reply channel, read on the node
+(see "Input reports: the node must be open when the report arrives").
+
+## Input reports: the node must be open when the report arrives (measured 2026-10-16)
+
+`usbhid` polls a hidraw collection's interrupt endpoint only while a descriptor on that minor is open. In
+`linux-read.pcapng` (the 1428-packet Linux run capture; measurements below are from that file - only a 66-packet
+excerpt of a related run, sha256 `7f2fa616742aaa6c5a746303e6b1e1234aee44188dec58b7f34fdd2c078c2f9d`, was still in the
+tree on 2026-10-17, so re-verification needs the capture taken again) - every frame was answered 1.0-3.4 ms after it was
+submitted, and the endpoint sat idle in 1133 gaps totalling 52 s: 737 gaps of 10-20 ms, 196 of 30-40 ms, 200 of 40-50 ms.
+A reader that opens the node per report leaves the endpoint unpolled exactly in those gaps, so the kernel discards the
+report:
+`poll(POLLIN)` on a freshly opened descriptor waits out its whole timeout and returns 0, and `read(2)` issued without
+a poll returns `EAGAIN` (frames 364, 431, 557, 765, 811, 1020, 1092 of that capture). Every `poll` + `read` of that run
+timed out on reports the device had answered.
+
+Hidapi's `read_timeout` is the same `poll` + `read(2)` pair (`hidapi-2.6.7 src/linux_native.rs:511` in the
+`linux-native` backend this crate builds; `open` is `O_RDWR | O_CLOEXEC`, `src/linux_native.rs:451`; the C backend is
+`etc/hidapi/linux/hid.c:1108`) and returns `0` on timeout, which keeps "nothing arrived" apart from "the read failed" -
+the 2026-10-15 run's `EAGAIN` came from a `read(2)` issued after its `poll` had timed out. The read path was switched
+briefly to one descriptor held open for the whole session, which is what the endpoint-polling rule above argues for,
+and reverted 2026-10-17 back to per-call opens: the gap behaviour this section measures is therefore **live in the
+current code** and unverified on hardware.
+
+The kernel's own read-back owns the endpoint for its duration: `usb_get_report()` unlinks the in-flight URB, issues
+`GET_REPORT`, copies the answer into the URB buffer, queues it to `hidraw`, then resubmits the URB
+(`drivers/hid/usbhid/hid-core.c:964-983`, kernel 6.12.90). A report submitted into that window goes into the read-back
+buffer and not onto the descriptor, and the read-back bytes are queued to every open descriptor, so they appear on the
+handle as a duplicate input report. Measured in the same capture: URB submitted 3.866646, `GET_REPORT` 51 ms later at
+3.866697, URB unlinked with 0 bytes at 3.920627. Not verified on hardware.
+
+**Transport (2026-10-17).** The hand-rolled raw paths are gone: every transfer is a hidapi call on a path opened
+for that call. The `linux-native` backend this crate builds implements `send_feature_report` and `get_feature_report`
+as the kernel's own `HIDIOCSFEATURE`/`HIDIOCGFEATURE` (`hidapi-2.6.7/src/linux_native/ioctl.rs:20,26`), `write` as
+`HIDIOCSOUTPUT` (nr `0x0b`, `:38`) and `read_timeout` as `poll` + `read(2)`; the direction-bit bug the earlier native
+backend sent was fixed in 2.6.6 and 2.6.7 is pinned, so one code path serves Linux, Windows and macOS - the
+`#[cfg(unix)]`/`#[cfg(not(unix))]` pairs are deleted. `devices::send_feature_report_raw`,
+`read_feature_report_raw`, `write_output_report_raw` and `read_input_report_raw` are those four calls;
+`apex_legacy_onboard` uses them for frames, payload reads and endpoint polls, `Keyboard::send_feature` for the Apex
+2023 lighting path. Two consequences worth knowing: `HIDIOCSOUTPUT` puts output frames on the control port as
+`SET_REPORT wValue 0x0200` - the shape the reference capture shows - where the raw `write(2)` this replaces went to an
+OUT endpoint the profile collection does not have; and `HidApi::new` enumerates the device tree per call. Nothing
+here is confirmed on hardware.
 
 Measured 2026-10-16 on the usbmon capture of a full `ssgg onboard read` run (`linux-read.pcapng`, 1428 URBs,
 bus 1 device 24, 1.026 s): the chain answered `4.16.8` (68 reports) and `00 01`, `6c 00 01` answered

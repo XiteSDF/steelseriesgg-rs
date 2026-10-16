@@ -257,63 +257,67 @@ pub fn write_padded_report(device: &HidDevice, data: &[u8], report_len: usize, i
     write_result.map_err(Into::into).map(|_| ())
 }
 
-#[cfg(unix)]
-/// Send a HID feature report by opening the hidraw device path directly.
+/// Open the HID API for one transfer. `HidApi::new` enumerates the device tree, so a caller that runs
+/// many transfers on one collection should keep a single API and handle open, and only open the extra
+/// paths for one-shot calls.
+fn open_hid_api(device_path: &str) -> Result<hidapi::HidApi> {
+    hidapi::HidApi::new()
+        .map_err(|e| Error::DeviceCommunication(format!("Failed to init HID API for {device_path}: {e}")))
+}
+
+/// Open a device path through hidapi: the `hidraw` node path on Linux, the hidapi device path on Windows
+/// and macOS. The handle borrows the API, so callers keep the API alive in the same scope.
+fn open_hid_device(api: &hidapi::HidApi, device_path: &str) -> Result<hidapi::HidDevice> {
+    let path = std::ffi::CString::new(device_path)
+        .map_err(|_| Error::InvalidConfig(format!("device path {device_path} contains a NUL byte")))?;
+    api.open_path(&path)
+        .map_err(|e| Error::DeviceCommunication(format!("Failed to open {device_path}: {e}")))
+}
+
+/// Send a feature report on a device path.
 ///
-/// We bypass hidapi's `send_feature_report` because the hidapi Rust crate's
-/// linux-native backend uses `ioctl_write_buf!` (IOC_WRITE only) for HIDIOCSFEATURE,
-/// but the Linux kernel defines it as `_IOWR` (IOC_WRITE|IOC_READ). This causes EINVAL
-/// on large feature reports. We call the ioctl directly with correct direction bits.
-pub fn send_feature_report_raw(hidraw_path: &str, data: &[u8], report_len: usize) -> Result<()> {
-    use std::fs::OpenOptions;
-    use std::os::unix::io::AsRawFd;
+/// `data[0]` is the report number and the buffer is padded to `report_len`, the size the device declares
+/// for that report. On Linux this is the kernel's own call:
+/// `ioctl(HIDIOCSFEATURE(len)) = _IOC(_IOC_WRITE|_IOC_READ, 'H', 0x06, len)`
+/// (`/usr/include/linux/hidraw.h`, `hidapi-2.6.7/src/linux_native/ioctl.rs:20`), which `usbhid` turns into
+/// `SET_REPORT bmRequestType 0x21 bRequest 0x01 wValue 0x0300 wIndex <interface> wLength len` - the shape the
+/// reference capture shows for every profile frame. The hand-rolled ioctl, the raw `write(2)` and the
+/// `#[cfg(unix)]` split this replaces are gone: hidapi 2.6.6 fixed the direction bits the earlier native
+/// backend sent and 2.6.7 is pinned in `Cargo.toml`.
+///
+/// `[EXPERIMENTAL]`: no use of this call on a profile collection has been confirmed on hardware.
+pub fn send_feature_report_raw(device_path: &str, data: &[u8], report_len: usize) -> Result<()> {
     use tracing::debug;
 
     let mut report = vec![0u8; report_len];
     let copy_len = data.len().min(report_len);
     report[..copy_len].copy_from_slice(&data[..copy_len]);
-
     debug!(
-        "Sending HID feature report via {}: len={}, cmd={:#04x}",
-        hidraw_path,
+        "Sending HID feature report via hidapi {}: len={}, cmd={:#04x}",
+        device_path,
         report_len,
         report.get(1).copied().unwrap_or(0)
     );
 
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(hidraw_path)
-        .map_err(|e| Error::DeviceCommunication(format!("Failed to open {hidraw_path}: {e}")))?;
-
-    let fd = file.as_raw_fd();
-    // HIDIOCSFEATURE = _IOWR('H', 0x06, size) = (3 << 30) | (size << 16) | ('H' << 8) | 0x06
-    let ioctl_code: libc::c_ulong =
-        (3 << 30) | ((report_len as libc::c_ulong) << 16) | ((b'H' as libc::c_ulong) << 8) | 0x06;
-
-    let ret = unsafe { libc::ioctl(fd, ioctl_code, report.as_mut_ptr()) };
-    if ret < 0 {
-        let err = std::io::Error::last_os_error();
-        return Err(Error::DeviceCommunication(format!(
-            "HID feature report ioctl failed on {hidraw_path}: {err}"
-        )));
-    }
-
+    let api = open_hid_api(device_path)?;
+    let device = open_hid_device(&api, device_path)?;
+    device
+        .send_feature_report(&report)
+        .map_err(|e| Error::DeviceCommunication(format!("Feature report failed on {device_path}: {e}")))?;
     Ok(())
 }
 
-#[cfg(unix)]
-/// Read a HID feature report by opening the hidraw device path directly.
+/// Read a feature report on a device path: hidapi's `get_feature_report`, which on Linux is the kernel's
+/// `ioctl(HIDIOCGFEATURE(len)) = _IOC(_IOC_WRITE|_IOC_READ, 'H', 0x07, len)`
+/// (`/usr/include/linux/hidraw.h`, `hidapi-2.6.7/src/linux_native/ioctl.rs:26`), turned into the
+/// `GET_REPORT bmRequestType 0xa1 bRequest 0x01 wValue 0x0300 wIndex <interface> wLength len` control-IN
+/// transfer the reference capture shows.
 ///
-/// `HIDIOCGFEATURE` is `_IOWR('H', 0x07, size)`, so the write path above and this read use the same
-/// direction bits. hidapi 2.6.7 exposes no feature-report getter on Linux at all, so the ioctl is the
-/// only way to collect a reply for a 645-byte feature report.
-///
-/// `report_len` includes the leading report-ID byte, which the kernel expects to find in `buf[0]`
-/// and returns unchanged.
-pub fn read_feature_report_raw(hidraw_path: &str, report_id: u8, report_len: usize) -> Result<Vec<u8>> {
-    use std::fs::OpenOptions;
-    use std::os::unix::io::AsRawFd;
+/// `report_len` includes the leading report-ID byte, seeded into `buf[0]`; the kernel returns the report ID
+/// the device sent. Ask for the size the device declares - 642 bytes for the legacy Apex profile collection;
+/// asking for 643 makes the control transfer time out.
+/// `[EXPERIMENTAL]`: confirmed only in the reference capture of official GG, never from this code.
+pub fn read_feature_report_raw(device_path: &str, report_id: u8, report_len: usize) -> Result<Vec<u8>> {
     use tracing::debug;
 
     if report_len < 2 {
@@ -322,47 +326,30 @@ pub fn read_feature_report_raw(hidraw_path: &str, report_id: u8, report_len: usi
         )));
     }
 
+    let api = open_hid_api(device_path)?;
+    let device = open_hid_device(&api, device_path)?;
+
     let mut report = vec![report_id; report_len];
+    let received = device
+        .get_feature_report(&mut report)
+        .map_err(|e| Error::DeviceCommunication(format!("Feature report read on {device_path}: {e}")))?;
 
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(hidraw_path)
-        .map_err(|e| Error::DeviceCommunication(format!("Failed to open {hidraw_path}: {e}")))?;
-
-    let fd = file.as_raw_fd();
-    // HIDIOCGFEATURE = _IOWR('H', 0x07, size) = (3 << 30) | (size << 16) | ('H' << 8) | 0x07
-    let ioctl_code: libc::c_ulong =
-        (3 << 30) | ((report_len as libc::c_ulong) << 16) | ((b'H' as libc::c_ulong) << 8) | 0x07;
-
-    // Safety: `report` is exactly `report_len` bytes and that size is encoded in the ioctl, so the
-    // kernel writes within the buffer; `file` keeps the descriptor alive for the call.
-    let received = unsafe { libc::ioctl(fd, ioctl_code, report.as_mut_ptr()) };
-    if received < 0 {
-        let err = std::io::Error::last_os_error();
-        return Err(Error::DeviceCommunication(format!(
-            "HID feature report read on {hidraw_path} failed: {err}"
-        )));
-    }
-
-    let len = usize::try_from(received).unwrap_or(report_len).min(report_len);
+    let len = received.min(report_len);
     report.truncate(len);
     debug!(
-        "Read HID feature report via {}: requested={}, received={}",
-        hidraw_path, report_len, len
+        "Read HID feature report via hidapi {}: requested={}, received={}",
+        device_path, report_len, len
     );
-
     Ok(report)
 }
 
-#[cfg(unix)]
-/// Send an output report on a hidraw path.
-///
-/// `data[0]` is the report ID the kernel expects (0 for the legacy Apex collections), so the report on
-/// the wire is `data.len() - 1` bytes.
-pub fn write_output_report_raw(hidraw_path: &str, data: &[u8]) -> Result<()> {
-    use std::fs::OpenOptions;
-    use std::io::Write as _;
+/// Send an output report on a device path: hidapi's `write`, `data[0]` being the report number. On Linux the
+/// `linux-native` backend issues `ioctl(HIDIOCSOUTPUT(len))`, nr `0x0b`
+/// (`/usr/include/linux/hidraw.h`, `hidapi-2.6.7/src/linux_native/ioctl.rs:38`), so the frame leaves as a
+/// `SET_REPORT wValue 0x0200 wIndex <interface> wLength <len - 1>` control transfer - the shape the reference
+/// capture shows for every profile frame. The raw `write(2)` this replaces went out on the collection's OUT
+/// endpoint, which the profile collection does not have.
+pub fn write_output_report_raw(device_path: &str, data: &[u8]) -> Result<()> {
     use tracing::debug;
 
     if data.len() < 2 {
@@ -373,81 +360,59 @@ pub fn write_output_report_raw(hidraw_path: &str, data: &[u8]) -> Result<()> {
     }
 
     debug!(
-        "Sending HID output report via {}: len={}, cmd={:#04x}",
-        hidraw_path,
+        "Sending HID output report via hidapi {}: len={}, cmd={:#04x}",
+        device_path,
         data.len() - 1,
         data[1]
     );
 
-    let mut file = OpenOptions::new()
-        .write(true)
-        .open(hidraw_path)
-        .map_err(|e| Error::DeviceCommunication(format!("Failed to open {hidraw_path}: {e}")))?;
-    file.write_all(data)
-        .map_err(|e| Error::DeviceCommunication(format!("Output report write on {hidraw_path} failed: {e}")))?;
-
+    let api = open_hid_api(device_path)?;
+    let device = open_hid_device(&api, device_path)?;
+    let written = device
+        .write(data)
+        .map_err(|e| Error::DeviceCommunication(format!("Output report write on {device_path}: {e}")))?;
+    if written != data.len() {
+        return Err(Error::DeviceCommunication(format!(
+            "output report write on {device_path} accepted {written} of {} bytes",
+            data.len()
+        )));
+    }
     Ok(())
 }
 
-#[cfg(unix)]
-/// Read one input report from a hidraw path, waiting up to `timeout_ms`.
+/// Read one input report from a device path, waiting up to `timeout_ms`: hidapi's `read_timeout`, a
+/// `poll` + `read(2)` pair on Linux (`hidapi-2.6.7/src/linux_native.rs`), which keeps "nothing arrived"
+/// (returns `0`) apart from "the read failed".
 ///
-/// `poll` gates the blocking read; hidraw returns one report per `read` call, prefixed with the report
-/// ID byte.
-pub fn read_input_report_raw(hidraw_path: &str, report_len: usize, timeout_ms: u64) -> Result<Vec<u8>> {
-    use std::fs::File;
-    use std::os::unix::io::AsRawFd;
+/// This opens the node for the call and closes it again. `usbhid` polls a collection's interrupt endpoint
+/// only while a descriptor on that node is open, so a report that arrives with no descriptor open is
+/// discarded by the kernel - measured on an Apex 7 (PID `0x1612`, firmware `4.16.8`) in the Linux run
+/// capture of 2026-10-16 (`linux-read.pcapng`, 1428 packets; written up in
+/// `docs/development/apex-7-onboard-profile-read.md`, "Input reports: the node must be open when the report
+/// arrives"). Reads driven this way timed out on reports the device had answered.
+pub fn read_input_report_raw(device_path: &str, report_len: usize, timeout_ms: u64) -> Result<Vec<u8>> {
     use tracing::debug;
 
-    let mut buffer = vec![0u8; report_len.max(1)];
-
-    let file = File::open(hidraw_path)
-        .map_err(|e| Error::DeviceCommunication(format!("Failed to open {hidraw_path}: {e}")))?;
-    let fd = file.as_raw_fd();
-
-    let mut poll_fd = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let timeout = i32::try_from(timeout_ms).unwrap_or(i32::MAX);
-
-    // Safety: `poll` only reads and writes `poll_fd`, `fd` is a live descriptor owned by `file`, and
-    // `poll` never touches the descriptor itself.
-    let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout) };
-    if ready < 0 {
-        let err = std::io::Error::last_os_error();
+    let api = open_hid_api(device_path)?;
+    let device = open_hid_device(&api, device_path)?;
+    let mut report = vec![0u8; report_len.max(1)];
+    let poll_ms = i32::try_from(timeout_ms).unwrap_or(i32::MAX);
+    let received = device
+        .read_timeout(&mut report, poll_ms)
+        .map_err(|e| Error::DeviceCommunication(format!("input report read on {device_path}: {e}")))?;
+    if received == 0 {
         return Err(Error::DeviceCommunication(format!(
-            "poll on {hidraw_path} failed: {err}"
+            "no input report on {device_path} within {timeout_ms} ms"
         )));
     }
-    if ready == 0 {
-        return Err(Error::DeviceCommunication(format!(
-            "no input report on {hidraw_path} within {timeout_ms} ms"
-        )));
-    }
-
-    // Safety: reading into `buffer`, whose length is passed to `read`.
-    let received = unsafe { libc::read(fd, buffer.as_mut_ptr().cast::<libc::c_void>(), buffer.len()) };
-    if received < 0 {
-        let err = std::io::Error::last_os_error();
-        return Err(Error::DeviceCommunication(format!(
-            "input report read on {hidraw_path} failed: {err}"
-        )));
-    }
-
-    let len = usize::try_from(received).unwrap_or(buffer.len()).min(buffer.len());
-    buffer.truncate(len);
+    report.truncate(received);
     debug!(
-        "Read HID input report via {}: requested={}, received={}",
-        hidraw_path, report_len, len
+        "Read HID input report via hidapi {}: requested={}, received={}",
+        device_path, report_len, received
     );
-
-    Ok(buffer)
+    Ok(report)
 }
 
-/// Parse the USB interface number out of a hidraw `HID_PHYS` string
-/// (`"usb-0:1.91:1.0/input7/1"` -> `1`). Linux appends the interface after the `input` node.
 #[cfg(unix)]
 fn interface_from_phys(phys: &str) -> Option<u32> {
     let last = phys.rsplit('/').next()?;
@@ -546,73 +511,6 @@ pub fn find_hidraw_for_interface(vendor_id: u16, product_id: u16, _interface: us
         }
     }
     None
-}
-
-#[cfg(not(unix))]
-/// Send a HID feature report using hidapi.
-/// On Linux the raw ioctl path is used instead to work around a hidapi direction-bit bug;
-/// on other platforms hidapi's send_feature_report works correctly.
-pub fn send_feature_report_raw(device_path: &str, data: &[u8], report_len: usize) -> Result<()> {
-    use std::ffi::CString;
-    use tracing::debug;
-
-    let mut report = vec![0u8; report_len];
-    let copy_len = data.len().min(report_len);
-    report[..copy_len].copy_from_slice(&data[..copy_len]);
-
-    debug!(
-        "Sending HID feature report via hidapi {}: len={}, cmd={:#04x}",
-        device_path,
-        report_len,
-        report.get(1).copied().unwrap_or(0)
-    );
-
-    let api = hidapi::HidApi::new().map_err(|e| Error::DeviceCommunication(format!("Failed to init HID API: {e}")))?;
-    let path =
-        CString::new(device_path).map_err(|e| Error::DeviceCommunication(format!("Invalid device path: {e}")))?;
-    let device = api
-        .open_path(&path)
-        .map_err(|e| Error::DeviceCommunication(format!("Failed to open {device_path}: {e}")))?;
-    device
-        .send_feature_report(&report)
-        .map_err(|e| Error::DeviceCommunication(format!("Feature report failed on {device_path}: {e}")))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-/// Read a HID feature report using hidapi.
-/// On Linux the raw ioctl path is used instead; hidapi's Windows backend reads feature reports
-/// correctly. `report_len` includes the leading report-ID byte, seeded into `buf[0]`.
-pub fn read_feature_report_raw(device_path: &str, report_id: u8, report_len: usize) -> Result<Vec<u8>> {
-    use std::ffi::CString;
-    use tracing::debug;
-
-    if report_len < 2 {
-        return Err(Error::DeviceCommunication(format!(
-            "Feature report size {report_len} cannot hold a report ID byte and any data"
-        )));
-    }
-
-    let api = hidapi::HidApi::new().map_err(|e| Error::DeviceCommunication(format!("Failed to init HID API: {e}")))?;
-    let path =
-        CString::new(device_path).map_err(|e| Error::DeviceCommunication(format!("Invalid device path: {e}")))?;
-    let device = api
-        .open_path(&path)
-        .map_err(|e| Error::DeviceCommunication(format!("Failed to open {device_path}: {e}")))?;
-
-    let mut report = vec![report_id; report_len];
-    let received = device
-        .get_feature_report(&mut report)
-        .map_err(|e| Error::DeviceCommunication(format!("Feature report read on {device_path}: {e}")))?;
-
-    let len = received.min(report_len);
-    report.truncate(len);
-    debug!(
-        "Read HID feature report via hidapi {}: requested={}, received={}",
-        device_path, report_len, len
-    );
-
-    Ok(report)
 }
 
 /// HID vendor-defined usage page used by the SteelSeries control (RGB/actuation) collection.
@@ -840,75 +738,6 @@ pub fn zone_count_for_product_id(product_id: u16) -> usize {
         APEX_PRO | APEX_PRO_TKL | APEX_5 | APEX_7 | APEX_7_TKL | APEX_150 => 1,
         _ => 1,
     }
-}
-
-#[cfg(not(unix))]
-/// Send an output report using hidapi. On Linux the hidraw write path is used instead.
-///
-/// `data[0]` is the report ID, matching hidapi's output-report convention.
-pub fn write_output_report_raw(device_path: &str, data: &[u8]) -> Result<()> {
-    use std::ffi::CString;
-    use tracing::debug;
-
-    if data.len() < 2 {
-        return Err(Error::DeviceCommunication(format!(
-            "output report of {} bytes has no room for a report ID byte and any payload",
-            data.len()
-        )));
-    }
-
-    debug!(
-        "Sending HID output report via hidapi {}: len={}, cmd={:#04x}",
-        device_path,
-        data.len() - 1,
-        data[1]
-    );
-
-    let api = hidapi::HidApi::new().map_err(|e| Error::DeviceCommunication(format!("Failed to init HID API: {e}")))?;
-    let path =
-        CString::new(device_path).map_err(|e| Error::DeviceCommunication(format!("Invalid device path: {e}")))?;
-    let device = api
-        .open_path(&path)
-        .map_err(|e| Error::DeviceCommunication(format!("Failed to open {device_path}: {e}")))?;
-    let written = device
-        .write(data)
-        .map_err(|e| Error::DeviceCommunication(format!("Output report write on {device_path} failed: {e}")))?;
-    if written != data.len() {
-        return Err(Error::DeviceCommunication(format!(
-            "output report write on {device_path} accepted {written} of {} bytes",
-            data.len()
-        )));
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-/// Read one input report using hidapi with a timeout. On Linux the hidraw read path is used instead.
-pub fn read_input_report_raw(device_path: &str, report_len: usize, timeout_ms: u64) -> Result<Vec<u8>> {
-    use std::ffi::CString;
-    use tracing::debug;
-
-    let api = hidapi::HidApi::new().map_err(|e| Error::DeviceCommunication(format!("Failed to init HID API: {e}")))?;
-    let path =
-        CString::new(device_path).map_err(|e| Error::DeviceCommunication(format!("Invalid device path: {e}")))?;
-    let device = api
-        .open_path(&path)
-        .map_err(|e| Error::DeviceCommunication(format!("Failed to open {device_path}: {e}")))?;
-
-    let mut buffer = vec![0u8; report_len.max(1)];
-    let timeout = i32::try_from(timeout_ms).unwrap_or(i32::MAX);
-    let received = device
-        .read_timeout(&mut buffer, timeout)
-        .map_err(|e| Error::DeviceCommunication(format!("input report read on {device_path} failed: {e}")))?;
-
-    let len = received.min(buffer.len());
-    buffer.truncate(len);
-    debug!(
-        "Read HID input report via hidapi {}: requested={}, received={}",
-        device_path, report_len, len
-    );
-
-    Ok(buffer)
 }
 
 #[cfg(test)]

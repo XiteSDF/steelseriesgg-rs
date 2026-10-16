@@ -37,67 +37,26 @@
 //! (`0x25EE1762`) is not the CRC of the bytes GG assembled. The schema word GG reads at payload
 //! offset 0 is `0x0000` on this device, i.e. the base schema of the platform.
 //!
-//! Linux: the request goes out through the raw hidraw paths in [`crate::devices`] (the hidapi
-//! feature-report ioctl has the wrong direction bits); the reply is collected with
-//! [`crate::devices::read_feature_report_raw`] first and with the interrupt endpoint as a fallback,
-//! because the kernel's `HID_REPORT_GET` path on this collection returns `ETIMEDOUT`.
+//! Every transfer opens the collection by path and closes it again: the frames go out through
+//! [`crate::devices::write_output_report_raw`] and [`crate::devices::send_feature_report_raw`], the payload
+//! comes back through [`crate::devices::read_feature_report_raw`], and the interrupt-endpoint reports -
+//! the opening-chain answers and the pull acknowledges - through
+//! [`crate::devices::read_input_report_raw`]. All of them are hidapi calls; on Linux the `linux-native`
+//! backend issues the kernel's own `HIDIOCSOUTPUT`, `HIDIOCSFEATURE` and `HIDIOCGFEATURE` ioctls, so this
+//! is one transport on every platform. `[EXPERIMENTAL]`: interrupt-endpoint reports collected this way
+//! timed out in the Linux run capture of 2026-10-16 - `usbhid` polls the endpoint only while a descriptor
+//! on the node is open, and a per-report reader opens it after the answer was dropped; see
+//! `docs/development/apex-7-onboard-profile-read.md`, "Input reports: the node must be open when the
+//! report arrives". Nothing in this path has been replayed on hardware.
 //!
 //! Nothing in this path has been replayed on hardware. This module never writes a profile.
 
 use std::time::{Duration, Instant};
 
 use crate::devices::find_hidraw_for_interface;
-#[cfg(unix)]
 use crate::devices::{
     read_feature_report_raw, read_input_report_raw, send_feature_report_raw, write_output_report_raw,
 };
-
-/// Windows/macOS transport: hidapi has the same control transfers, so the frames and replies are
-/// identical on the wire. Each call opens the collection by path.
-#[cfg(not(unix))]
-mod wire_shim {
-    use super::*;
-
-    fn open(path: &str) -> Result<hidapi::HidDevice> {
-        let api = hidapi::HidApi::new().map_err(|e| Error::DeviceCommunication(e.to_string()))?;
-        let c_path = std::ffi::CString::new(path)
-            .map_err(|_| Error::InvalidConfig("device path contains a NUL byte".to_string()))?;
-        api.open_path(&c_path)
-            .map_err(|e| Error::DeviceCommunication(format!("cannot open {path}: {e}")))
-    }
-
-    pub fn write_output_report_raw(path: &str, buffer: &[u8]) -> Result<()> {
-        open(path)?
-            .send_output_report(buffer)
-            .map(|_| ())
-            .map_err(|e| Error::DeviceCommunication(e.to_string()))
-    }
-
-    pub fn send_feature_report_raw(path: &str, buffer: &[u8], _report_len: usize) -> Result<()> {
-        open(path)?
-            .send_feature_report(buffer)
-            .map_err(|e| Error::DeviceCommunication(e.to_string()))
-    }
-
-    pub fn read_feature_report_raw(path: &str, report_id: u8, report_len: usize) -> Result<Vec<u8>> {
-        let mut report = vec![report_id; report_len];
-        let read = open(path)?
-            .get_feature_report(&mut report)
-            .map_err(|e| Error::DeviceCommunication(e.to_string()))?;
-        report.truncate(read);
-        Ok(report)
-    }
-
-    pub fn read_input_report_raw(path: &str, max_len: usize, poll_ms: u64) -> Result<Vec<u8>> {
-        let mut report = vec![0u8; max_len];
-        let timeout = i32::try_from(poll_ms).unwrap_or(i32::MAX);
-        let read = open(path)?
-            .read_timeout(&mut report, timeout)
-            .map_err(|e| Error::DeviceCommunication(e.to_string()))?;
-        report.truncate(read);
-        Ok(report)
-    }
-}
 
 use crate::devices::hid_reports::{
     CommandCode, HidCommand, HidDeviceType, HidReportBuilder, ONBOARD_FEATURE_REPORT_SIZE, ONBOARD_INIT_CHAIN,
@@ -108,8 +67,6 @@ use crate::onboard_profile::{
     ChunkRecord, INIT_REPLY_LEN, MAX_PROFILE_INDEX, PROFILE_FS_BASE, ProfileImage, ReadConfig, ReadReply,
     SCHEMA_READ_LEN, hex_of, parse_firmware_version, parse_read_reply_at, reply_mismatch, schema_of,
 };
-#[cfg(not(unix))]
-use wire_shim::{read_feature_report_raw, read_input_report_raw, send_feature_report_raw, write_output_report_raw};
 
 /// Highest profile slot this read supports.
 pub const MAX_PROFILE_INDEX_FOR_READ: u8 = MAX_PROFILE_INDEX;
@@ -430,7 +387,7 @@ fn read_reply_report(path: &str, payload_len: usize, overall: Option<Instant>) -
                 );
             }
             Err(e) => {
-                last_error = Some(e);
+                last_error = Some(Error::DeviceCommunication(format!("payload read on {path}: {e}")));
                 break;
             }
         }
@@ -438,7 +395,7 @@ fn read_reply_report(path: &str, payload_len: usize, overall: Option<Instant>) -
     }
 
     let mut input_attempts = 0u32;
-    while input_attempts < REPLY_INPUT_ATTEMPTS && overall.is_none_or(|d| Instant::now() < d) {
+    while input_attempts < REPLY_INPUT_ATTEMPTS {
         input_attempts = input_attempts.saturating_add(1);
         match read_input_report_raw(path, INPUT_REPORT_MAX_LEN, REPLY_POLL_MS as u64) {
             Ok(report) if reply_carries_payload(&report, payload_len) => {
@@ -477,10 +434,10 @@ fn read_pull_ack(path: &str) -> Option<Vec<u8>> {
     read_interrupt_report(path, PULL_ACK_LEN, PULL_ACK_ATTEMPTS)
 }
 
-/// Polls the interrupt endpoint for one non-empty report of at most `len` bytes.
+/// Polls the node for one non-empty report of at most `len` bytes.
 fn read_interrupt_report(path: &str, len: usize, attempts: u32) -> Option<Vec<u8>> {
     for _ in 0..attempts {
-        match read_input_report_raw(path, len + 1, REPLY_POLL_MS as u64) {
+        match read_input_report_raw(path, len, REPLY_POLL_MS as u64) {
             Ok(report) if !report.is_empty() => return Some(report),
             Ok(_) => {}
             Err(e) => {
