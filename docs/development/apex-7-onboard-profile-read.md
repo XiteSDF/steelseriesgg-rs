@@ -3,7 +3,7 @@
 Source: capture notes (Windows USBPcap capture of SteelSeries GG talking to an
 Apex 7, PID `0x1612`, 2026-10-15, firmware `4.16.8`). Every item below is `[EXPERIMENTAL]`: nothing of
 it has been replayed from `ssgg` on real hardware. Code: `src/devices/hid_reports.rs` (the command codes
-and every report buffer: `OnboardInitCommand` and `ONBOARD_INIT_CHAIN`, `OnboardPullCommand`,
+and every report buffer: `OnboardFirmwareVersionCommand`, `OnboardPullCommand`,
 `OnboardReadCommand`), `src/devices/keyboards/apex_legacy_profile.rs` (reply framing, payload geometry, reply parsing, decode - the module moved there on 2026-10-17, from `src/onboard_profile.rs`, because everything in it is specific to this legacy platform),
 `src/devices/keyboards/apex_legacy_onboard.rs` (read plan, reply assembly, polling),
 `src/devices/keyboards/apex7.rs` (`Apex7`: the keyboard device of the legacy Apex family, which wraps
@@ -35,7 +35,7 @@ discovered as its own device; the old path-based probe that tried interface 1 fi
 
 | Transfer | Control setup (from the capture) | Frame bytes (data stage) |
 |----------|------------------------------|------------------------|
-| opening chain (6 frames, once, 11 ms apart) | `SET_REPORT`, `bmRequestType 0x21`, `wValue 0x0200`, `wIndex 1`, `wLength 64` | `90 00 …`, `90 01 …`, `f4 00 …`, `6c 00 01 …`, `90 00 …`, `90 01 …`, each zero-padded to 64. The `90` polls are answered with the ASCII firmware version (`34 2e 31 …` = `4.16.8`), `f4 00` with `00 01 00…`, `6c 00 01` with nothing. Meanings unknown |
+| firmware poll (1 frame, once) | `SET_REPORT`, `bmRequestType 0x21`, `wValue 0x0200`, `wIndex 1`, `wLength 64` | `90 00 …` zero-padded to 64, answered on the interrupt endpoint with the ASCII firmware version (`34 2e 31 …` = `4.16.8`). **This is all the read sends.** GG's opening chain occupies the same slot with six frames 11 ms apart (`90 00`, `90 01`, `f4 00`, `6c 00 01`, `90 00`, `90 01`): `90 00` and `90 01` answer identically — measured on an Apex 7 wired on 2026-10-17, which is why one poll is enough — `f4 00` answers `00 01 00…`, `6c 00 01` answers nothing, and the meanings of both are unknown. `OnboardInitCommand`/`ONBOARD_INIT_CHAIN` were removed 2026-10-17; the codes stay as `CommandCode::{FirmwareVersion, EngineStatus, OpenFiles}` |
 | pull | `SET_REPORT`, `wValue 0x0200`, `wIndex 1`, `wLength 64` | `85 00 <file selector u16 LE> <file offset u32 LE> <size u16 LE>`, then zeros to 64 |
 | payload read | `SET_REPORT`, `wValue 0x0300`, `wIndex 1`, `wLength 642` | `83 00 <resource-buffer offset u16 LE> <size u16 LE>`, then zeros to 642 |
 | payload write | `SET_REPORT`, `wValue 0x0300`, `wIndex 1`, `wLength 642` | `03 00 <buffer offset u16 LE> <size u16 LE> <payload…>` — GG's write direction, 144 transfers, not sent by `ssgg` |
@@ -43,7 +43,7 @@ discovered as its own device; the old path-based probe that tried interface 1 fi
 
 All request shapes are output-report (`wValue 0x0200`) or feature-report (`wValue 0x0300`) `SET_REPORT`
 transfers: report **number 0** in both cases, the command byte sits in the data stage, not in `wValue`.
-On Linux that means `write()` for the opening-chain and pull frames (data[0] = report number 0) and the
+On Linux that means `write()` for the firmware-poll and pull frames (data[0] = report number 0) and the
 feature-report write for the read request.
 
 
@@ -102,7 +102,7 @@ per chunk from the typed commands, nothing materialises a transfer list (`Step`,
 `ReadConfig::steps()`, `init_steps()`, `plan_json` and the `onboard plan` subcommand were removed
 2026-10-17).
 The profile slot is the only run-time choice. The geometry (12 pulls of 1024, 2 reads of 512), the pacing
-([`GG_GAP_MS`]), the opening chain (always sent) and the reply framing
+([`GG_GAP_MS`]), the firmware poll (one `90 00`; GG's chain is not sent) and the reply framing
 ([`READ_REPLY_FRAMING_LEN`], 0 = the offset the capture's replies show) are constants:
 `ReadConfig` and its CLI tunables (`--resource-len`, `--read-len`, `--chunks`, `--payload-len`,
 `--fs-base`, `--gap-ms`, `--no-init-chain`, `--reply-header`) were removed 2026-10-17. A keyboard that
@@ -202,9 +202,9 @@ keyboard in a state GG itself cannot repair. `read` requires `--yes`; `decode` n
   none of them. The 2022/2023 profile blobs use a word at blob offset 12320 (see
   [apex-pro-tkl-2023-gg-capture.md](apex-pro-tkl-2023-gg-capture.md)); nothing in this capture says the
   legacy family does the same.
-- What `f4 00` and `6c 00 01` do. They are part of the opening chain, `f4 00` answers `00 01 00 …` and
+- What `f4 00` and `6c 00 01` do. GG sends them in its opening chain, `f4 00` answers `00 01 00 …` and
   `6c 00 01` is not answered at all; nothing here says which of the six frames a keyboard requires, and the
-  read always sends all six (`--no-init-chain` was removed 2026-10-17, so measuring that needs a code change).
+  this crate sends neither: since 2026-10-17 the read's only opening transfer is the `90 00` poll.
 - GG's write direction (`03 00 <offset> <size> <payload>`, 144 transfers in the capture): not used
   here, and there is no read-back command known for this family, so `ssgg onboard` writes nothing.
 - The remaining `wValue 0x0200` frames of the capture (`0x6e`, `0x68`, `0x6a`, `0x89`, `0x41`, `0x69`,

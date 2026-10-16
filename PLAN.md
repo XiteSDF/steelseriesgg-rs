@@ -247,6 +247,10 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   GG's shape, replacing `0x0290`/`0x0285`/`0x0383`), the read-back asks report number 0
   (`READ_REPLY_ID = 0x00`, `wValue 0x0300`) and `onboard_profile` keeps plan/parse/decode only. Same day:
 - 2026-10-17: same-day follow-ups after review - the materialised transfer plan (`OnboardTransferPlan`, `plan_frames`, `plan` and its CLI wiring), the schema probe (`OnboardSchemaProbe`, `read_config.schema_probe`), the transport layer (`OnboardTransport`, `HandleTransport`, `PathTransport`, the per-call path-open helpers) and the per-device stored slot (`Apex7::onboard_slot`, `set_onboard_slot`, `read_profile_slot`) were all removed, the read API takes the slot as an argument, every send on `GenericKeyboard` now shares one `connected_device` accessor, and `src/onboard_profile.rs` moved to `src/devices/keyboards/apex_legacy_profile.rs` (feature-gated) because its geometry, framing, payload sizes, schema words and struct offsets are all specific to this legacy platform. Same day: the CLI stopped printing that
+  geometry and the schema-length line (they quoted legacy constants); the opening chain was removed from the read -
+  `OnboardInitCommand`/`ONBOARD_INIT_CHAIN` are gone, `OnboardFirmwareVersionCommand` (`90 00`) is the one poll the
+  read sends, because on hardware `90 00` and `90 01` answered identically on 2026-10-17 and `f4 00`/`6c 00 01` have
+  no known meaning;
   geometry and the schema-length line (they quoted legacy constants), and the geometry is now logged by the read loop at
   `info` level - `src/main.rs` references no protocol constant.
   `devices::list_hidraw_paths` is gone (it existed in three copies) and `candidate_paths` asks

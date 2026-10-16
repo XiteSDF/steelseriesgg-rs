@@ -53,13 +53,13 @@ use std::time::{Duration, Instant};
 
 use super::GenericKeyboard;
 use super::apex_legacy_profile::{
-    ChunkRecord, DEFAULT_CHUNKS, GG_GAP_MS, INIT_REPLY_LEN, MAX_PROFILE_INDEX, PROFILE_FILE_LEN, ProfileImage,
+    ChunkRecord, DEFAULT_CHUNKS, FIRMWARE_REPLY_LEN, GG_GAP_MS, MAX_PROFILE_INDEX, PROFILE_FILE_LEN, ProfileImage,
     READ_LEN, READ_REPLY_FRAMING_LEN, READS_PER_PULL, RESOURCE_BUFFER_LEN, ReadReply, hex_of, parse_firmware_version,
     parse_read_reply_at, profile_file_id, reply_mismatch, validate_profile,
 };
 use crate::devices::hid_reports::{
-    CommandCode, HidCommand, HidDeviceType, HidReportBuilder, ONBOARD_FEATURE_REPORT_SIZE, ONBOARD_INIT_CHAIN,
-    ONBOARD_OUTPUT_REPORT_SIZE, ONBOARD_REPLY_REPORT_SIZE, OnboardPullCommand, OnboardReadCommand,
+    HidCommand, HidDeviceType, HidReportBuilder, ONBOARD_FEATURE_REPORT_SIZE, ONBOARD_OUTPUT_REPORT_SIZE,
+    ONBOARD_REPLY_REPORT_SIZE, OnboardFirmwareVersionCommand, OnboardPullCommand, OnboardReadCommand,
 };
 use crate::error::{Error, Result};
 
@@ -89,8 +89,8 @@ const REPLY_BUDGET_MS: u64 = 2_000;
 const REPLY_INPUT_ATTEMPTS: u32 = 20;
 /// Polls allowed for one pull answer.
 const PULL_ACK_ATTEMPTS: u32 = 4;
-/// Polls allowed for one opening-chain answer.
-const CHAIN_REPLY_ATTEMPTS: u32 = 3;
+/// Polls allowed for the firmware-version answer.
+const FIRMWARE_REPLY_ATTEMPTS: u32 = 3;
 /// Largest input report a profile collection can return (Apex 7 profile collections report 1024).
 const INPUT_REPORT_MAX_LEN: usize = 1024;
 
@@ -152,9 +152,9 @@ fn read_image(
         PROFILE_FILE_LEN,
     );
 
-    // The chain is part of every read GG runs, and its `0x90` poll is the only source of the firmware
-    // version this read reports.
-    let firmware = send_init_chain(keyboard, GG_GAP_MS);
+    // One `90 00` poll for the firmware version the image reports; the rest of GG's opening chain is
+    // not part of this read (see `read_firmware_version`).
+    let firmware = read_firmware_version(keyboard);
 
     let mut chunks: Vec<ChunkRecord> = Vec::with_capacity(DEFAULT_CHUNKS);
     for chunk in 0..DEFAULT_CHUNKS {
@@ -226,37 +226,25 @@ fn read_image(
     ProfileImage::assemble(profile, chunks).map(|image| image.with_firmware(firmware))
 }
 
-/// Sends GG's opening chain and returns the firmware version the `0x90` poll answered with.
+/// Reads the firmware version with one poll: `90 00` ([`OnboardFirmwareVersionCommand`]), answered on
+/// the interrupt endpoint with the ASCII version.
 ///
-/// Every frame is a 64-byte output report, in the capture's order: `90 00`, `90 01`, `f4 00`,
-/// `6c 00 01`, `90 00`, `90 01`. The answers arrive on the interrupt endpoint and carry no report-ID
-/// byte, so a frame that expects one is polled briefly; `6c 00 01` is not answered at all in the
-/// capture. A collection that rejects a frame is logged and the chain continues: the chain is GG's,
-/// and we have not measured on hardware which of its frames a keyboard requires.
-fn send_init_chain(keyboard: &GenericKeyboard, gap_ms: u64) -> Option<String> {
+/// GG's opening chain (`90 00`, `90 01`, `f4 00`, `6c 00 01`, twice over) is not sent. Both `90` polls
+/// answer on hardware (confirmed on an Apex 7 wired, 2026-10-17), so one is enough; `f4 00` and
+/// `6c 00 01` have unknown meanings and no known use in the read. The version is informational, so a
+/// refused poll is logged and the read continues without it.
+fn read_firmware_version(keyboard: &GenericKeyboard) -> Option<String> {
     let path = collection_label(keyboard);
-    let mut version: Option<String> = None;
-    for frame in ONBOARD_INIT_CHAIN {
-        if let Err(e) = write_output_command(keyboard, frame) {
-            tracing::debug!("onboard opening-chain frame {} on {path} rejected: {e}", frame.command);
-            continue;
-        }
-        if frame.expects_reply {
-            if let Some(report) = read_interrupt_report(keyboard, INIT_REPLY_LEN, CHAIN_REPLY_ATTEMPTS) {
-                tracing::debug!(
-                    "onboard opening-chain answer on {path}: {}",
-                    hex_of(&report[..report.len().min(8)])
-                );
-                if matches!(frame.command, CommandCode::FirmwareVersion) {
-                    version = version.or_else(|| parse_firmware_version(&report));
-                }
-            }
-        }
-        if gap_ms > 0 {
-            std::thread::sleep(Duration::from_millis(gap_ms));
-        }
+    if let Err(e) = write_output_command(keyboard, OnboardFirmwareVersionCommand) {
+        tracing::debug!("onboard firmware poll on {path} rejected: {e}");
+        return None;
     }
-    version
+    let report = read_interrupt_report(keyboard, FIRMWARE_REPLY_LEN, FIRMWARE_REPLY_ATTEMPTS)?;
+    tracing::debug!(
+        "onboard firmware poll answer on {path}: {}",
+        hex_of(&report[..report.len().min(8)])
+    );
+    parse_firmware_version(&report)
 }
 
 /// Collects one payload reply: the feature-report reply the capture shows, then the interrupt

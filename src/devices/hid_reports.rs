@@ -52,12 +52,15 @@ pub enum CommandCode {
     OnboardPull = 0x85,
     /// [EXPERIMENTAL] Legacy Apex on-board payload read (0x83), see `OnboardReadCommand`.
     OnboardPayloadRead = 0x83,
-    /// [EXPERIMENTAL] Legacy Apex opening-chain firmware-version poll (0x90), answered on the interrupt
-    /// endpoint with the ASCII firmware version. See `ONBOARD_INIT_CHAIN`.
+    /// [EXPERIMENTAL] Legacy Apex firmware-version poll (0x90), answered on the interrupt endpoint with
+    /// the ASCII firmware version. Both arguments answer on hardware (`90 00` and `90 01`, Apex 7 wired,
+    /// 2026-10-17). See [`OnboardFirmwareVersionCommand`].
     FirmwareVersion = 0x90,
-    /// [EXPERIMENTAL] Legacy Apex opening-chain frame (0xF4), answered `00 01 00…`; meaning unknown.
+    /// [EXPERIMENTAL] Legacy Apex frame `f4 00`, seen in GG's opening chain and answered `00 01 00…`;
+    /// meaning unknown, and nothing in this crate sends it.
     EngineStatus = 0xF4,
-    /// [EXPERIMENTAL] Legacy Apex opening-chain frame (0x6C); no answer was ever captured.
+    /// [EXPERIMENTAL] Legacy Apex frame `6c 00 01`, seen in GG's opening chain; no answer was ever
+    /// captured, the meaning is unknown, and nothing in this crate sends it.
     OpenFiles = 0x6C,
 }
 
@@ -480,107 +483,50 @@ pub const ONBOARD_REPLY_REPORT_SIZE: usize = 642;
 /// Bytes a payload read may ask for: a reply report carries the payload behind its report-ID byte.
 pub const ONBOARD_MAX_READ_LEN: usize = ONBOARD_REPLY_REPORT_SIZE - 1;
 
-/// One frame of the opening chain a legacy Apex keyboard expects in front of a profile read,
-/// `[EXPERIMENTAL]`: report number 0, the command byte, two argument bytes, zero padded to
-/// [`ONBOARD_OUTPUT_REPORT_SIZE`].
+/// [EXPERIMENTAL] Legacy Apex firmware-version poll: `90 00` in a 64-byte output report
+/// (`SET_REPORT wValue 0x0200`), answered on the interrupt endpoint with the ASCII firmware version
+/// (`34 2e 31 …` = `4.16.8` in the reference capture).
 ///
-/// The frame bytes are captured; the meanings of [`CommandCode::EngineStatus`] and
-/// [`CommandCode::OpenFiles`] are unknown, and no answer to [`CommandCode::OpenFiles`] was ever captured.
+/// The argument byte does not matter on hardware: an Apex 7 wired answered `90 00` and `90 01` the same
+/// way (2026-10-17). GG's chain polls with both 11 ms apart; one poll is enough, so this crate sends
+/// `90 00`. The chain's other frames, `f4 00` ([`CommandCode::EngineStatus`]) and `6c 00 01`
+/// ([`CommandCode::OpenFiles`]), have unknown meanings and are not sent here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OnboardInitCommand {
-    /// Command byte, one of [`CommandCode::FirmwareVersion`], [`CommandCode::EngineStatus`],
-    /// [`CommandCode::OpenFiles`].
-    pub command: CommandCode,
-    /// The two bytes behind the command byte.
-    pub args: [u8; 2],
-    /// True when the capture shows an interrupt-endpoint answer to this frame.
-    pub expects_reply: bool,
-}
+pub struct OnboardFirmwareVersionCommand;
 
-impl OnboardInitCommand {
-    /// Significant frame bytes behind the report number: command byte and its two arguments.
-    pub const FRAME_LEN: usize = 3;
+impl OnboardFirmwareVersionCommand {
+    /// Argument this crate polls with. GG's chain uses `0x01` as well; both answer.
+    const ARG: u8 = 0x00;
 
-    /// Frame bytes behind the report number, for plan reporting. Built by [`HidCommand::serialize`],
-    /// the same source as the wire bytes.
+    /// Significant frame bytes behind the report number: `[0x90, 0x00]`.
     #[must_use]
-    pub fn data_stage(&self) -> [u8; Self::FRAME_LEN] {
-        let mut buffer = [0u8; ONBOARD_OUTPUT_REPORT_SIZE];
-        serialize_stage(*self, &mut buffer);
-        let mut frame = [0u8; Self::FRAME_LEN];
-        frame.copy_from_slice(&buffer[1..Self::FRAME_LEN + 1]);
-        frame
+    pub fn data_stage() -> [u8; 2] {
+        [CommandCode::FirmwareVersion as u8, Self::ARG]
     }
 }
 
-impl HidCommand for OnboardInitCommand {
+impl HidCommand for OnboardFirmwareVersionCommand {
     fn command_code(&self) -> CommandCode {
-        self.command
+        CommandCode::FirmwareVersion
     }
 
     fn serialize(&self, buffer: &mut [u8], _device_type: HidDeviceType) -> Result<usize> {
-        self.validate()?;
         check_report_buffer(buffer, ONBOARD_OUTPUT_REPORT_SIZE)?;
         let report = &mut buffer[..ONBOARD_OUTPUT_REPORT_SIZE];
         report.fill(0);
-        report[1] = self.command as u8;
-        report[2..Self::FRAME_LEN + 1].copy_from_slice(&self.args);
+        report[1] = CommandCode::FirmwareVersion as u8;
+        report[2] = Self::ARG;
         Ok(ONBOARD_OUTPUT_REPORT_SIZE)
     }
 
     fn validate(&self) -> Result<()> {
-        match self.command {
-            CommandCode::FirmwareVersion | CommandCode::EngineStatus | CommandCode::OpenFiles => Ok(()),
-            other => Err(Error::InvalidConfig(format!(
-                "{other} is not a legacy Apex opening-chain command"
-            ))),
-        }
+        Ok(())
     }
 
     fn description(&self) -> String {
-        format!("On-board opening chain: {} {:02X?}", self.command, self.args)
+        "On-board firmware version poll: 90 00".to_string()
     }
 }
-
-/// The opening chain of a legacy Apex profile read, in wire order, `[EXPERIMENTAL]`: six 64-byte
-/// output reports, 11 ms apart in the capture. Bytes from the engine session capture (device 7, `1792014261.316` to
-/// `1792014261.390`); the `FirmwareVersion` polls are answered on the interrupt endpoint with the ASCII
-/// firmware version, `EngineStatus` answers `00 01 00…`, `OpenFiles` is not answered at all.
-///
-/// The capture contains no 13-byte transfer anywhere, so the pacing frame earlier versions of the read
-/// path sent is not part of the keyboard's procedure.
-pub const ONBOARD_INIT_CHAIN: [OnboardInitCommand; 6] = [
-    OnboardInitCommand {
-        command: CommandCode::FirmwareVersion,
-        args: [0x00, 0],
-        expects_reply: true,
-    },
-    OnboardInitCommand {
-        command: CommandCode::FirmwareVersion,
-        args: [0x01, 0],
-        expects_reply: true,
-    },
-    OnboardInitCommand {
-        command: CommandCode::EngineStatus,
-        args: [0, 0],
-        expects_reply: true,
-    },
-    OnboardInitCommand {
-        command: CommandCode::OpenFiles,
-        args: [0, 1],
-        expects_reply: false,
-    },
-    OnboardInitCommand {
-        command: CommandCode::FirmwareVersion,
-        args: [0x00, 0],
-        expects_reply: true,
-    },
-    OnboardInitCommand {
-        command: CommandCode::FirmwareVersion,
-        args: [0x01, 0],
-        expects_reply: true,
-    },
-];
 
 /// Copy part of a profile file into the keyboard's resource buffer, `[EXPERIMENTAL]`:
 /// `85 | 00 | file id u16 LE | file offset u32 LE | size u16 LE | 00…` inside
@@ -1796,41 +1742,26 @@ mod tests {
     use recovery::*;
 
     #[test]
-    fn opening_chain_frames_match_the_capture() {
-        let expected = [
-            [0x90, 0x00, 0x00],
-            [0x90, 0x01, 0x00],
-            [0xF4, 0x00, 0x00],
-            [0x6C, 0x00, 0x01],
-            [0x90, 0x00, 0x00],
-            [0x90, 0x01, 0x00],
-        ];
-        for (frame, expected) in ONBOARD_INIT_CHAIN.iter().zip(expected) {
-            assert_eq!(frame.data_stage(), expected, "frame bytes of {}", frame.command);
-            let mut buffer = [0u8; ONBOARD_OUTPUT_REPORT_SIZE];
-            let size = frame.serialize(&mut buffer, HidDeviceType::Keyboard).unwrap();
-            assert_eq!(size, ONBOARD_OUTPUT_REPORT_SIZE);
-            assert_eq!(buffer[0], 0x00, "report number 0, as the capture's wValue 0x0200");
-            assert_eq!(&buffer[1..4], &expected);
-            assert!(
-                buffer[4..].iter().all(|b| *b == 0),
-                "the 64-byte data stage is zero padded like the capture's frames"
-            );
-        }
-        assert!(!ONBOARD_INIT_CHAIN[3].expects_reply, "no answer to 6c was captured");
-        assert!(
-            matches!(ONBOARD_INIT_CHAIN[0].command, CommandCode::FirmwareVersion),
-            "the first frame is the firmware poll"
+    fn firmware_poll_matches_one_answered_form() {
+        assert_eq!(
+            OnboardFirmwareVersionCommand::data_stage(),
+            [0x90, 0x00],
+            "90 00 is one of the two forms an Apex 7 answered on 2026-10-17"
         );
+        let mut buffer = [0u8; ONBOARD_OUTPUT_REPORT_SIZE];
+        let size = OnboardFirmwareVersionCommand
+            .serialize(&mut buffer, HidDeviceType::Keyboard)
+            .unwrap();
+        assert_eq!(size, ONBOARD_OUTPUT_REPORT_SIZE);
+        assert_eq!(buffer[0], 0x00, "report number 0, as the capture's wValue 0x0200");
+        assert_eq!(&buffer[1..3], &[0x90, 0x00]);
         assert!(
-            OnboardInitCommand {
-                command: CommandCode::RgbControl,
-                args: [0, 0],
-                expects_reply: false,
-            }
-            .validate()
-            .is_err(),
-            "only the captured chain codes are accepted"
+            buffer[3..].iter().all(|b| *b == 0),
+            "the 64-byte data stage is zero padded like the capture's frames"
+        );
+        assert_eq!(
+            OnboardFirmwareVersionCommand.command_code(),
+            CommandCode::FirmwareVersion
         );
     }
 
@@ -1869,7 +1800,7 @@ mod tests {
         let builder = HidReportBuilder::new(HidDeviceType::Keyboard);
         let mut chain = [0u8; ONBOARD_OUTPUT_REPORT_SIZE];
         assert_eq!(
-            builder.build_report(ONBOARD_INIT_CHAIN[0], &mut chain).unwrap(),
+            builder.build_report(OnboardFirmwareVersionCommand, &mut chain).unwrap(),
             ONBOARD_OUTPUT_REPORT_SIZE
         );
         let mut pull = [0u8; ONBOARD_OUTPUT_REPORT_SIZE];
