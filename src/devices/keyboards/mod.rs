@@ -331,11 +331,7 @@ impl GenericKeyboard {
 
         debug!("Sending HID report ({} bytes): {:02x?}", data.len(), data);
 
-        let device = self
-            .device
-            .as_ref()
-            .ok_or(Error::DeviceCommunication("Device not connected".to_string()))?;
-        let device = device.lock();
+        let device = self.connected_device()?.lock();
 
         let result = if let Some(result) = with_global_diagnostics(|diag| {
             diag.record_timed_operation(HidOperation::Send, data, || {
@@ -378,10 +374,7 @@ impl GenericKeyboard {
 
         debug!("Sending HID report ({} bytes): {:02x?}", data.len(), data);
 
-        let device = self
-            .device
-            .clone()
-            .ok_or(Error::DeviceCommunication("Device not connected".to_string()))?;
+        let device = self.connected_device()?.clone();
 
         let data = data.to_vec();
 
@@ -430,10 +423,7 @@ impl GenericKeyboard {
     /// frames, re-open the interface-1 collection explicitly rather than restoring the path lookup.
     #[cfg(unix)]
     pub fn send_feature(&self, data: &[u8], report_len: usize) -> Result<()> {
-        let device = self
-            .device
-            .as_ref()
-            .ok_or(Error::DeviceCommunication("Device not connected".to_string()))?;
+        let device = self.connected_device()?;
         let report = {
             let mut report = vec![0u8; report_len.max(1)];
             let copy_len = data.len().min(report.len());
@@ -448,11 +438,7 @@ impl GenericKeyboard {
 
     #[cfg(not(unix))]
     pub fn send_feature(&self, data: &[u8], _report_len: usize) -> Result<()> {
-        let device = self
-            .device
-            .as_ref()
-            .ok_or(Error::DeviceCommunication("Device not connected".to_string()))?;
-        let device = device.lock();
+        let device = self.connected_device()?.lock();
 
         device
             .send_feature_report(data)
@@ -484,16 +470,16 @@ impl GenericKeyboard {
     // opened and it stays open for the whole read - `usbhid` polls a collection's interrupt endpoint
     // only while a descriptor on that node is open.
 
-    /// The open handle of this keyboard's collection.
+    /// The open handle of this keyboard's collection, shared by every transfer on it.
     ///
     /// # Errors
     ///
-    /// Returns an error when the keyboard was created without a handle.
-    #[cfg(feature = "onboard")]
-    pub(crate) fn profile_device(&self) -> Result<&Arc<Mutex<HidDevice>>> {
+    /// Returns the same "Device not connected" error every send and receive on a handle-less keyboard
+    /// reports.
+    pub(crate) fn connected_device(&self) -> Result<&Arc<Mutex<HidDevice>>> {
         self.device
             .as_ref()
-            .ok_or_else(|| Error::DeviceCommunication("keyboard has no open HID handle".to_string()))
+            .ok_or(Error::DeviceCommunication("Device not connected".to_string()))
     }
 
     /// Send one output report on this keyboard's collection: `data[0]` is the report number
@@ -506,7 +492,7 @@ impl GenericKeyboard {
     /// so a deduplicating write would drop frames GG sends.
     #[cfg(feature = "onboard")]
     pub(crate) fn write_profile_packet(&self, data: &[u8]) -> Result<()> {
-        let device = self.profile_device()?.lock();
+        let device = self.connected_device()?.lock();
         let written = device
             .write(data)
             .map_err(|e| Error::DeviceCommunication(format!("output report write: {e}")))?;
@@ -529,7 +515,7 @@ impl GenericKeyboard {
             )));
         }
         let mut report = vec![report_id; len];
-        let device = self.profile_device()?.lock();
+        let device = self.connected_device()?.lock();
         let received = device
             .get_feature_report(&mut report)
             .map_err(|e| Error::DeviceCommunication(format!("feature report read: {e}")))?;
@@ -544,7 +530,7 @@ impl GenericKeyboard {
         let mut report = vec![0u8; len.max(1)];
         let poll_ms = i32::try_from(timeout_ms).unwrap_or(i32::MAX);
         let received = {
-            let device = self.profile_device()?.lock();
+            let device = self.connected_device()?.lock();
             device
                 .read_timeout(&mut report, poll_ms)
                 .map_err(|e| Error::DeviceCommunication(format!("input report read: {e}")))?
@@ -598,11 +584,7 @@ impl Device for GenericKeyboard {
     }
 
     fn receive_raw(&mut self, buf: &mut [u8]) -> Result<usize> {
-        let device = self
-            .device
-            .as_ref()
-            .ok_or(Error::DeviceCommunication("Device not connected".to_string()))?;
-        let device = device.lock();
+        let device = self.connected_device()?.lock();
 
         if let Some(result) = with_global_diagnostics(|diag| {
             diag.record_timed_operation(HidOperation::Receive, &[], || {
