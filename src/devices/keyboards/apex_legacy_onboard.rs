@@ -52,15 +52,17 @@
 //! nothing; see `docs/development/apex-7-onboard-profile-read.md`, "Input reports: the node must be open
 //! when the report arrives". Apex 7 wired works through hidapi: the same `SET_REPORT wValue 0x0200` and
 //! `wValue 0x0300` shapes the reference capture shows, on the collection hidapi opened.
-//! `[EXPERIMENTAL]`: nothing in this path has been replayed on hardware. This module never writes a
-//! profile.
+//! `[EXPERIMENTAL]`: the read completes on hardware - a full profile slot has been read from an Apex 7
+//! under Linux (reported 2026-10-18; model, firmware and the decoded bytes are not recorded in this repo
+//! yet). What is still unproven is the decode: slot layout, checksum words and the per-slot compare
+//! against GG (`ONBOARD.md` steps 3-5). This module never writes a profile.
 
 use std::time::{Duration, Instant};
 
 use super::GenericKeyboard;
 use super::apex_legacy_profile::{
-    ChunkRecord, DEFAULT_CHUNKS, FIRMWARE_REPLY_LEN, GG_GAP_MS, MAX_PROFILE_INDEX, PROFILE_FILE_LEN, ProfileImage,
-    READ_LEN, READ_REPLY_FRAMING_LEN, READS_PER_PULL, RESOURCE_BUFFER_LEN, ReadReply, hex_of, parse_firmware_version,
+    ChunkRecord, DEVICE_RESOURCE_BUFFER_LEN, FIRMWARE_REPLY_LEN, GG_GAP_MS, PAYLOAD_READ_LEN, PROFILE_FILE_BYTES,
+    PULLS_PER_FILE, ProfileImage, READ_REPLY_FRAMING_LEN, READS_PER_PULL, ReadReply, hex_of, parse_firmware_version,
     parse_read_reply_at, profile_file_id, reply_mismatch, validate_profile,
 };
 use crate::devices::hid_reports::{
@@ -69,8 +71,6 @@ use crate::devices::hid_reports::{
 };
 use crate::error::{Error, Result};
 
-/// Highest profile slot this read supports.
-pub const MAX_PROFILE_INDEX_FOR_READ: u8 = MAX_PROFILE_INDEX;
 /// Report number to ask for when reading a payload read back: **0**, which is the
 /// `GET_REPORT wValue 0x0300 wIndex 1` control read the reference capture shows. The kernel writes the
 /// device's own report-ID byte into byte 0 of the buffer, so the reply's leading `03` arrives there
@@ -92,7 +92,9 @@ const ACK_REPORT_IDS: [u8; 2] = [0x0B, 0x12];
 const PULL_ACK_LEN: usize = 64;
 /// Polls per reply collection round, in milliseconds.
 const REPLY_POLL_MS: i32 = 50;
-/// Reply budget per payload read when the caller set no deadline, in milliseconds.
+/// Reply budget for one payload read, in milliseconds: the feature-report poll loop runs until this
+/// expires, then the input-endpoint fallback starts. A fixed budget, not a caller-set deadline (the
+/// `--timeout` knob is gone).
 const REPLY_BUDGET_MS: u64 = 2_000;
 /// Input-report polls allowed per reply before giving up.
 const REPLY_INPUT_ATTEMPTS: u32 = 20;
@@ -105,13 +107,14 @@ const INPUT_REPORT_MAX_LEN: usize = 1024;
 
 // The transfers the profile protocol needs are the packet I/O of the keyboard the read runs on:
 // `GenericKeyboard::write_profile_packet` for output frames (not `send_report`, whose hid optimizer
-// dedup would drop the chain's repeated frames), the keyboard's existing `send_feature` for the
+// dedup would drop the repeated frames of a read), the keyboard's existing `send_feature` for the
 // feature-report read request, and `read_profile_feature_packet` / `read_profile_input_packet` for the
 // two reply shapes, all on the handle that device already owns - the collection the device manager
 // opened, open for the whole read.
 //
-// `[EXPERIMENTAL]`: on hardware this has gone as far as the read request being accepted (Apex 7,
-// 2026-10-15); no payload reply has been collected from a keyboard by this code.
+// `[EXPERIMENTAL]`: on hardware the pull, the pacing read and the payload read-back all complete on an
+// Apex 7 (2026-10-17/18); the read request is answered by the `GET_REPORT` control-IN reply the capture
+// shows.
 
 /// Reads one profile slot on one collection a keyboard device holds open, which is how
 /// [`super::apex7::Apex7`] reads its own on-board profiles.
@@ -120,58 +123,47 @@ const INPUT_REPORT_MAX_LEN: usize = 1024;
 ///
 /// Returns an error when the collection rejects a frame, never answers a payload read, or `profile` is
 /// not a slot this read supports.
-pub async fn read_profile(keyboard: &GenericKeyboard, profile: u8, strict: bool) -> Result<ProfileImage> {
-    // The read plan blocks (frame pacing, reply polls) on a worker thread. `spawn_blocking` asks for a
-    // `'static` closure; the keyboard outlives the join we await below, and the closure finishes before
-    // `read_profile` returns, so borrowing it for the closure is sound.
-    let keyboard: &'static GenericKeyboard =
-        unsafe { std::mem::transmute::<&GenericKeyboard, &'static GenericKeyboard>(keyboard) };
-    let (tx, rx) = std::sync::mpsc::channel();
-    tokio::task::spawn_blocking(move || {
-        let result = read_image(keyboard, profile, strict, None);
-        let _ = tx.send(result);
+pub async fn read_profile(keyboard: &GenericKeyboard, profile: u8) -> Result<ProfileImage> {
+    // The read plan blocks on reply polls and GG's inter-frame pacing, so it runs on its own thread. A
+    // scoped thread borrows the keyboard and the scope is joined before this returns, which is the whole
+    // reason to use `std::thread::scope`: the borrow is checked, not asserted.
+    std::thread::scope(|scope| {
+        scope
+            .spawn(move || read_image(keyboard, profile))
+            .join()
+            .map_err(|_| Error::Other("onboard read worker panicked".to_string()))?
     })
-    .await
-    .map_err(|e| Error::Other(format!("onboard read task failed: {e}")))?;
-    rx.recv()
-        .map_err(|e| Error::Other(format!("onboard read worker sent no result: {e}")))?
 }
 
-/// Runs one read (the firmware poll, then [`DEFAULT_CHUNKS`] pulls, each with its pacing read and payload
+/// Runs one read (the firmware poll, then [`PULLS_PER_FILE`] pulls, each with its pacing read and payload
 /// reads) on one collection.
-fn read_image(
-    keyboard: &GenericKeyboard,
-    profile: u8,
-    strict: bool,
-    deadline: Option<Duration>,
-) -> Result<ProfileImage> {
+fn read_image(keyboard: &GenericKeyboard, profile: u8) -> Result<ProfileImage> {
     let path = collection_label(keyboard);
     validate_profile(profile)?;
     let fs_id = profile_file_id(profile);
-    let read_len = READ_LEN as u16;
-    let overall = deadline.map(|d| Instant::now() + d);
+    let read_len = PAYLOAD_READ_LEN as u16;
 
     // The geometry this platform's read always has; `ssgg --debug onboard read ...` shows it before
     // the first byte moves.
     tracing::info!(
-        "onboard read geometry: profile slot {profile} (file {fs_id:04X}) is {DEFAULT_CHUNKS} pulls of \
-         {RESOURCE_BUFFER_LEN} bytes, {} payload reads of {READ_LEN} bytes, {} of the {} payload bytes covered",
-        DEFAULT_CHUNKS * READS_PER_PULL,
-        DEFAULT_CHUNKS * READS_PER_PULL * READ_LEN,
-        PROFILE_FILE_LEN,
+        "onboard read geometry: profile slot {profile} (file {fs_id:04X}) is {PULLS_PER_FILE} pulls of \
+         {DEVICE_RESOURCE_BUFFER_LEN} bytes, {} payload reads of {PAYLOAD_READ_LEN} bytes, {} of the {} payload bytes covered",
+        PULLS_PER_FILE * READS_PER_PULL,
+        PULLS_PER_FILE * READS_PER_PULL * PAYLOAD_READ_LEN,
+        PROFILE_FILE_BYTES,
     );
 
     // One `90 00` poll for the firmware version the image reports; the rest of GG's opening chain is
     // not part of this read (see `read_firmware_version`).
     let firmware = read_firmware_version(keyboard);
 
-    let mut chunks: Vec<ChunkRecord> = Vec::with_capacity(DEFAULT_CHUNKS);
-    for chunk in 0..DEFAULT_CHUNKS {
-        let file_offset = (chunk * RESOURCE_BUFFER_LEN) as u32;
+    let mut chunks: Vec<ChunkRecord> = Vec::with_capacity(PULLS_PER_FILE);
+    for chunk in 0..PULLS_PER_FILE {
+        let file_offset = (chunk * DEVICE_RESOURCE_BUFFER_LEN) as u32;
         let pull = OnboardPullCommand {
             fs_id,
             file_offset,
-            size: RESOURCE_BUFFER_LEN as u16,
+            size: DEVICE_RESOURCE_BUFFER_LEN as u16,
         };
         write_output_command(keyboard, pull).map_err(|e| {
             Error::DeviceCommunication(format!(
@@ -190,7 +182,7 @@ fn read_image(
 
         let mut reads: Vec<ReadReply> = Vec::with_capacity(READS_PER_PULL);
         for read in 0..READS_PER_PULL {
-            let buffer_offset = (read * READ_LEN) as u16;
+            let buffer_offset = (read * PAYLOAD_READ_LEN) as u16;
             let command = OnboardReadCommand {
                 buffer_offset,
                 size: read_len,
@@ -201,16 +193,10 @@ fn read_image(
                      {path} rejected: {e}"
                 ))
             })?;
-            let reply = read_reply_report(keyboard, READ_LEN, overall)?;
+            let reply = read_reply_report(keyboard, PAYLOAD_READ_LEN)?;
             let parsed = parse_read_reply_at(&reply, read_len, READ_REPLY_FRAMING_LEN)?;
             if let Some(msg) = reply_mismatch(&parsed, buffer_offset, read_len) {
                 tracing::debug!("onboard read: {msg}");
-                if strict {
-                    return Err(Error::DeviceCommunication(format!(
-                        "strict mode: {msg} (drop --strict to accept replies that do not echo the \
-                         request header)"
-                    )));
-                }
             }
             reads.push(parsed);
             if GG_GAP_MS > 0 {
@@ -225,11 +211,6 @@ fn read_image(
             ack_hex,
             reads,
         });
-        if overall.is_some_and(|d| Instant::now() >= d) {
-            return Err(Error::DeviceCommunication(format!(
-                "reply budget expired after chunk {chunk} on {path}"
-            )));
-        }
     }
 
     ProfileImage::assemble(profile, chunks).map(|image| image.with_firmware(firmware))
@@ -258,13 +239,9 @@ fn read_firmware_version(keyboard: &GenericKeyboard) -> Option<String> {
 
 /// Collects one payload reply: the feature-report reply the capture shows, then the interrupt
 /// endpoint. Returns `[report ID][payload…]`, the shape [`parse_read_reply`] consumes.
-fn read_reply_report(keyboard: &GenericKeyboard, payload_len: usize, overall: Option<Instant>) -> Result<Vec<u8>> {
+fn read_reply_report(keyboard: &GenericKeyboard, payload_len: usize) -> Result<Vec<u8>> {
     let path = collection_label(keyboard);
-    let budget = overall
-        .map(|d| d.saturating_duration_since(Instant::now()))
-        .filter(|d| !d.is_zero())
-        .unwrap_or(Duration::from_millis(REPLY_BUDGET_MS));
-    let stop = Instant::now() + budget;
+    let stop = Instant::now() + Duration::from_millis(REPLY_BUDGET_MS);
     let mut empty_answers = 0u32;
     let mut last_error: Option<Error> = None;
 
@@ -403,7 +380,10 @@ fn write_feature_command<C: HidCommand>(keyboard: &GenericKeyboard, command: C) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::devices::keyboards::apex_legacy_profile::{PROFILE_FS_BASE, RESOURCE_BUFFER_LEN};
+    use crate::devices::keyboards::apex_legacy_profile::{
+        DEVICE_RESOURCE_BUFFER_LEN, MAX_PROFILE_INDEX, PAYLOAD_READ_LEN, PROFILE_FS_BASE, PULLS_PER_FILE,
+        READS_PER_PULL, profile_file_id, validate_profile,
+    };
 
     #[test]
     fn reply_carries_payload_needs_room_behind_the_report_id() {
@@ -418,13 +398,13 @@ mod tests {
     fn default_read_config_matches_the_captured_geometry() {
         assert_eq!(profile_file_id(0), PROFILE_FS_BASE);
         assert_eq!(
-            DEFAULT_CHUNKS * RESOURCE_BUFFER_LEN,
+            PULLS_PER_FILE * DEVICE_RESOURCE_BUFFER_LEN,
             12_288,
             "the fixed read covers the payload of the reference capture"
         );
         assert_eq!(
             READS_PER_PULL,
-            RESOURCE_BUFFER_LEN / READ_LEN,
+            DEVICE_RESOURCE_BUFFER_LEN / PAYLOAD_READ_LEN,
             "the fixed read drains the buffer in 512-byte windows"
         );
         assert!(validate_profile(MAX_PROFILE_INDEX).is_ok());

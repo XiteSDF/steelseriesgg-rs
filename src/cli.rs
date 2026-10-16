@@ -195,8 +195,8 @@ pub(crate) enum Commands {
 
 /// [EXPERIMENTAL] Read the on-board profile of a legacy Apex keyboard.
 ///
-/// `plan` and `decode` work on the wire format and on saved files only; they never touch a device.
-/// `read` talks to a keyboard and needs `--yes`.
+/// `decode` works on a saved profile image only and never touches a device. `read` talks to a keyboard
+/// and needs `--yes`.
 #[derive(Subcommand)]
 pub(crate) enum OnboardAction {
     /// Read one profile from a legacy Apex keyboard. Requires --yes.
@@ -206,13 +206,14 @@ pub(crate) enum OnboardAction {
     Decode(OnboardDecodeArgs),
 }
 
-/// Wire tunables of one on-board profile read. Defaults are the values measured in the reference
-/// capture: GG's six-frame opening chain 11 ms apart, a 1024-byte resource buffer, and 512-byte
-/// reads out of it.
+/// One on-board profile read. The flags pick the slot, the keyboard and what to do with the result;
+/// nothing on the wire is a flag. The geometry is fixed in `apex_legacy_profile`: 12 pulls of the
+/// device's 1024-byte resource buffer, drained by two 512-byte payload windows per fill, paced like GG
+/// (5 ms) and read with the reply framing the reference capture shows.
 #[derive(clap::Args)]
 pub(crate) struct OnboardReadArgs {
-    /// On-board profile slot (0-4). Everything else about the read is fixed geometry: 12 pulls of 1024
-    /// bytes, 512-byte payload reads, GG's opening chain, its pacing, the reply framing the capture shows.
+    /// On-board profile slot (0-4). The pull count, buffer size, window size, pacing and reply framing
+    /// are protocol constants, not options.
     #[arg(short, long, default_value = "0")]
     pub(crate) profile: u8,
 
