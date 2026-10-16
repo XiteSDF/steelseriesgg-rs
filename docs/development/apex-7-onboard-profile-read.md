@@ -4,7 +4,7 @@ Source: capture notes (Windows USBPcap capture of SteelSeries GG talking to an
 Apex 7, PID `0x1612`, 2026-10-15, firmware `4.16.8`). Every item below is `[EXPERIMENTAL]`: nothing of
 it has been replayed from `ssgg` on real hardware. Code: `src/devices/hid_reports.rs` (the command codes
 and every report buffer: `OnboardInitCommand` and `ONBOARD_INIT_CHAIN`, `OnboardPullCommand`,
-`OnboardReadCommand`), `src/onboard_profile.rs` (read sequence plan, reply parsing, decode),
+`OnboardReadCommand`), `src/devices/keyboards/apex_legacy_profile.rs` (reply framing, payload geometry, reply parsing, decode - the module moved there on 2026-10-17, from `src/onboard_profile.rs`, because everything in it is specific to this legacy platform),
 `src/devices/keyboards/apex_legacy_onboard.rs` (read plan, reply assembly, polling),
 `src/devices/keyboards/apex7.rs` (`Apex7`: the keyboard device of the legacy Apex family, which wraps
 `GenericKeyboard`) - the packet I/O is `GenericKeyboard`'s own profile transfers on the handle it owns
@@ -191,7 +191,7 @@ visible in the read output: the schema word appears at byte 0 of the payload onl
 ## Safety
 
 Read-only code. `ssgg onboard` writes nothing to the keyboard: the push command (`0x05`) is named in
-`src/onboard_profile.rs` for completeness and nothing sends it. Do not add profile writes: the
+`src/devices/keyboards/apex_legacy_profile.rs` for completeness and nothing sends it. Do not add profile writes: the
 profile blob contains blocks this layout does not explain, and writing a synthetic blob can put the
 keyboard in a state GG itself cannot repair. `read` requires `--yes`; `decode` never touches a device.
 

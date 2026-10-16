@@ -7,7 +7,7 @@
 //! collection's interrupt endpoint only while a descriptor on that node is open, so the opening-chain
 //! answers and the pull acknowledges have nowhere to arrive on a per-report open).
 //!
-//! Frame construction, reply parsing, payload geometry and decode live in [`crate::onboard_profile`].
+//! Frame construction, reply parsing, payload geometry and decode live in [`crate::devices::keyboards::apex_legacy_profile`].
 //!
 //! `[EXPERIMENTAL]`: the protocol is reverse-engineered from the Windows USBPcap capture of
 //! official GG on an Apex 7 (PID `0x1612`, firmware `4.16.8`), written up in
@@ -20,14 +20,14 @@ use async_trait::async_trait;
 
 #[cfg(feature = "onboard")]
 use super::apex_legacy_onboard;
+#[cfg(feature = "onboard")]
+use super::apex_legacy_profile::ProfileImage;
 use super::{GenericKeyboard, Keyboard};
 use crate::devices::key_mapping::{KeyId, KeyMapping};
 use crate::devices::product_ids;
 use crate::devices::zone_mapping::{ZoneEffect, ZoneMapping};
 use crate::devices::{Device, DeviceType};
 use crate::error::Result;
-#[cfg(feature = "onboard")]
-use crate::onboard_profile::ProfileImage;
 use crate::rgb::{Color, PerKeyEffect};
 
 /// Apex 7 and the boards of its platform that take the on-board profile protocol.
@@ -206,10 +206,13 @@ mod tests {
             // The device carries no slot state: the slot is an argument, and slot 0 is the file the
             // capture read.
             assert_eq!(
-                crate::onboard_profile::profile_file_id(0),
-                crate::onboard_profile::PROFILE_FS_BASE
+                crate::devices::keyboards::apex_legacy_profile::profile_file_id(0),
+                crate::devices::keyboards::apex_legacy_profile::PROFILE_FS_BASE
             );
-            assert_eq!(crate::onboard_profile::profile_file_id(4), 0x0205);
+            assert_eq!(
+                crate::devices::keyboards::apex_legacy_profile::profile_file_id(4),
+                0x0205
+            );
         }
     }
 }

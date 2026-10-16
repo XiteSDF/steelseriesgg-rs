@@ -1,9 +1,9 @@
 //! [EXPERIMENTAL] On-board profile read for the legacy/"macho" Apex platform.
 //!
-//! Frame construction, reply parsing, payload geometry and decoding live in [`crate::onboard_profile`].
+//! Frame construction, reply parsing, payload geometry and decoding live in [`crate::devices::keyboards::apex_legacy_profile`].
 //! This module only moves bytes: it opens the collection that carries profile traffic, sends the
 //! opening-chain, pull and read frames the read plan describes, collects replies and assembles a
-//! [`crate::onboard_profile::ProfileImage`].
+//! [`crate::devices::keyboards::apex_legacy_profile::ProfileImage`].
 //!
 //! Wire facts confirmed from the 2026-10-15 Windows USBPcap capture of official GG on an Apex 7
 //! (VID `0x1038`, PID `0x1612`, firmware `4.16.8`), decoded from
@@ -52,16 +52,16 @@
 use std::time::{Duration, Instant};
 
 use super::GenericKeyboard;
+use super::apex_legacy_profile::{
+    ChunkRecord, DEFAULT_CHUNKS, GG_GAP_MS, INIT_REPLY_LEN, MAX_PROFILE_INDEX, ProfileImage, READ_LEN,
+    READ_REPLY_FRAMING_LEN, READS_PER_PULL, RESOURCE_BUFFER_LEN, ReadReply, hex_of, parse_firmware_version,
+    parse_read_reply_at, profile_file_id, reply_mismatch, validate_profile,
+};
 use crate::devices::hid_reports::{
     CommandCode, HidCommand, HidDeviceType, HidReportBuilder, ONBOARD_FEATURE_REPORT_SIZE, ONBOARD_INIT_CHAIN,
     ONBOARD_OUTPUT_REPORT_SIZE, ONBOARD_REPLY_REPORT_SIZE, OnboardPullCommand, OnboardReadCommand,
 };
 use crate::error::{Error, Result};
-use crate::onboard_profile::{
-    ChunkRecord, DEFAULT_CHUNKS, GG_GAP_MS, INIT_REPLY_LEN, MAX_PROFILE_INDEX, ProfileImage, READ_LEN,
-    READ_REPLY_FRAMING_LEN, READS_PER_PULL, RESOURCE_BUFFER_LEN, ReadReply, hex_of, parse_firmware_version,
-    parse_read_reply_at, profile_file_id, reply_mismatch, validate_profile,
-};
 
 /// Highest profile slot this read supports.
 pub const MAX_PROFILE_INDEX_FOR_READ: u8 = MAX_PROFILE_INDEX;
@@ -392,7 +392,7 @@ fn write_feature_command<C: HidCommand>(keyboard: &GenericKeyboard, command: C) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::onboard_profile::{PROFILE_FS_BASE, RESOURCE_BUFFER_LEN};
+    use crate::devices::keyboards::apex_legacy_profile::{PROFILE_FS_BASE, RESOURCE_BUFFER_LEN};
 
     #[test]
     fn reply_carries_payload_needs_room_behind_the_report_id() {

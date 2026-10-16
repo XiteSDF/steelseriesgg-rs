@@ -202,7 +202,7 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   SignalRGB research (it drives devices directly via its own plugins; no SteelSeries bytes in public docs).
 - Apex Pro TKL 2023 wired: GG capture, 84-key lighting table, 645-byte frame, interface-1 path, profile slot map
   (`WIRED_2023_PROFILE_SLOTS`), GG-engine warning. Committed in `f430380`.
-- Apex 7 on-board profile read: `onboard` feature, `src/onboard_profile.rs`,
+- Apex 7 on-board profile read: `onboard` feature, `src/devices/keyboards/apex_legacy_profile.rs`,
   `src/devices/keyboards/apex_legacy_onboard.rs`, `ssgg onboard` (2026-10-15). Read-only, `[EXPERIMENTAL]`.
   Hardware validation on 2026-10-15 got a pacing frame, a pull and the payload-read request accepted on
   the `0xFFC1` collection, then stalled: the code asked the kernel for a 643-byte feature report, the
@@ -246,6 +246,7 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   every buffer starts with report number **0** (`wValue 0x0200 wLength 64`, `wValue 0x0300 wLength 642` -
   GG's shape, replacing `0x0290`/`0x0285`/`0x0383`), the read-back asks report number 0
   (`READ_REPLY_ID = 0x00`, `wValue 0x0300`) and `onboard_profile` keeps plan/parse/decode only. Same day:
+- 2026-10-17: same-day follow-ups after review - the materialised transfer plan (`OnboardTransferPlan`, `plan_frames`, `plan` and its CLI wiring), the schema probe (`OnboardSchemaProbe`, `read_config.schema_probe`), the transport layer (`OnboardTransport`, `HandleTransport`, `PathTransport`, the per-call path-open helpers) and the per-device stored slot (`Apex7::onboard_slot`, `set_onboard_slot`, `read_profile_slot`) were all removed, the read API takes the slot as an argument, every send on `GenericKeyboard` now shares one `connected_device` accessor, and `src/onboard_profile.rs` moved to `src/devices/keyboards/apex_legacy_profile.rs` (feature-gated) because its geometry, framing, payload sizes, schema words and struct offsets are all specific to this legacy platform.
   `devices::list_hidraw_paths` is gone (it existed in three copies) and `candidate_paths` asks
   `find_hidraw_for_interface(vid, pid, PROFILE_INTERFACE = 1)`, so the probe no longer sprays frames over
   interfaces 0-4. `find_hidraw_for_interface` on Unix now compares the interface number `interface_from_phys`

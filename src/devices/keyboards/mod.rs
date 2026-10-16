@@ -4,6 +4,8 @@ pub mod apex;
 pub mod apex7;
 #[cfg(feature = "onboard")]
 pub mod apex_legacy_onboard;
+#[cfg(feature = "onboard")]
+pub mod apex_legacy_profile;
 pub mod apex_pro_tkl_2023;
 pub mod apex_pro_tkl_2023_profile;
 
@@ -224,7 +226,10 @@ pub trait Keyboard: Device {
     /// `[EXPERIMENTAL]`: the protocol is reverse-engineered from a capture of official GG and
     /// has never completed a read on hardware from this code.
     #[cfg(feature = "onboard")]
-    async fn read_onboard_profile(&self, _profile: u8) -> Result<crate::onboard_profile::ProfileImage> {
+    async fn read_onboard_profile(
+        &self,
+        _profile: u8,
+    ) -> Result<crate::devices::keyboards::apex_legacy_profile::ProfileImage> {
         Err(Error::DeviceCommunication(
             "on-board profile read is not supported by this keyboard".to_string(),
         ))
@@ -317,6 +322,13 @@ impl GenericKeyboard {
             zone_color_buffer: Vec::with_capacity(zone_count),
             actuation_point_cache: None,
         }
+    }
+
+    // Packet I/O on the collection this keyboard already owns.
+    pub(crate) fn connected_device(&self) -> Result<&Arc<Mutex<HidDevice>>> {
+        self.device
+            .as_ref()
+            .ok_or(Error::DeviceCommunication("Device not connected".to_string()))
     }
 
     /// Send a HID report to the keyboard synchronously (blocking).
@@ -465,31 +477,8 @@ impl GenericKeyboard {
             .await
     }
 
-    // Packet I/O on the collection this keyboard already owns, for the `[EXPERIMENTAL]` on-board profile
-    // read in [`apex_legacy_onboard`](apex_legacy_onboard). The handle is the one the device manager
-    // opened and it stays open for the whole read - `usbhid` polls a collection's interrupt endpoint
-    // only while a descriptor on that node is open.
-
-    /// The open handle of this keyboard's collection, shared by every transfer on it.
-    ///
-    /// # Errors
-    ///
-    /// Returns the same "Device not connected" error every send and receive on a handle-less keyboard
-    /// reports.
-    pub(crate) fn connected_device(&self) -> Result<&Arc<Mutex<HidDevice>>> {
-        self.device
-            .as_ref()
-            .ok_or(Error::DeviceCommunication("Device not connected".to_string()))
-    }
-
     /// Send one output report on this keyboard's collection: `data[0]` is the report number
     /// (`SET_REPORT wValue 0x0200`).
-    ///
-    /// This is deliberately not [`GenericKeyboard::send_report`]: that path pads a 64-byte payload
-    /// behind a report-ID byte and runs it through the hid optimizer, which skips a report identical
-    /// to one sent in the last 50 ms. The on-board protocol's frames are exact 65-byte buffers whose
-    /// first byte is the report number, and its opening chain repeats `90 00` and `90 01` 11 ms apart,
-    /// so a deduplicating write would drop frames GG sends.
     #[cfg(feature = "onboard")]
     pub(crate) fn write_profile_packet(&self, data: &[u8]) -> Result<()> {
         let device = self.connected_device()?.lock();

@@ -1,13 +1,20 @@
 //! [EXPERIMENTAL] On-board profile read-back for the legacy/"macho" Apex platform.
 //!
-//! This module is the pure half of the read path: frame builders, the read sequence plan, reply
-//! parsing, payload assembly, struct decode, checksum reporting and JSON. It performs no I/O. The
-//! hardware loop is [`crate::devices::keyboards::apex_legacy_onboard`] (feature `onboard`).
+//! This module is the pure half of the read path: frame builders, reply parsing, payload assembly,
+//! struct decode, checksum reporting and JSON. It performs no I/O. The hardware loop is
+//! [`crate::devices::keyboards::apex_legacy_onboard`] (feature `onboard`).
+//!
+//! It lives in this keyboard namespace, behind the same feature as its consumers, because everything
+//! in it belongs to this one platform: the reply framing, resource-buffer and window sizes, file-id
+//! base, payload sizes, schema words and the payload struct offsets all come from the legacy platform's
+//! own protocol module (`apexui.dll`). Nothing here is generic - the Gen3 platform (`0x1628`) reads its
+//! on-board profile through a completely different transport (see
+//! [`crate::devices::keyboards::apex_pro_tkl_2023_profile`]) and shares none of it.
 //!
 //! Protocol status: reverse-engineered. The file ids, chunk geometry, frame layouts and the payload
 //! struct layout below are reproduced from the Windows engine's device descriptors, and the wire part of
 //! them is visible in one Windows USBPcap capture of the official GG talking to an Apex 7 (firmware
-//! 4.16.8, 2026-10-15, `ssgg-capture-1612-20261015-004400`, decoded from `hub-2.pcap` frame by frame):
+//! 4.16.8, 2026-10-15, capture notes, decoded from the engine capture 2 frame by frame):
 //! 120 pulls of 1024 bytes at file offsets 0..11264, each drained by reads at buffer offsets 0 and 512,
 //! 100 of them on file `0x0201` (profile slot 0) plus one schema probe; 241 payload reads, every one of
 //! them answering with the first payload byte `0x0B`, i.e. schema [`SCHEMA_B`]. On 2026-10-15 an Apex 7
@@ -27,7 +34,7 @@
 //! * opening chain (`HIDINIT`, output report ID `0x00`, 64 data bytes on the wire, `SET_REPORT wValue
 //!   0x0200 wIndex 1 wLength 64`): GG starts the profile read with `90 00`, `90 01`, `f4 00`,
 //!   `6c 00 01` and then `90 00`, `90 01` again, 11 ms apart. The two `0x90` polls are answered on the
-//!   interrupt endpoint with the ASCII firmware version (`34 2e 31 36 2e 38 00…` = `4.16.8`, see
+//!   interrupt endpoint with the ASCII firmware version (`34 2e 31 …` = `4.16.8`, see
 //!   [`parse_firmware_version]), `f4 00` is answered with `00 01 00…`, and `6c 00 01` is not answered at
 //!   all. The meanings of `0xf4` and `0x6c` are unknown. See
 //!   [`crate::devices::hid_reports::ONBOARD_INIT_CHAIN`]. The capture
@@ -125,13 +132,13 @@ pub const INIT_REPLY_LEN: usize = OUTPUT_REPORT_DATA_LEN;
 pub const READ_REPLY_HEADER_LEN: usize = 5;
 /// Framing bytes between the report-ID byte and the payload of a payload-read reply (`GET_REPORT
 /// wValue 0x0300 wIndex 1 wLength 642`): the report-ID byte, and nothing else — the payload starts
-/// directly behind it, so the framing length is 0. In the 2026-10-15 capture every one of the 241
+/// directly behind it, so the framing length is 0. In the capture every one of the 241
 /// replies answers `03` as its first byte: the 2-byte probe of file `0x0201` answers `03 0b 00`
 /// (schema [`SCHEMA_B`]) and the 512-byte read at buffer offset 0 answers
-/// `03 0b 00 43 6f 6e 66 69 67 20 31 …`, the profile name 2 bytes behind the schema word, the offset the
+/// `03 0b 00 …`, the profile name 2 bytes behind the schema word, the offset the
 /// Windows engine decoder documents. An earlier version of this constant said 20: that many bytes sit
 /// between the payload and the report bytes in the capture's **text** export, which prefixes every
-/// report with the USBPcap header, and 20 of 241 replies matched by accident. The 2026-10-15 hardware
+/// report with the USBPcap header, and 20 of 241 replies matched by accident. The hardware
 /// probe accepted 6; `ssgg onboard read --reply-header` changes it.
 pub const READ_REPLY_FRAMING_LEN: usize = 0;
 /// Bytes in a profile schema word, and the size of a schema-only payload read.
@@ -142,7 +149,7 @@ pub const GG_GAP_MS: u64 = 5;
 
 /// Firmware version an opening-chain [`CommandCode::FirmwareVersion`] answer carries: the printable
 /// ASCII run
-/// from the first byte, which the capture shows NUL padded (`34 2e 31 36 2e 38 00…` = `4.16.8`).
+/// from the first byte, which the capture shows NUL padded (`34 2e 31 …` = `4.16.8`).
 /// Returns `None` when the answer starts with non-printable bytes, which is how a keyboard that frames
 /// its answer with a header, or does not answer the poll at all, shows up.
 #[must_use]
@@ -1066,7 +1073,7 @@ mod tests {
 
     #[test]
     fn capture_reply_payload_starts_behind_the_report_id_byte() {
-        // The GET_REPORT 0x0300 answer to `83 00 00 00 00 02` on file 0x0201 in the 2026-10-15 capture:
+        // The GET_REPORT 0x0300 answer to `83 00 00 …` on file 0x0201 in the capture:
         // report ID 03, then the schema word 0x000B, then the ASCII profile name 2 bytes behind it.
         let mut reply = vec![0x03u8, 0x0b, 0x00];
         reply.extend(b"Config 1");
