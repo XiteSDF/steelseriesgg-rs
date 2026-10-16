@@ -37,8 +37,9 @@
 //! (`0x25EE1762`) is not the CRC of the bytes GG assembled. The schema word GG reads at payload
 //! offset 0 is `0x0000` on this device, i.e. the base schema of the platform.
 //!
-//! The transfers run straight on the open hidapi handle of [`super::apex7::Apex7`] (the
-//! `GenericKeyboard` the device manager opened): see [`ProfileHandle`] and the transfers below it. `usbhid` polls a collection's interrupt endpoint only
+//! The transfers run on the handle [`GenericKeyboard`] already owns - the collection the device manager
+//! opened, held open for the whole read (see the packet methods named below). `usbhid` polls a
+//! collection's interrupt endpoint only
 //! while a descriptor on that node is open, so the opening-chain answers and the pull acknowledges can
 //! only arrive on a handle that stays open for the whole read - measured on an Apex 7 in the 2026-10-16
 //! Linux run capture (`linux-read.pcapng`), where a reader that opened the node per report collected
@@ -48,12 +49,9 @@
 //! `[EXPERIMENTAL]`: nothing in this path has been replayed on hardware. This module never writes a
 //! profile.
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use hidapi::HidDevice;
-use parking_lot::Mutex;
-
+use super::GenericKeyboard;
 use crate::devices::hid_reports::{
     CommandCode, HidCommand, HidDeviceType, HidReportBuilder, ONBOARD_FEATURE_REPORT_SIZE, ONBOARD_INIT_CHAIN,
     ONBOARD_OUTPUT_REPORT_SIZE, ONBOARD_REPLY_REPORT_SIZE, OnboardPullCommand, OnboardReadCommand,
@@ -95,93 +93,13 @@ const CHAIN_REPLY_ATTEMPTS: u32 = 3;
 /// Largest input report a profile collection can return (Apex 7 profile collections report 1024).
 const INPUT_REPORT_MAX_LEN: usize = 1024;
 
-/// The profile collection a read runs on: the hidapi handle [`super::apex7::Apex7`] holds open for the
-/// whole read. A report that arrives while no descriptor on the node is open is discarded by `usbhid`
-/// (measured on an Apex 7 in the 2026-10-16 Linux run capture), so the opening-chain answers and the
-/// pull acknowledges only show up on a handle that stays open - which is the case here.
-pub type ProfileHandle = Arc<Mutex<HidDevice>>;
-
-// The transfers the profile protocol needs, straight on [`ProfileHandle`]: the two frame writes, the
-// feature-report reply the payload comes back on, and the interrupt-endpoint reports the opening chain
-// and the pull acknowledges arrive on.
+// The transfers the profile protocol needs are the packet I/O of the keyboard the read runs on:
+// `GenericKeyboard::write_profile_packet`, `send_profile_feature_packet`,
+// `read_profile_feature_packet` and `read_profile_input_packet` (feature `onboard`), on the handle that
+// device already owns - the collection the device manager opened, open for the whole read.
 //
 // `[EXPERIMENTAL]`: on hardware this has gone as far as the read request being accepted (Apex 7,
 // 2026-10-15); no payload reply has been collected from a keyboard by this code.
-
-fn device_label(handle: &ProfileHandle) -> String {
-    let device = handle.lock();
-    device
-        .get_device_info()
-        .map(|info| format!("vid {:04x}:pid {:04x}", info.vendor_id(), info.product_id()))
-        .unwrap_or_else(|_| "open hidapi handle".to_string())
-}
-
-/// Output report: `data[0]` is the report number (`SET_REPORT wValue 0x0200`).
-fn write_output(handle: &ProfileHandle, data: &[u8]) -> Result<()> {
-    let device = handle.lock();
-    let written = device
-        .write(data)
-        .map_err(|e| Error::DeviceCommunication(format!("output report write: {e}")))?;
-    if written != data.len() {
-        return Err(Error::DeviceCommunication(format!(
-            "output report write accepted {written} of {} bytes",
-            data.len()
-        )));
-    }
-    Ok(())
-}
-
-/// Feature report write on report number 0 (`SET_REPORT wValue 0x0300`), padded to the size the
-/// collection declares.
-fn send_feature(handle: &ProfileHandle, data: &[u8]) -> Result<()> {
-    let report = {
-        let mut report = vec![0u8; ONBOARD_FEATURE_REPORT_SIZE];
-        let copy_len = data.len().min(ONBOARD_FEATURE_REPORT_SIZE);
-        report[..copy_len].copy_from_slice(&data[..copy_len]);
-        report
-    };
-    let device = handle.lock();
-    device
-        .send_feature_report(&report)
-        .map_err(|e| Error::DeviceCommunication(format!("feature report write: {e}")))?;
-    Ok(())
-}
-
-/// Feature-report reply (`GET_REPORT wValue 0x0300`): `report_id` seeds byte 0 and `len` is the size
-/// the collection declares, forwarded to the device as `wLength`.
-fn read_feature(handle: &ProfileHandle, report_id: u8, len: usize) -> Result<Vec<u8>> {
-    if len < 2 {
-        return Err(Error::DeviceCommunication(format!(
-            "feature report size {len} cannot hold a report ID byte and any data"
-        )));
-    }
-    let mut report = vec![report_id; len];
-    let device = handle.lock();
-    let received = device
-        .get_feature_report(&mut report)
-        .map_err(|e| Error::DeviceCommunication(format!("feature report read: {e}")))?;
-    report.truncate(received.min(len));
-    Ok(report)
-}
-
-/// One interrupt-endpoint input report, waiting up to `timeout_ms`.
-fn read_input(handle: &ProfileHandle, len: usize, timeout_ms: u64) -> Result<Vec<u8>> {
-    let mut report = vec![0u8; len.max(1)];
-    let poll_ms = i32::try_from(timeout_ms).unwrap_or(i32::MAX);
-    let received = {
-        let device = handle.lock();
-        device
-            .read_timeout(&mut report, poll_ms)
-            .map_err(|e| Error::DeviceCommunication(format!("input report read: {e}")))?
-    };
-    if received == 0 {
-        return Err(Error::DeviceCommunication(format!(
-            "no input report within {timeout_ms} ms"
-        )));
-    }
-    report.truncate(received);
-    Ok(report)
-}
 
 /// Reads one profile slot on one collection a keyboard device holds open, which is how
 /// [`super::apex7::Apex7`] reads its own on-board profiles.
@@ -190,21 +108,32 @@ fn read_input(handle: &ProfileHandle, len: usize, timeout_ms: u64) -> Result<Vec
 ///
 /// Returns an error when the collection rejects a frame, never answers a payload read, or the read plan
 /// cannot be validated.
-pub async fn read_profile(handle: ProfileHandle, config: &ReadConfig, strict: bool) -> Result<ProfileImage> {
+pub async fn read_profile(keyboard: &GenericKeyboard, config: &ReadConfig, strict: bool) -> Result<ProfileImage> {
     let config = *config;
-    tokio::task::spawn_blocking(move || read_image(&handle, &config, strict, None))
-        .await
-        .map_err(|e| Error::Other(format!("onboard read task failed: {e}")))?
+    // The read plan blocks (frame pacing, reply polls) on a worker thread. `spawn_blocking` asks for a
+    // `'static` closure; the keyboard outlives the join we await below, and the closure finishes before
+    // `read_profile` returns, so borrowing it for the closure is sound.
+    let keyboard: &'static GenericKeyboard =
+        unsafe { std::mem::transmute::<&GenericKeyboard, &'static GenericKeyboard>(keyboard) };
+    let (tx, rx) = std::sync::mpsc::channel();
+    tokio::task::spawn_blocking(move || {
+        let result = read_image(keyboard, &config, strict, None);
+        let _ = tx.send(result);
+    })
+    .await
+    .map_err(|e| Error::Other(format!("onboard read task failed: {e}")))?;
+    rx.recv()
+        .map_err(|e| Error::Other(format!("onboard read worker sent no result: {e}")))?
 }
 
 /// Runs one read plan (the opening chain, then pulls with their payload reads) on one collection.
 fn read_image(
-    handle: &ProfileHandle,
+    keyboard: &GenericKeyboard,
     config: &ReadConfig,
     strict: bool,
     deadline: Option<Duration>,
 ) -> Result<ProfileImage> {
-    let path = device_label(handle);
+    let path = keyboard.packet_label();
     config.validate()?;
     let fs_id = config.fs_id();
     let reads_per_pull = config.resource_len / config.read_len;
@@ -212,7 +141,7 @@ fn read_image(
     let overall = deadline.map(|d| Instant::now() + d);
 
     let firmware = if config.send_init_chain {
-        send_init_chain(handle, config.gap_ms)
+        send_init_chain(keyboard, config.gap_ms)
     } else {
         None
     };
@@ -225,13 +154,13 @@ fn read_image(
             file_offset,
             size: u16::try_from(config.resource_len).unwrap_or(OnboardPullCommand::MAX_SIZE),
         };
-        write_output_command(handle, pull).map_err(|e| {
+        write_output_command(keyboard, pull).map_err(|e| {
             Error::DeviceCommunication(format!(
                 "onboard pull frame for chunk {chunk} (file {fs_id:04X} offset {file_offset}) on \
                  {path} rejected: {e}"
             ))
         })?;
-        let ack = read_pull_ack(handle);
+        let ack = read_pull_ack(keyboard);
         let (ack_report_id, ack_hex) = match ack.as_deref() {
             Some(report) if !report.is_empty() => (report[0], hex_of(report)),
             _ => {
@@ -247,13 +176,13 @@ fn read_image(
                 buffer_offset,
                 size: read_len,
             };
-            write_feature_command(handle, command).map_err(|e| {
+            write_feature_command(keyboard, command).map_err(|e| {
                 Error::DeviceCommunication(format!(
                     "onboard read request for chunk {chunk} buffer offset {buffer_offset} on \
                      {path} rejected: {e}"
                 ))
             })?;
-            let reply = read_reply_report(handle, config.read_len, overall)?;
+            let reply = read_reply_report(keyboard, config.read_len, overall)?;
             let parsed = parse_read_reply_at(&reply, read_len, config.reply_header)?;
             if let Some(msg) = reply_mismatch(&parsed, buffer_offset, read_len) {
                 tracing::debug!("onboard read: {msg}");
@@ -294,16 +223,16 @@ fn read_image(
 /// byte, so a frame that expects one is polled briefly; `6c 00 01` is not answered at all in the
 /// capture. A collection that rejects a frame is logged and the chain continues: the chain is GG's,
 /// and we have not measured on hardware which of its frames a keyboard requires.
-fn send_init_chain(handle: &ProfileHandle, gap_ms: u64) -> Option<String> {
-    let path = device_label(handle);
+fn send_init_chain(keyboard: &GenericKeyboard, gap_ms: u64) -> Option<String> {
+    let path = keyboard.packet_label();
     let mut version: Option<String> = None;
     for frame in ONBOARD_INIT_CHAIN {
-        if let Err(e) = write_output_command(handle, frame) {
+        if let Err(e) = write_output_command(keyboard, frame) {
             tracing::debug!("onboard opening-chain frame {} on {path} rejected: {e}", frame.command);
             continue;
         }
         if frame.expects_reply {
-            if let Some(report) = read_interrupt_report(handle, INIT_REPLY_LEN, CHAIN_REPLY_ATTEMPTS) {
+            if let Some(report) = read_interrupt_report(keyboard, INIT_REPLY_LEN, CHAIN_REPLY_ATTEMPTS) {
                 tracing::debug!(
                     "onboard opening-chain answer on {path}: {}",
                     hex_of(&report[..report.len().min(8)])
@@ -322,8 +251,8 @@ fn send_init_chain(handle: &ProfileHandle, gap_ms: u64) -> Option<String> {
 
 /// Collects one payload reply: the feature-report reply the capture shows, then the interrupt
 /// endpoint. Returns `[report ID][payload…]`, the shape [`parse_read_reply`] consumes.
-fn read_reply_report(handle: &ProfileHandle, payload_len: usize, overall: Option<Instant>) -> Result<Vec<u8>> {
-    let path = device_label(handle);
+fn read_reply_report(keyboard: &GenericKeyboard, payload_len: usize, overall: Option<Instant>) -> Result<Vec<u8>> {
+    let path = keyboard.packet_label();
     let budget = overall
         .map(|d| d.saturating_duration_since(Instant::now()))
         .filter(|d| !d.is_zero())
@@ -333,7 +262,7 @@ fn read_reply_report(handle: &ProfileHandle, payload_len: usize, overall: Option
     let mut last_error: Option<Error> = None;
 
     while Instant::now() < stop {
-        match read_feature(handle, READ_REPLY_ID, READ_REPLY_WIRE_LEN) {
+        match keyboard.read_profile_feature_packet(READ_REPLY_ID, READ_REPLY_WIRE_LEN) {
             Ok(report) if reply_carries_payload(&report, payload_len) => return Ok(report),
             Ok(report) => {
                 empty_answers = empty_answers.saturating_add(1);
@@ -355,7 +284,7 @@ fn read_reply_report(handle: &ProfileHandle, payload_len: usize, overall: Option
     let mut input_attempts = 0u32;
     while input_attempts < REPLY_INPUT_ATTEMPTS {
         input_attempts = input_attempts.saturating_add(1);
-        match read_input(handle, INPUT_REPORT_MAX_LEN, REPLY_POLL_MS as u64) {
+        match keyboard.read_profile_input_packet(INPUT_REPORT_MAX_LEN, REPLY_POLL_MS as u64) {
             Ok(report) if reply_carries_payload(&report, payload_len) => {
                 tracing::debug!(
                     "onboard read: reply arrived on {path} as a {}-byte input report",
@@ -388,15 +317,15 @@ fn read_reply_report(handle: &ProfileHandle, payload_len: usize, overall: Option
 }
 
 /// Reads the pull answer (the capture shows a 64-byte report on report `0x85` after each pull).
-fn read_pull_ack(handle: &ProfileHandle) -> Option<Vec<u8>> {
-    read_interrupt_report(handle, PULL_ACK_LEN, PULL_ACK_ATTEMPTS)
+fn read_pull_ack(keyboard: &GenericKeyboard) -> Option<Vec<u8>> {
+    read_interrupt_report(keyboard, PULL_ACK_LEN, PULL_ACK_ATTEMPTS)
 }
 
 /// Polls the node for one non-empty report of at most `len` bytes.
-fn read_interrupt_report(handle: &ProfileHandle, len: usize, attempts: u32) -> Option<Vec<u8>> {
-    let path = device_label(handle);
+fn read_interrupt_report(keyboard: &GenericKeyboard, len: usize, attempts: u32) -> Option<Vec<u8>> {
+    let path = keyboard.packet_label();
     for _ in 0..attempts {
-        match read_input(handle, len, REPLY_POLL_MS as u64) {
+        match keyboard.read_profile_input_packet(len, REPLY_POLL_MS as u64) {
             Ok(report) if !report.is_empty() => return Some(report),
             Ok(_) => {}
             Err(e) => {
@@ -425,7 +354,7 @@ fn is_ack(report: &[u8]) -> bool {
 /// 0 plus the 64-byte data stage, i.e. `SET_REPORT wValue 0x0200 wLength 64` as the reference capture
 /// shows (the kernel takes the report number out of the data stage, so the buffer is one byte longer
 /// than the wire).
-fn write_output_command<C: HidCommand>(handle: &ProfileHandle, command: C) -> Result<()> {
+fn write_output_command<C: HidCommand>(keyboard: &GenericKeyboard, command: C) -> Result<()> {
     let mut buffer = [0u8; ONBOARD_OUTPUT_REPORT_SIZE];
     let len = HidReportBuilder::new(HidDeviceType::Keyboard).build_report(command, &mut buffer)?;
     if len != buffer.len() {
@@ -434,12 +363,12 @@ fn write_output_command<C: HidCommand>(handle: &ProfileHandle, command: C) -> Re
             buffer.len()
         )));
     }
-    write_output(handle, &buffer)
+    keyboard.write_profile_packet(&buffer)
 }
 
 /// Serializes a command through [`HidReportBuilder`] and sends it as a feature report on report number
 /// 0 (`SET_REPORT wValue 0x0300 wLength 642` in the capture).
-fn write_feature_command<C: HidCommand>(handle: &ProfileHandle, command: C) -> Result<()> {
+fn write_feature_command<C: HidCommand>(keyboard: &GenericKeyboard, command: C) -> Result<()> {
     let mut buffer = [0u8; ONBOARD_FEATURE_REPORT_SIZE];
     let len = HidReportBuilder::new(HidDeviceType::Keyboard).build_report(command, &mut buffer)?;
     if len != buffer.len() {
@@ -448,7 +377,7 @@ fn write_feature_command<C: HidCommand>(handle: &ProfileHandle, command: C) -> R
             buffer.len()
         )));
     }
-    send_feature(handle, &buffer)
+    keyboard.send_profile_feature_packet(&buffer)
 }
 
 #[cfg(test)]

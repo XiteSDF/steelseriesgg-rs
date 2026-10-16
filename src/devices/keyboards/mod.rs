@@ -482,14 +482,102 @@ impl GenericKeyboard {
             .await
     }
 
-    /// Borrow the open hidapi handle of this keyboard.
+    // Packet I/O on the collection this keyboard already owns, for the `[EXPERIMENTAL]` on-board profile
+    // read in [`apex_legacy_onboard`](apex_legacy_onboard). The handle is the one the device manager
+    // opened and it stays open for the whole read - `usbhid` polls a collection's interrupt endpoint
+    // only while a descriptor on that node is open.
+
+    /// The open handle of this keyboard's collection.
     ///
-    /// For a transfer that has to run on the collection the device manager opened, and on a handle that
-    /// stays open while the device answers - `usbhid` polls a collection's interrupt endpoint only while
-    /// a descriptor on that node is open.
-    #[must_use]
-    pub fn hid_handle(&self) -> Option<&Arc<Mutex<HidDevice>>> {
-        self.device.as_ref()
+    /// # Errors
+    ///
+    /// Returns an error when the keyboard was created without a handle.
+    #[cfg(feature = "onboard")]
+    pub(crate) fn profile_device(&self) -> Result<&Arc<Mutex<HidDevice>>> {
+        self.device
+            .as_ref()
+            .ok_or_else(|| Error::DeviceCommunication("keyboard has no open HID handle".to_string()))
+    }
+
+    /// Identity of this keyboard's collection, for logs and read errors.
+    #[cfg(feature = "onboard")]
+    pub(crate) fn packet_label(&self) -> String {
+        let label = format!("vid {:04x}:pid {:04x}", self.info.vendor_id, self.info.product_id);
+        match &self.device {
+            Some(device) => device
+                .lock()
+                .get_device_info()
+                .map(|info| format!("vid {:04x}:pid {:04x}", info.vendor_id(), info.product_id()))
+                .unwrap_or(label),
+            None => label,
+        }
+    }
+
+    /// Send one output report on this keyboard's collection: `data[0]` is the report number
+    /// (`SET_REPORT wValue 0x0200`).
+    #[cfg(feature = "onboard")]
+    pub(crate) fn write_profile_packet(&self, data: &[u8]) -> Result<()> {
+        let device = self.profile_device()?.lock();
+        let written = device
+            .write(data)
+            .map_err(|e| Error::DeviceCommunication(format!("output report write: {e}")))?;
+        if written != data.len() {
+            return Err(Error::DeviceCommunication(format!(
+                "output report write accepted {written} of {} bytes",
+                data.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Send one feature report on this keyboard's collection: `data[0]` is the report number
+    /// (`SET_REPORT wValue 0x0300`), and `data` is already the full report buffer.
+    #[cfg(feature = "onboard")]
+    pub(crate) fn send_profile_feature_packet(&self, data: &[u8]) -> Result<()> {
+        let device = self.profile_device()?.lock();
+        device
+            .send_feature_report(data)
+            .map_err(|e| Error::DeviceCommunication(format!("feature report write: {e}")))?;
+        Ok(())
+    }
+
+    /// Read one feature report from this keyboard's collection (`GET_REPORT wValue 0x0300`):
+    /// `report_id` seeds byte 0, `len` is the size the collection declares and goes out as `wLength`.
+    #[cfg(feature = "onboard")]
+    pub(crate) fn read_profile_feature_packet(&self, report_id: u8, len: usize) -> Result<Vec<u8>> {
+        if len < 2 {
+            return Err(Error::DeviceCommunication(format!(
+                "feature report size {len} cannot hold a report ID byte and any data"
+            )));
+        }
+        let mut report = vec![report_id; len];
+        let device = self.profile_device()?.lock();
+        let received = device
+            .get_feature_report(&mut report)
+            .map_err(|e| Error::DeviceCommunication(format!("feature report read: {e}")))?;
+        report.truncate(received.min(len));
+        Ok(report)
+    }
+
+    /// Read one interrupt-endpoint input report from this keyboard's collection, waiting up to
+    /// `timeout_ms`.
+    #[cfg(feature = "onboard")]
+    pub(crate) fn read_profile_input_packet(&self, len: usize, timeout_ms: u64) -> Result<Vec<u8>> {
+        let mut report = vec![0u8; len.max(1)];
+        let poll_ms = i32::try_from(timeout_ms).unwrap_or(i32::MAX);
+        let received = {
+            let device = self.profile_device()?.lock();
+            device
+                .read_timeout(&mut report, poll_ms)
+                .map_err(|e| Error::DeviceCommunication(format!("input report read: {e}")))?
+        };
+        if received == 0 {
+            return Err(Error::DeviceCommunication(format!(
+                "no input report within {timeout_ms} ms"
+            )));
+        }
+        report.truncate(received);
+        Ok(report)
     }
 
     /// Update the cached actuation point value.
