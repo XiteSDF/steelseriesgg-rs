@@ -9,8 +9,8 @@ and every report buffer: `OnboardFirmwareVersionCommand`, `OnboardPullCommand`,
 `src/devices/keyboards/apex7.rs` (`Apex7`: the keyboard device of the legacy Apex family, which wraps
 `GenericKeyboard`) - the packet I/O is `GenericKeyboard`'s own profile transfers on the handle it owns
 (`write_profile_packet`, `read_profile_feature_packet`, `read_profile_input_packet`, …), `ssgg onboard` (`src/cli.rs`, `src/main.rs`). Discovery builds `Apex7` for the family
-with or without the `onboard` feature (the device class is part of the device tree); only the read path
-(transport, read plan, `Keyboard::read_onboard_profile`) is behind that feature, the report builders are not.
+(the device class is part of the device tree); the read path
+(transport, read plan, `Keyboard::read_onboard_profile`) is core code, labelled `[EXPERIMENTAL]`, as are the report builders.
 
 The framing below is decoded from the capture's URBs (`hub-2.pcap`, parsed packet by packet: the 8-byte
 setup block of every control transfer plus its data stage), not from `reports.csv`. The CSV holds only

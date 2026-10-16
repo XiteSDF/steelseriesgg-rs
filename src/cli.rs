@@ -1,6 +1,5 @@
 use clap::{Parser, Subcommand};
 
-#[cfg(feature = "onboard")]
 use std::path::PathBuf;
 
 use steelseries_gg::devices::KeyId;
@@ -71,7 +70,6 @@ pub(crate) enum Commands {
     },
 
     /// Read the on-board profile of a legacy Apex keyboard (experimental, reads only)
-    #[cfg(feature = "onboard")]
     Onboard {
         #[command(subcommand)]
         action: OnboardAction,
@@ -199,7 +197,6 @@ pub(crate) enum Commands {
 ///
 /// `plan` and `decode` work on the wire format and on saved files only; they never touch a device.
 /// `read` talks to a keyboard and needs `--yes`.
-#[cfg(feature = "onboard")]
 #[derive(Subcommand)]
 pub(crate) enum OnboardAction {
     /// Read one profile from a legacy Apex keyboard. Requires --yes.
@@ -212,7 +209,6 @@ pub(crate) enum OnboardAction {
 /// Wire tunables of one on-board profile read. Defaults are the values measured in the reference
 /// capture: GG's six-frame opening chain 11 ms apart, a 1024-byte resource buffer, and 512-byte
 /// reads out of it.
-#[cfg(feature = "onboard")]
 #[derive(clap::Args)]
 pub(crate) struct OnboardReadArgs {
     /// On-board profile slot (0-4). Everything else about the read is fixed geometry: 12 pulls of 1024
@@ -246,7 +242,6 @@ pub(crate) struct OnboardReadArgs {
     pub(crate) verify: bool,
 }
 
-#[cfg(feature = "onboard")]
 #[derive(clap::Args)]
 pub(crate) struct OnboardDecodeArgs {
     /// Profile image file (assembled by `ssgg onboard read --out`)

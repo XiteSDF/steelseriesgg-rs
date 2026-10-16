@@ -44,7 +44,6 @@ jobs:
         features:
           - ""
           - "--features sonar"
-          - "--features onboard"
           - "--features audio"
     steps:
       - uses: actions/checkout@v7
@@ -80,7 +79,6 @@ jobs:
         features:
           - ""
           - "--features sonar"
-          - "--features onboard"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -108,7 +106,6 @@ jobs:
         features:
           - ""
           - "--features sonar"
-          - "--features onboard"
           - "--features audio"
     steps:
       - uses: actions/checkout@v7

@@ -47,10 +47,8 @@ use crate::cli::normalize_volume;
 #[cfg(feature = "sonar")]
 use crate::cli::{SonarAction, StreamerAction, parse_sonar_channel};
 
-#[cfg(feature = "onboard")]
 use crate::cli::OnboardAction;
 
-#[cfg(feature = "onboard")]
 use steelseries_gg::devices::keyboards::apex_legacy_profile::decode;
 
 #[cfg(feature = "audio")]
@@ -151,7 +149,6 @@ async fn main() -> Result<()> {
             cmd_pollrate(action).await?;
         }
 
-        #[cfg(feature = "onboard")]
         Commands::Onboard { action } => {
             match &action {
                 // Only the two device-reading subcommands enumerate hardware.
@@ -812,7 +809,6 @@ async fn cmd_profile(action: ProfileAction) -> Result<()> {
 ///
 /// Reads only. The protocol is reverse-engineered from the GG USBPcap capture written up in
 /// docs/development/apex-7-onboard-profile-read.md and has never been replayed from this crate.
-#[cfg(feature = "onboard")]
 async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAction) -> Result<()> {
     use steelseries_gg::devices::keyboards::apex_legacy_profile::{hex_dump, profile_json, schema_of, to_json};
 
@@ -910,7 +906,6 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
 /// Device paths to try for a profile read: the control collection discovery ranked for this
 /// vendor/product pair (or the `--device` node) first, then the interface-1 collection of the same
 /// device, where the reference capture shows every profile transfer running.
-#[cfg(feature = "onboard")]
 /// The Apex 7 as a keyboard device, when the target carries the `[EXPERIMENTAL]` on-board profile
 /// protocol. The read then runs on the handle the device manager opened, which is what `usbhid` needs
 /// for the firmware-poll answer and the pacing packet after every pull: it polls an interrupt endpoint only
@@ -918,7 +913,6 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
 ///
 /// `None` when no matching keyboard is openable, and when the target is not on the platform the
 /// protocol was reverse-engineered from (`Apex7::onboard_family`).
-#[cfg(feature = "onboard")]
 async fn onboard_keyboard(manager: &mut DeviceManager, device: &Option<String>) -> Option<Box<dyn Keyboard>> {
     use steelseries_gg::STEELSERIES_VENDOR_ID;
     use steelseries_gg::devices::keyboards::apex7::onboard_family;
@@ -940,13 +934,11 @@ async fn onboard_keyboard(manager: &mut DeviceManager, device: &Option<String>) 
 }
 
 /// Where a device-driven read ran, in the same reporting form the path-based read prints.
-#[cfg(feature = "onboard")]
 fn onboard_device_label(keyboard: &dyn Keyboard) -> String {
     format!("{} ({})", keyboard.info().name, keyboard.info().path)
 }
 
 /// `vendor:pid` as used by `ssgg --device`.
-#[cfg(feature = "onboard")]
 fn parse_vid_pid(spec: &str) -> Option<(u16, u16)> {
     let (vendor, product) = spec.split_once(':')?;
     Some((
@@ -955,7 +947,6 @@ fn parse_vid_pid(spec: &str) -> Option<(u16, u16)> {
     ))
 }
 
-#[cfg(feature = "onboard")]
 fn require_yes(what: &str) -> Result<()> {
     println!("Refusing to {what} without --yes:");
     println!("  this is experimental, reverse-engineered protocol code that has never been replayed on");
@@ -964,7 +955,6 @@ fn require_yes(what: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "onboard")]
 fn print_onboard_banner() {
     println!("[EXPERIMENTAL] legacy Apex on-board profile read");
     println!("  reverse-engineered from one GG USBPcap capture, never replayed from this crate; reads only.");
@@ -972,7 +962,6 @@ fn print_onboard_banner() {
     println!();
 }
 
-#[cfg(feature = "onboard")]
 fn print_onboard_image(image: &steelseries_gg::devices::keyboards::apex_legacy_profile::ProfileImage, path: &str) {
     use steelseries_gg::devices::keyboards::apex_legacy_profile::decode;
 
@@ -996,7 +985,6 @@ fn print_onboard_image(image: &steelseries_gg::devices::keyboards::apex_legacy_p
     println!();
 }
 
-#[cfg(feature = "onboard")]
 fn print_onboard_profile(profile: &steelseries_gg::devices::keyboards::apex_legacy_profile::OnboardProfile) {
     use steelseries_gg::devices::keyboards::apex_legacy_profile::Color;
 
