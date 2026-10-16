@@ -136,7 +136,7 @@ fn read_image(
     let path = keyboard.packet_label();
     config.validate()?;
     let fs_id = config.fs_id();
-    let reads_per_pull = config.resource_len / config.read_len;
+    let reads_per_pull = config.reads_per_pull();
     let read_len = u16::try_from(config.read_len).unwrap_or(u16::MAX);
     let overall = deadline.map(|d| Instant::now() + d);
 
