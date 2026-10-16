@@ -195,8 +195,8 @@ mod tests {
             match keyboard.inner.read_profile_feature_packet(0x00, 642) {
                 Ok(_) => panic!("a device without a handle must not answer a profile packet"),
                 Err(error) => assert!(
-                    error.to_string().contains("no open HID handle"),
-                    "the error names the missing handle: {error}"
+                    error.to_string().contains("Device not connected"),
+                    "the error is the shared handle-less message: {error}"
                 ),
             }
         }
