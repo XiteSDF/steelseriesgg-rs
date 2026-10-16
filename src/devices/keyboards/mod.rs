@@ -496,22 +496,14 @@ impl GenericKeyboard {
             .ok_or_else(|| Error::DeviceCommunication("keyboard has no open HID handle".to_string()))
     }
 
-    /// Identity of this keyboard's collection, for logs and read errors.
-    #[cfg(feature = "onboard")]
-    pub(crate) fn packet_label(&self) -> String {
-        let label = format!("vid {:04x}:pid {:04x}", self.info.vendor_id, self.info.product_id);
-        match &self.device {
-            Some(device) => device
-                .lock()
-                .get_device_info()
-                .map(|info| format!("vid {:04x}:pid {:04x}", info.vendor_id(), info.product_id()))
-                .unwrap_or(label),
-            None => label,
-        }
-    }
-
     /// Send one output report on this keyboard's collection: `data[0]` is the report number
     /// (`SET_REPORT wValue 0x0200`).
+    ///
+    /// This is deliberately not [`GenericKeyboard::send_report`]: that path pads a 64-byte payload
+    /// behind a report-ID byte and runs it through the hid optimizer, which skips a report identical
+    /// to one sent in the last 50 ms. The on-board protocol's frames are exact 65-byte buffers whose
+    /// first byte is the report number, and its opening chain repeats `90 00` and `90 01` 11 ms apart,
+    /// so a deduplicating write would drop frames GG sends.
     #[cfg(feature = "onboard")]
     pub(crate) fn write_profile_packet(&self, data: &[u8]) -> Result<()> {
         let device = self.profile_device()?.lock();
@@ -524,17 +516,6 @@ impl GenericKeyboard {
                 data.len()
             )));
         }
-        Ok(())
-    }
-
-    /// Send one feature report on this keyboard's collection: `data[0]` is the report number
-    /// (`SET_REPORT wValue 0x0300`), and `data` is already the full report buffer.
-    #[cfg(feature = "onboard")]
-    pub(crate) fn send_profile_feature_packet(&self, data: &[u8]) -> Result<()> {
-        let device = self.profile_device()?.lock();
-        device
-            .send_feature_report(data)
-            .map_err(|e| Error::DeviceCommunication(format!("feature report write: {e}")))?;
         Ok(())
     }
 

@@ -95,9 +95,11 @@ const CHAIN_REPLY_ATTEMPTS: u32 = 3;
 const INPUT_REPORT_MAX_LEN: usize = 1024;
 
 // The transfers the profile protocol needs are the packet I/O of the keyboard the read runs on:
-// `GenericKeyboard::write_profile_packet`, `send_profile_feature_packet`,
-// `read_profile_feature_packet` and `read_profile_input_packet` (feature `onboard`), on the handle that
-// device already owns - the collection the device manager opened, open for the whole read.
+// `GenericKeyboard::write_profile_packet` for output frames (not `send_report`, whose hid optimizer
+// dedup would drop the chain's repeated frames), the keyboard's existing `send_feature` for the
+// feature-report read request, and `read_profile_feature_packet` / `read_profile_input_packet` for the
+// two reply shapes, all on the handle that device already owns - the collection the device manager
+// opened, open for the whole read.
 //
 // `[EXPERIMENTAL]`: on hardware this has gone as far as the read request being accepted (Apex 7,
 // 2026-10-15); no payload reply has been collected from a keyboard by this code.
@@ -134,7 +136,7 @@ fn read_image(
     strict: bool,
     deadline: Option<Duration>,
 ) -> Result<ProfileImage> {
-    let path = keyboard.packet_label();
+    let path = collection_label(keyboard);
     validate_profile(profile)?;
     let fs_id = profile_file_id(profile);
     let read_len = READ_LEN as u16;
@@ -222,7 +224,7 @@ fn read_image(
 /// capture. A collection that rejects a frame is logged and the chain continues: the chain is GG's,
 /// and we have not measured on hardware which of its frames a keyboard requires.
 fn send_init_chain(keyboard: &GenericKeyboard, gap_ms: u64) -> Option<String> {
-    let path = keyboard.packet_label();
+    let path = collection_label(keyboard);
     let mut version: Option<String> = None;
     for frame in ONBOARD_INIT_CHAIN {
         if let Err(e) = write_output_command(keyboard, frame) {
@@ -250,7 +252,7 @@ fn send_init_chain(keyboard: &GenericKeyboard, gap_ms: u64) -> Option<String> {
 /// Collects one payload reply: the feature-report reply the capture shows, then the interrupt
 /// endpoint. Returns `[report ID][payload…]`, the shape [`parse_read_reply`] consumes.
 fn read_reply_report(keyboard: &GenericKeyboard, payload_len: usize, overall: Option<Instant>) -> Result<Vec<u8>> {
-    let path = keyboard.packet_label();
+    let path = collection_label(keyboard);
     let budget = overall
         .map(|d| d.saturating_duration_since(Instant::now()))
         .filter(|d| !d.is_zero())
@@ -319,9 +321,18 @@ fn read_pull_ack(keyboard: &GenericKeyboard) -> Option<Vec<u8>> {
     read_interrupt_report(keyboard, PULL_ACK_LEN, PULL_ACK_ATTEMPTS)
 }
 
+/// Identity of the collection the read runs on, for logs and read errors.
+fn collection_label(keyboard: &GenericKeyboard) -> String {
+    let info = &keyboard.info;
+    format!(
+        "vid {:04x}:pid {:04x} interface {} ({})",
+        info.vendor_id, info.product_id, info.interface_number, info.path
+    )
+}
+
 /// Polls the node for one non-empty report of at most `len` bytes.
 fn read_interrupt_report(keyboard: &GenericKeyboard, len: usize, attempts: u32) -> Option<Vec<u8>> {
-    let path = keyboard.packet_label();
+    let path = collection_label(keyboard);
     for _ in 0..attempts {
         match keyboard.read_profile_input_packet(len, REPLY_POLL_MS as u64) {
             Ok(report) if !report.is_empty() => return Some(report),
@@ -375,7 +386,7 @@ fn write_feature_command<C: HidCommand>(keyboard: &GenericKeyboard, command: C) 
             buffer.len()
         )));
     }
-    keyboard.send_profile_feature_packet(&buffer)
+    keyboard.send_feature(&buffer, ONBOARD_FEATURE_REPORT_SIZE)
 }
 
 #[cfg(test)]
