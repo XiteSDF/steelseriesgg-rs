@@ -8,8 +8,9 @@ and every report buffer: `OnboardInitCommand` and `ONBOARD_INIT_CHAIN`, `Onboard
 `src/devices/keyboards/apex_legacy_onboard.rs` (transfers, plus the `OnboardTransport` the device path
 uses), `src/devices/keyboards/apex7.rs` (`Apex7`: the keyboard device of the legacy Apex family, which
 wraps `GenericKeyboard` — its `HidReportBuilder` and open `HidDevice` — and runs the read on that
-handle), `ssgg onboard` (`src/cli.rs`, `src/main.rs`); the read path is behind the `onboard` feature,
-the report builders are not.
+handle), `ssgg onboard` (`src/cli.rs`, `src/main.rs`). Discovery builds `Apex7` for the family
+with or without the `onboard` feature (the device class is part of the device tree); only the read path
+(transport, read plan, `Keyboard::read_onboard_profile`) is behind that feature, the report builders are not.
 
 The framing below is decoded from the capture's URBs (engine capture 2, parsed packet by packet: the 8-byte
 setup block of every control transfer plus its data stage), not from the decoded response listing. The CSV holds only

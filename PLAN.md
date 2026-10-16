@@ -35,9 +35,9 @@ Protocol facts for the Apex Pro TKL 2023 are in `AGENTS.md` ("Protocol research 
 Code is in place (2026-10-17, `onboard-configs-dev`): `Apex7` in `src/devices/keyboards/apex7.rs` wraps
 `GenericKeyboard` (its `HidReportBuilder` and the open `HidDevice`) and runs the read on its own handle
 through `HandleTransport`; `Keyboard::read_onboard_profile` is the device API,
-`discovery::open_keyboard` returns `Apex7` for `0x1612`, `0x1614`, `0x1616`, `0x1618`. `ssgg onboard read`
-uses the device when the target is on that family, and the candidate collections when `--device
-/dev/hidrawN` names a node. Nothing has been replayed on hardware.
+`discovery::open_keyboard` returns `Apex7` for `0x1612`, `0x1614`, `0x1616`, `0x1618` - **with or without
+the `onboard` feature** (2026-10-17: the device class is part of the device tree, only the read path is
+feature-gated). `ssgg onboard read` runs on that device. Nothing has been replayed on hardware.
 
 1. **[HW] Collection check first:** `ls -l the device sysfs input nodes`. The 2026-10-15
    run found the interface-1 collection (`the hidraw node`) had no `input*`, so the device manager opened

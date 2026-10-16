@@ -19,13 +19,17 @@ use std::ops::{Deref, DerefMut};
 
 use async_trait::async_trait;
 
+#[cfg(feature = "onboard")]
 use super::apex_legacy_onboard::{self, HandleTransport};
 use super::{GenericKeyboard, Keyboard};
 use crate::devices::key_mapping::{KeyId, KeyMapping};
 use crate::devices::product_ids;
 use crate::devices::zone_mapping::{ZoneEffect, ZoneMapping};
 use crate::devices::{Device, DeviceType};
-use crate::error::{Error, Result};
+#[cfg(feature = "onboard")]
+use crate::error::Error;
+use crate::error::Result;
+#[cfg(feature = "onboard")]
 use crate::onboard_profile::{ProfileImage, ReadConfig};
 use crate::rgb::{Color, PerKeyEffect};
 
@@ -42,10 +46,14 @@ pub fn onboard_family(product_id: u16) -> bool {
     )
 }
 
-/// Apex 7 keyboard device: standard lighting control through [`GenericKeyboard`], plus the
-/// `[EXPERIMENTAL]` on-board profile read on its own handle.
+/// Apex 7 keyboard device: standard lighting control through [`GenericKeyboard`], plus - with the
+/// `onboard` feature - the `[EXPERIMENTAL]` on-board profile read on its own handle.
+///
+/// Discovery builds this device for every [`onboard_family`] product ID whether or not the crate was
+/// built with `onboard`: the device class is part of the device tree, only the read is feature-gated.
 pub struct Apex7 {
     inner: GenericKeyboard,
+    #[cfg(feature = "onboard")]
     onboard: ReadConfig,
 }
 
@@ -57,23 +65,27 @@ impl Apex7 {
     pub fn new(keyboard: GenericKeyboard) -> Self {
         Self {
             inner: keyboard,
+            #[cfg(feature = "onboard")]
             onboard: ReadConfig::default(),
         }
     }
 
     /// Whether this device's product ID is on the platform the read was reverse-engineered from.
+    #[cfg(feature = "onboard")]
     #[must_use]
     pub fn supports_onboard(&self) -> bool {
         onboard_family(self.inner.info().product_id)
     }
 
     /// Read plan this device uses when the caller does not pass one.
+    #[cfg(feature = "onboard")]
     #[must_use]
     pub fn onboard_config(&self) -> &ReadConfig {
         &self.onboard
     }
 
     /// Replace the read plan (slot, geometry, pacing, reply framing).
+    #[cfg(feature = "onboard")]
     pub fn set_onboard_config(&mut self, config: ReadConfig) {
         self.onboard = config;
     }
@@ -83,6 +95,7 @@ impl Apex7 {
     /// # Errors
     ///
     /// Returns an error when the device was created without a hidapi handle.
+    #[cfg(feature = "onboard")]
     fn transport(&self) -> Result<HandleTransport> {
         let handle = self
             .inner
@@ -97,6 +110,7 @@ impl Apex7 {
     ///
     /// Returns an error when the plan is invalid, the collection rejects a frame, or it never answers
     /// a payload read.
+    #[cfg(feature = "onboard")]
     pub async fn read_profile(&self, config: &ReadConfig) -> Result<ProfileImage> {
         apex_legacy_onboard::read_profile(self.transport()?, config, false).await
     }
@@ -106,6 +120,7 @@ impl Apex7 {
     /// # Errors
     ///
     /// As [`Apex7::read_profile`].
+    #[cfg(feature = "onboard")]
     pub async fn read_profile_slot(&self) -> Result<ProfileImage> {
         self.read_profile(&self.onboard.clone()).await
     }
@@ -159,10 +174,12 @@ impl Device for Apex7 {
 
 // Delegate Keyboard trait; the on-board profile methods are this device's own.
 crate::impl_keyboard_with_delegation!(Apex7, {
+    #[cfg(feature = "onboard")]
     fn supports_onboard_profile(&self) -> bool {
         self.supports_onboard()
     }
 
+    #[cfg(feature = "onboard")]
     async fn read_onboard_profile(&self, config: &ReadConfig) -> Result<ProfileImage> {
         self.read_profile(config).await
     }
@@ -171,54 +188,70 @@ crate::impl_keyboard_with_delegation!(Apex7, {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::devices::{DeviceInfo, DeviceType};
-
-    fn device_without_handle(product_id: u16) -> Apex7 {
-        let info = DeviceInfo {
-            name: std::borrow::Cow::Borrowed("Test Apex 7"),
-            device_type: DeviceType::Keyboard,
-            vendor_id: crate::STEELSERIES_VENDOR_ID,
-            product_id,
-            interface_number: 1,
-            usage_page: 0xFFC0,
-            usage: 0x01,
-            serial_number: None,
-            manufacturer: Some("SteelSeries".to_string()),
-            path: "/test/device/path".to_string(),
-        };
-        Apex7::new(GenericKeyboard::new_without_device(info))
-    }
 
     #[test]
-    fn only_the_legacy_family_gets_the_read() {
-        let apex_7 = device_without_handle(product_ids::APEX_7);
-        assert!(apex_7.supports_onboard());
-        assert!(Apex7::supports_onboard_profile(&apex_7));
+    fn the_family_predicate_selects_the_device() {
+        assert!(onboard_family(product_ids::APEX_7));
         for pid in [product_ids::APEX_3, product_ids::APEX_PRO, product_ids::APEX_7_2024] {
             assert!(
                 !onboard_family(pid),
-                "PID {pid:#06x} is not the platform the read was reverse-engineered from"
+                "PID {pid:#06x} is not the legacy platform discovery wraps in Apex7"
             );
         }
     }
 
-    #[test]
-    fn a_device_without_a_handle_says_so() {
-        let keyboard = device_without_handle(product_ids::APEX_7);
-        match keyboard.transport() {
-            Ok(_) => panic!("a device without a handle must not report a transport"),
-            Err(error) => assert!(
-                error.to_string().contains("no open HID handle"),
-                "the error names the missing handle: {error}"
-            ),
-        }
-    }
+    #[cfg(feature = "onboard")]
+    mod onboard {
+        use super::super::*;
+        use crate::devices::{DeviceInfo, DeviceType};
 
-    #[test]
-    fn the_device_starts_on_the_captured_read_plan() {
-        let keyboard = device_without_handle(product_ids::APEX_7);
-        let config = keyboard.onboard_config();
-        assert_eq!(config.fs_id(), crate::onboard_profile::PROFILE_FS_BASE);
-        assert_eq!(config.total_resource_len(), 12_288);
+        fn device_without_handle(product_id: u16) -> Apex7 {
+            let info = DeviceInfo {
+                name: std::borrow::Cow::Borrowed("Test Apex 7"),
+                device_type: DeviceType::Keyboard,
+                vendor_id: crate::STEELSERIES_VENDOR_ID,
+                product_id,
+                interface_number: 1,
+                usage_page: 0xFFC0,
+                usage: 0x01,
+                serial_number: None,
+                manufacturer: Some("SteelSeries".to_string()),
+                path: "/test/device/path".to_string(),
+            };
+            Apex7::new(GenericKeyboard::new_without_device(info))
+        }
+
+        #[test]
+        fn only_the_legacy_family_gets_the_read() {
+            let apex_7 = device_without_handle(product_ids::APEX_7);
+            assert!(apex_7.supports_onboard());
+            assert!(Apex7::supports_onboard_profile(&apex_7));
+            for pid in [product_ids::APEX_3, product_ids::APEX_PRO, product_ids::APEX_7_2024] {
+                assert!(
+                    !onboard_family(pid),
+                    "PID {pid:#06x} is not the platform the read was reverse-engineered from"
+                );
+            }
+        }
+
+        #[test]
+        fn a_device_without_a_handle_says_so() {
+            let keyboard = device_without_handle(product_ids::APEX_7);
+            match keyboard.transport() {
+                Ok(_) => panic!("a device without a handle must not report a transport"),
+                Err(error) => assert!(
+                    error.to_string().contains("no open HID handle"),
+                    "the error names the missing handle: {error}"
+                ),
+            }
+        }
+
+        #[test]
+        fn the_device_starts_on_the_captured_read_plan() {
+            let keyboard = device_without_handle(product_ids::APEX_7);
+            let config = keyboard.onboard_config();
+            assert_eq!(config.fs_id(), crate::onboard_profile::PROFILE_FS_BASE);
+            assert_eq!(config.total_resource_len(), 12_288);
+        }
     }
 }

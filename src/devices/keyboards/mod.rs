@@ -1,7 +1,6 @@
 //! Keyboard device support (Apex series).
 
 pub mod apex;
-#[cfg(feature = "onboard")]
 pub mod apex7;
 #[cfg(feature = "onboard")]
 pub mod apex_legacy_onboard;
