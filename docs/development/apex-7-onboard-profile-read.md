@@ -97,7 +97,7 @@ for each chunk c in 0..12:
 12 pulls of 1024 bytes cover 12288 bytes, enough for the 11648-byte schema A payload and the
 11696-byte schema B payload. A schema-only read is the opening chain, one 2-byte pull of the file head
 and one 2-byte read (GG's own probe, kept in the transfer map; `ssgg onboard` has no schema-probing mode).
-`ssgg onboard read --yes --profile N` runs the whole read and prints its geometry first; frames are built
+`ssgg --debug onboard read --yes --profile N` runs the whole read, and the read loop logs its geometry (`info` level) before the first transfer; frames are built
 per chunk from the typed commands, nothing materialises a transfer list (`Step`, `StepKind`,
 `ReadConfig::steps()`, `init_steps()`, `plan_json` and the `onboard plan` subcommand were removed
 2026-10-17).

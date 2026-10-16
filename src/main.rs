@@ -814,10 +814,7 @@ async fn cmd_profile(action: ProfileAction) -> Result<()> {
 /// docs/development/apex-7-onboard-profile-read.md and has never been replayed from this crate.
 #[cfg(feature = "onboard")]
 async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAction) -> Result<()> {
-    use steelseries_gg::devices::keyboards::apex_legacy_profile::{
-        DEFAULT_CHUNKS, READ_LEN, READS_PER_PULL, RESOURCE_BUFFER_LEN, hex_dump, profile_file_id, profile_json,
-        schema_of, to_json,
-    };
+    use steelseries_gg::devices::keyboards::apex_legacy_profile::{hex_dump, profile_json, schema_of, to_json};
 
     match action {
         OnboardAction::Read(args) => {
@@ -836,12 +833,6 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
             };
             let label = onboard_device_label(keyboard.as_ref());
             print_onboard_banner();
-            println!(
-                "profile slot {profile} (file id {:04X}): {} pulls of {RESOURCE_BUFFER_LEN} bytes, {} reads of {READ_LEN} bytes",
-                profile_file_id(profile),
-                DEFAULT_CHUNKS,
-                DEFAULT_CHUNKS * READS_PER_PULL
-            );
             println!("reading on the {label}");
             println!();
 
@@ -1007,9 +998,7 @@ fn print_onboard_image(image: &steelseries_gg::devices::keyboards::apex_legacy_p
 
 #[cfg(feature = "onboard")]
 fn print_onboard_profile(profile: &steelseries_gg::devices::keyboards::apex_legacy_profile::OnboardProfile) {
-    use steelseries_gg::devices::keyboards::apex_legacy_profile::{
-        Color, PAYLOAD_LEN_A, PAYLOAD_LEN_B, SCHEMA_B_FIRMWARE,
-    };
+    use steelseries_gg::devices::keyboards::apex_legacy_profile::Color;
 
     fn color(c: &Color) -> String {
         format!("#{:02X}{:02X}{:02X}", c.r, c.g, c.b)
@@ -1019,10 +1008,6 @@ fn print_onboard_profile(profile: &steelseries_gg::devices::keyboards::apex_lega
     println!(
         "checksum: stored {:08X}, computed {:08X} over {} bytes, match: {}",
         profile.crc_stored, profile.crc_computed, profile.crc_region_len, profile.crc_ok
-    );
-    println!(
-        "known schema lengths: {} (schema A) and {} (schema B, firmware {})",
-        PAYLOAD_LEN_A, PAYLOAD_LEN_B, SCHEMA_B_FIRMWARE
     );
     println!("name: {:?} (raw bytes {})", profile.name, profile.name_hex);
     println!("guid: {:?} (schema A padding {})", profile.guid, profile.guid_padding);

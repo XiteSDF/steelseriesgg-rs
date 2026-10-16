@@ -53,8 +53,8 @@ use std::time::{Duration, Instant};
 
 use super::GenericKeyboard;
 use super::apex_legacy_profile::{
-    ChunkRecord, DEFAULT_CHUNKS, GG_GAP_MS, INIT_REPLY_LEN, MAX_PROFILE_INDEX, ProfileImage, READ_LEN,
-    READ_REPLY_FRAMING_LEN, READS_PER_PULL, RESOURCE_BUFFER_LEN, ReadReply, hex_of, parse_firmware_version,
+    ChunkRecord, DEFAULT_CHUNKS, GG_GAP_MS, INIT_REPLY_LEN, MAX_PROFILE_INDEX, PROFILE_FILE_LEN, ProfileImage,
+    READ_LEN, READ_REPLY_FRAMING_LEN, READS_PER_PULL, RESOURCE_BUFFER_LEN, ReadReply, hex_of, parse_firmware_version,
     parse_read_reply_at, profile_file_id, reply_mismatch, validate_profile,
 };
 use crate::devices::hid_reports::{
@@ -141,6 +141,16 @@ fn read_image(
     let fs_id = profile_file_id(profile);
     let read_len = READ_LEN as u16;
     let overall = deadline.map(|d| Instant::now() + d);
+
+    // The geometry this platform's read always has; `ssgg --debug onboard read ...` shows it before
+    // the first byte moves.
+    tracing::info!(
+        "onboard read geometry: profile slot {profile} (file {fs_id:04X}) is {DEFAULT_CHUNKS} pulls of \
+         {RESOURCE_BUFFER_LEN} bytes, {} payload reads of {READ_LEN} bytes, {} of the {} payload bytes covered",
+        DEFAULT_CHUNKS * READS_PER_PULL,
+        DEFAULT_CHUNKS * READS_PER_PULL * READ_LEN,
+        PROFILE_FILE_LEN,
+    );
 
     // The chain is part of every read GG runs, and its `0x90` poll is the only source of the firmware
     // version this read reports.
