@@ -400,8 +400,10 @@ mod tests {
         assert_eq!(config.resource_len, RESOURCE_BUFFER_LEN);
         assert_eq!(config.fs_id(), PROFILE_FS_BASE);
         assert_eq!(config.total_resource_len(), 12_288);
-        let steps = config.steps();
-        let pulls = steps.iter().filter(|s| s.kind.to_string() == "pull").count();
-        assert_eq!(pulls, config.chunks);
+        assert_eq!(
+            config.reads_per_pull(),
+            RESOURCE_BUFFER_LEN / crate::onboard_profile::READ_LEN,
+            "the default geometry reads 512-byte windows out of the 1024-byte buffer"
+        );
     }
 }

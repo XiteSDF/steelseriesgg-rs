@@ -814,13 +814,12 @@ async fn cmd_profile(action: ProfileAction) -> Result<()> {
 /// docs/development/apex-7-onboard-profile-read.md and has never been replayed from this crate.
 #[cfg(feature = "onboard")]
 async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAction) -> Result<()> {
-    use steelseries_gg::onboard_profile::{hex_dump, plan_json, profile_json, schema_of, to_json};
+    use steelseries_gg::onboard_profile::{hex_dump, profile_json, schema_of, to_json};
 
     match action {
         OnboardAction::Plan(wire_args) => {
             let config = wire_args.to_config();
             config.validate()?;
-            println!("{}", plan_json(&config)?);
             print_plan_summary(&config);
         }
 
@@ -991,36 +990,28 @@ fn print_onboard_banner() {
 
 #[cfg(feature = "onboard")]
 fn print_plan_summary(config: &ReadConfig) {
-    use steelseries_gg::onboard_profile::StepKind;
+    use steelseries_gg::devices::hid_reports::ONBOARD_INIT_CHAIN;
 
-    let steps = config.steps();
-    let pulls = steps.iter().filter(|s| s.kind == StepKind::Pull).count();
-    let reads = steps.iter().filter(|s| s.kind == StepKind::Read).count();
-    let init = steps.iter().filter(|s| s.kind == StepKind::Init).count();
-    let first_pull = steps.iter().find(|s| s.kind == StepKind::Pull);
-    let first_read = steps.iter().find(|s| s.kind == StepKind::Read);
+    let pulls = config.chunks;
+    let reads = pulls * config.reads_per_pull();
+    let init = usize::from(config.send_init_chain) * ONBOARD_INIT_CHAIN.len();
 
     println!();
     println!(
-        "plan: {init} opening-chain frame(s), {pulls} pulls, {reads} payload reads, {} transfers total",
-        steps.len()
+        "plan: {pulls} pull(s), {} payload read(s), {init} opening-chain frame(s)",
+        reads
     );
-    for step in steps.iter().filter(|s| s.kind == StepKind::Init) {
-        println!("init frame: {}", hex_of(&step.frame[..3]));
-    }
-    if let Some(step) = first_pull {
-        println!("first pull:  {}", hex_of(&step.frame));
-    }
-    if let Some(step) = first_read {
-        println!("first read:  {}", hex_of(&step.frame));
-    }
+    println!("first pull:  {}", hex_of(&config.pull_frames()[0]));
+    println!("first read:  {}", hex_of(&config.read_frames()[0]));
     println!(
-        "file ids {} .. {} (slot {}), {} bytes planned for {} payload bytes",
+        "file ids {:#06X} .. {:#06X} (slot {}), {} bytes pulled for {} payload bytes, {} ms pacing, reply payload anchored at byte {}",
         config.fs_base,
         config.fs_base + u16::from(config.profile),
         config.profile,
         config.total_resource_len(),
-        config.payload_len
+        config.payload_len,
+        config.gap_ms,
+        config.reply_header
     );
 }
 

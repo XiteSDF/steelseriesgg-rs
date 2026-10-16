@@ -97,7 +97,10 @@ for each chunk c in 0..12:
 12 pulls of 1024 bytes cover 12288 bytes, enough for the 11648-byte schema A payload and the
 11696-byte schema B payload. A schema-only read is the opening chain, one 2-byte pull of the file head
 and one 2-byte read (GG's own probe, kept in the transfer map; `ssgg onboard` has no schema-probing mode).
-`ssgg onboard plan` prints the sequence and `ssgg onboard read --yes` runs the whole read.
+`ssgg onboard plan` prints the geometry (pulls, payload reads, opening-chain frames, file ids, pacing,
+reply anchor) and `ssgg onboard read --yes` runs the whole read; frames are built per chunk from the typed
+commands - no transfer list is materialised ahead of the wire (`Step`, `StepKind`, `ReadConfig::steps()`,
+`init_steps()` and `plan_json` were removed 2026-10-17).
 The reply framing length is `--reply-header` (default 0, the offset the capture's replies show); skip
 the chain itself with `--no-init-chain`.
 

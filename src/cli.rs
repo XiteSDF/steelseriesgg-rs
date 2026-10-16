@@ -202,7 +202,8 @@ pub(crate) enum Commands {
 #[cfg(feature = "onboard")]
 #[derive(Subcommand)]
 pub(crate) enum OnboardAction {
-    /// Print the transfer plan of one profile read (no device, no hardware).
+    /// Print what one profile read will do (pulls, payload reads, file ids, pacing). No device, no
+    /// hardware.
     Plan(OnboardWireArgs),
 
     /// Read one profile from a legacy Apex keyboard. Requires --yes.
