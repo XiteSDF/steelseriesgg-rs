@@ -913,7 +913,7 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
 #[cfg(feature = "onboard")]
 /// The Apex 7 as a keyboard device, when the target carries the `[EXPERIMENTAL]` on-board profile
 /// protocol. The read then runs on the handle the device manager opened, which is what `usbhid` needs
-/// for the firmware-poll answer: it polls an interrupt endpoint only while a descriptor on
+/// for the opening-chain and pull answers: it polls an interrupt endpoint only while a descriptor on
 /// the node is open.
 ///
 /// `None` when no matching keyboard is openable, and when the target is not on the platform the

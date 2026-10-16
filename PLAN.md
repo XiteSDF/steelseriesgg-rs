@@ -261,11 +261,6 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   `docs/development/apex-7-onboard-profile-read.md` ("What answers a pull"), `ONBOARD.md` item 0a, the `0x85` row of
   `.claude/rules/experimental-protocol.md`, and the comments of `apex_legacy_profile.rs` /
   `apex_legacy_onboard.rs` (the packet after a pull is consumed, never parsed);
-- 2026-10-17: **the per-pull pacing read is out of `onboard read`.** Since a pull has no reply with content
-  (see the previous entry), the per-pull input poll (`read_pull_ack`, `PULL_ACK_LEN`, `PULL_ACK_ATTEMPTS`) is
-  removed: the read goes straight from the pull to its two payload reads, and `ChunkRecord` no longer carries
-  `ack_report_id`/`ack_hex` (the pull answer is not collected at all). The interrupt endpoint is still polled for
-  the `90` firmware-poll answer, so the whole read still needs a handle that stays open.
 - 2026-10-17: same-day follow-ups after review - the materialised transfer plan (`OnboardTransferPlan`, `plan_frames`, `plan` and its CLI wiring), the schema probe (`OnboardSchemaProbe`, `read_config.schema_probe`), the transport layer (`OnboardTransport`, `HandleTransport`, `PathTransport`, the per-call path-open helpers) and the per-device stored slot (`Apex7::onboard_slot`, `set_onboard_slot`, `read_profile_slot`) were all removed, the read API takes the slot as an argument, every send on `GenericKeyboard` now shares one `connected_device` accessor, and `src/onboard_profile.rs` moved to `src/devices/keyboards/apex_legacy_profile.rs` (feature-gated) because its geometry, framing, payload sizes, schema words and struct offsets are all specific to this legacy platform. Same day: the CLI stopped printing that
   geometry and the schema-length line (they quoted legacy constants); the opening chain was removed from the read -
   `OnboardInitCommand`/`ONBOARD_INIT_CHAIN` are gone, `OnboardFirmwareVersionCommand` (`90 00`) is the one poll the

@@ -1,8 +1,8 @@
 //! [EXPERIMENTAL] On-board profile read for the legacy/"macho" Apex platform.
 //!
 //! Frame construction, reply parsing, payload geometry and decoding live in [`crate::devices::keyboards::apex_legacy_profile`].
-//! This module only moves bytes: it sends the firmware poll, the pull frames and the payload reads, collects
-//! the replies and assembles a
+//! This module only moves bytes: it opens the collection that carries profile traffic, sends the
+//! opening-chain, pull and read frames the read plan describes, collects replies and assembles a
 //! [`crate::devices::keyboards::apex_legacy_profile::ProfileImage`].
 //!
 //! Wire facts confirmed from the 2026-10-15 Windows USBPcap capture of official GG on an Apex 7
@@ -18,11 +18,7 @@
 //!   contains no 13-byte transfer at all, so the pacing frame this module sent before is not on GG's
 //!   wire;
 //! - the pull frame is `SET_REPORT wValue 0x0200 wLength 64` carrying
-//!   `[85][00][file selector u16 LE][file offset u32 LE][size u16 LE]`, 10 frame bytes. GG pairs every pull
-//!   with one input read (`read-chunk HIDIO 65`) and keeps **no bytes** of its byte specifier `(0 0 0)`: the
-//!   packet that answers it is the keyboard's ordinary input report `0x01` (all-zero on an idle keyboard,
-//!   1.7-3.7 ms after the pull in all 121 pulls). This module sends no such read - there is nothing to take
-//!   from the packet, so consuming one would be pure latency;
+//!   `[85][00][file selector u16 LE][file offset u32 LE][size u16 LE]`, 10 frame bytes;
 //! - the payload-read request is `SET_REPORT wValue 0x0300 wLength 642` — a **feature** report, not an
 //!   output report — carrying `[83][00][resource-buffer offset u16 LE][size u16 LE]`, 6 frame bytes;
 //! - the answer is a **feature-report reply** (`GET_REPORT wValue 0x0300 wIndex 1 wLength 642`): 643
@@ -44,8 +40,8 @@
 //! The transfers run on the handle [`GenericKeyboard`] already owns - the collection the device manager
 //! opened, held open for the whole read (see the packet methods named below). `usbhid` polls a
 //! collection's interrupt endpoint only
-//! while a descriptor on that node is open, so the interrupt report the read consumes (the `0x90`
-//! answer) can
+//! while a descriptor on that node is open, so the interrupt reports the read consumes (the `0x90`
+//! answer and the packet after each pull) can
 //! only arrive on a handle that stays open for the whole read - measured on an Apex 7 in the 2026-10-16
 //! Linux run capture (`linux-read.pcapng`), where a reader that opened the node per report collected
 //! nothing; see `docs/development/apex-7-onboard-profile-read.md`, "Input reports: the node must be open
@@ -84,12 +80,19 @@ const READ_REPLY_ID: u8 = 0x00;
 const READ_REPLY_WIRE_LEN: usize = ONBOARD_REPLY_REPORT_SIZE;
 /// Poll acknowledges and status reports the reply collector skips.
 const ACK_REPORT_IDS: [u8; 2] = [0x0B, 0x12];
+/// Wire length to ask for when collecting the packet that follows a pull. The pull has no answer of
+/// its own: the device keeps streaming its ordinary input reports on the interrupt endpoint (report
+/// `0x01`, all-zero on an idle keyboard, 1.7-3.7 ms after the pull in the capture) and GG consumes one
+/// packet per chunk as pacing, taking no bytes from it.
+const PULL_ACK_LEN: usize = 64;
 /// Polls per reply collection round, in milliseconds.
 const REPLY_POLL_MS: i32 = 50;
 /// Reply budget per payload read when the caller set no deadline, in milliseconds.
 const REPLY_BUDGET_MS: u64 = 2_000;
 /// Input-report polls allowed per reply before giving up.
 const REPLY_INPUT_ATTEMPTS: u32 = 20;
+/// Polls allowed for one pull answer.
+const PULL_ACK_ATTEMPTS: u32 = 4;
 /// Polls allowed for the firmware-version answer.
 const FIRMWARE_REPLY_ATTEMPTS: u32 = 3;
 /// Largest input report a profile collection can return (Apex 7 profile collections report 1024).
@@ -171,6 +174,14 @@ fn read_image(
                  {path} rejected: {e}"
             ))
         })?;
+        let ack = read_pull_ack(keyboard);
+        let (ack_report_id, ack_hex) = match ack.as_deref() {
+            Some(report) if !report.is_empty() => (report[0], hex_of(report)),
+            _ => {
+                tracing::debug!("no input report arrived after the pull for chunk {chunk} on {path}");
+                (0, String::new())
+            }
+        };
 
         let mut reads: Vec<ReadReply> = Vec::with_capacity(READS_PER_PULL);
         for read in 0..READS_PER_PULL {
@@ -205,6 +216,8 @@ fn read_image(
             index: chunk,
             fs_id,
             file_offset,
+            ack_report_id,
+            ack_hex,
             reads,
         });
         if overall.is_some_and(|d| Instant::now() >= d) {
@@ -303,6 +316,12 @@ fn read_reply_report(keyboard: &GenericKeyboard, payload_len: usize, overall: Op
     Err(Error::DeviceCommunication(format!(
         "no profile payload reply from {path}: {reason}"
     )))
+}
+
+/// Consumes the interrupt packet that follows a pull (flow control, the content is not looked at -
+/// GG's read specifiers keep zero bytes of it), so the next payload read starts from a clean queue.
+fn read_pull_ack(keyboard: &GenericKeyboard) -> Option<Vec<u8>> {
+    read_interrupt_report(keyboard, PULL_ACK_LEN, PULL_ACK_ATTEMPTS)
 }
 
 /// Identity of the collection the read runs on, for logs and read errors.
