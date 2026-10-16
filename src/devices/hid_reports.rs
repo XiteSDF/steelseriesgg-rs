@@ -475,13 +475,23 @@ pub const ONBOARD_OUTPUT_REPORT_SIZE: usize = 65;
 /// `[EXPERIMENTAL]` Never reproduced on hardware.
 pub const ONBOARD_FEATURE_REPORT_SIZE: usize = 643;
 
-/// Report length to ask for when reading a payload read back with `GET_REPORT wValue 0x0300 wIndex 1`
-/// (the capture's reply is a 643-byte data stage, report-ID byte plus 642 payload bytes). Measured on
-/// Linux 2026-10-15: 642 answers, **643 makes the control transfer never complete**.
-pub const ONBOARD_REPLY_REPORT_SIZE: usize = 642;
+/// Wire bytes of a payload read-back: the `GET_REPORT wValue 0x0300 wIndex 1 wLength 642` control read
+/// the reference capture shows, which is also the length to ask the transport for. On Linux the read side
+/// sends the buffer length verbatim (`HIDIOCGFEATURE`: hidapi hands the slice length straight to the
+/// ioctl, `src/linux_native/ioctl.rs:26`), so **ask with 642, never 643** - measured 2026-10-15:
+/// 642 answers, 643 makes the control transfer never complete (`Connection timed out`). The kernel writes
+/// the device's report-ID byte into buffer[0], so the bytes behind it are 641.
+///
+/// `[EXPERIMENTAL]` Wire length capture-confirmed on Windows (Apex 7, 2026-10-15); the answering length
+/// measured on Linux the same day.
+pub const ONBOARD_GET_WIRE_BYTES: usize = 642;
 
-/// Bytes a payload read may ask for: a reply report carries the payload behind its report-ID byte.
-pub const ONBOARD_MAX_READ_LEN: usize = ONBOARD_REPLY_REPORT_SIZE - 1;
+/// Bytes a payload read frame may ask for. A reply report arrives as `[report ID][641 bytes]`, and a
+/// header-echoing reply puts a further 5-byte header (`03 01 01 00 01`, see `READ_REPLY_HEADER_LEN` in
+/// `apex_legacy_profile`) in front of the payload, so the payload a read can ask for tops out at
+/// 642 - 1 - 5 = 636. An earlier version of this constant said 641: it subtracted the report-ID byte but
+/// not the header, which let a read frame ask for a size no reply can carry.
+pub const ONBOARD_MAX_READ_LEN: usize = ONBOARD_GET_WIRE_BYTES - 1 - 5;
 
 /// [EXPERIMENTAL] Legacy Apex firmware-version poll: `90 00` in a 64-byte output report
 /// (`SET_REPORT wValue 0x0200`), answered on the interrupt endpoint with the ASCII firmware version
@@ -707,8 +717,9 @@ impl HidCommand for OnboardReadCommand {
     fn validate(&self) -> Result<()> {
         if usize::from(self.size) > ONBOARD_MAX_READ_LEN {
             return Err(Error::InvalidConfig(format!(
-                "payload read of {} bytes exceeds the {} bytes one reply report can carry",
-                self.size, ONBOARD_MAX_READ_LEN
+                "payload read of {} bytes exceeds the {} bytes a {}-byte reply report carries behind its \
+                 5-byte header",
+                self.size, ONBOARD_MAX_READ_LEN, ONBOARD_GET_WIRE_BYTES
             )));
         }
         Ok(())
@@ -1987,6 +1998,42 @@ mod tests {
         assert!(
             cmd.serialize(&mut small, HidDeviceType::Keyboard).is_err(),
             "the feature report needs its full buffer"
+        );
+    }
+
+    #[test]
+    fn read_back_length_and_its_ceiling_match_the_reply_the_kernel_hands_us() {
+        // Read side: the buffer length goes to the device verbatim (HIDIOCGFEATURE), so the ask equals the
+        // capture's GET wLength. Write side: the kernel strips the report number, so the 643-byte buffer of
+        // ONBOARD_FEATURE_REPORT_SIZE goes out as wLength 642. The asymmetry is the kernel's, and the
+        // measured lengths are the anchor: 642 answers, 643 never completes (2026-10-15).
+        assert_eq!(ONBOARD_GET_WIRE_BYTES, 642, "the capture's GET wLength and our ask");
+        assert_eq!(
+            ONBOARD_FEATURE_REPORT_SIZE,
+            ONBOARD_GET_WIRE_BYTES + 1,
+            "the write buffer carries a report-number byte the wire does not"
+        );
+        assert_eq!(
+            ONBOARD_MAX_READ_LEN, 636,
+            "642 reply bytes minus the report-ID byte and the 5-byte header"
+        );
+        assert!(
+            OnboardReadCommand {
+                buffer_offset: 0,
+                size: 636,
+            }
+            .validate()
+            .is_ok(),
+            "the largest payload a header-echoing reply can carry is accepted"
+        );
+        assert!(
+            OnboardReadCommand {
+                buffer_offset: 0,
+                size: 637,
+            }
+            .validate()
+            .is_err(),
+            "one byte more would not fit behind the header in the reply the kernel delivers"
         );
     }
 

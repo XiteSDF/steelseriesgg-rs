@@ -67,13 +67,12 @@ use std::time::{Duration, Instant};
 use super::GenericKeyboard;
 use super::apex_legacy_profile::{
     ChunkRecord, DEVICE_RESOURCE_BUFFER_LEN, GG_GAP_MS, GG_INPUT_READ_BYTES, PAYLOAD_READ_LEN, PROFILE_FILE_BYTES,
-    PULLS_PER_FILE, ProfileImage, READ_REPLY_FRAMING_LEN, READS_PER_PULL, ReadReply, hex_of, parse_firmware_version,
-    parse_read_reply_at, profile_file_id, reply_mismatch, validate_profile,
+    PULLS_PER_FILE, ProfileImage, READ_REPLY_FRAMING_LEN, READ_REPORT_LEN, READS_PER_PULL, ReadReply, hex_of,
+    parse_firmware_version, parse_read_reply_at, profile_file_id, reply_mismatch, validate_profile,
 };
 use crate::devices::hid_reports::{
     HidCommand, HidDeviceType, HidReportBuilder, ONBOARD_FEATURE_REPORT_SIZE, ONBOARD_INIT_CHAIN,
-    ONBOARD_INIT_FRAME_COUNT, ONBOARD_OUTPUT_REPORT_SIZE, ONBOARD_REPLY_REPORT_SIZE, OnboardPullCommand,
-    OnboardReadCommand,
+    ONBOARD_INIT_FRAME_COUNT, ONBOARD_OUTPUT_REPORT_SIZE, OnboardPullCommand, OnboardReadCommand,
 };
 use crate::error::{Error, Result};
 
@@ -85,10 +84,12 @@ use crate::error::{Error, Result};
 /// declared - and that run answered nothing.
 /// `[EXPERIMENTAL]`
 const READ_REPLY_ID: u8 = 0x00;
-/// Length to request for the payload reply (see [`ONBOARD_REPLY_REPORT_SIZE`]). The kernel forwards
-/// this number to the device as `wLength`: 642 answers, asking for more makes the control read never
-/// complete, which is what `Connection timed out` meant on 2026-10-15.
-const READ_REPLY_WIRE_LEN: usize = ONBOARD_REPLY_REPORT_SIZE;
+/// Buffer size to ask the transport for when reading a payload read back: [`READ_REPORT_LEN`] (642), the
+/// capture's `GET_REPORT wValue 0x0300 wIndex 1 wLength 642`. The read side forwards this number to the
+/// device as `wLength` verbatim, so 643 is the ask that never completes (`Connection timed out`, measured
+/// 2026-10-15). The device's report-ID byte lands in buffer[0], so a full answer is `[report ID][641 bytes]`.
+/// `[EXPERIMENTAL]` The 642-byte ask answered on hardware (Apex 7, 2026-10-16 and 2026-10-18).
+const READ_REPLY_BUFFER_LEN: usize = READ_REPORT_LEN;
 /// Poll acknowledges and status reports the reply collector skips.
 const ACK_REPORT_IDS: [u8; 2] = [0x0B, 0x12];
 /// Bytes to read for the pacing packet that follows a pull. The pull has no answer of its own: the device
@@ -291,7 +292,7 @@ fn read_reply_report(keyboard: &GenericKeyboard, payload_len: usize) -> Result<V
     let mut last_error: Option<Error> = None;
 
     while Instant::now() < stop {
-        match keyboard.read_profile_feature_packet(READ_REPLY_ID, READ_REPLY_WIRE_LEN) {
+        match keyboard.read_profile_feature_packet(READ_REPLY_ID, READ_REPLY_BUFFER_LEN) {
             Ok(report) if reply_carries_payload(&report, payload_len) => return Ok(report),
             Ok(report) => {
                 empty_answers = empty_answers.saturating_add(1);

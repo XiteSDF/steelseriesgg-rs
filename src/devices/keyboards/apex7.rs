@@ -189,8 +189,12 @@ mod tests {
         #[test]
         fn a_device_without_a_handle_says_so() {
             let keyboard = device_without_handle(product_ids::APEX_7);
-            // report ID 0 and 642 bytes: the payload-read shape of the reference capture
-            match keyboard.inner.read_profile_feature_packet(0x00, 642) {
+            // report number 0 and a 642-byte ask: the payload read-back shape of the reference capture,
+            // which the read side sends to the device verbatim as wLength 642
+            match keyboard
+                .inner
+                .read_profile_feature_packet(0x00, crate::devices::keyboards::apex_legacy_profile::READ_REPORT_LEN)
+            {
                 Ok(_) => panic!("a device without a handle must not answer a profile packet"),
                 Err(error) => assert!(
                     error.to_string().contains("Device not connected"),

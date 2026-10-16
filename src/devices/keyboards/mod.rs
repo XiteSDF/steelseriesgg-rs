@@ -490,8 +490,12 @@ impl GenericKeyboard {
         Ok(())
     }
 
-    /// Read one feature report from this keyboard's collection (`GET_REPORT wValue 0x0300`):
-    /// `report_id` seeds byte 0, `len` is the size the collection declares and goes out as `wLength`.
+    /// Read one feature report from this keyboard's collection (`GET_REPORT wValue 0x0300`): `report_id`
+    /// seeds byte 0 and `len` is the buffer size, which the kernel forwards to the device as `wLength`
+    /// verbatim (`HIDIOCGFEATURE`; hidapi hands the slice length straight to the ioctl, hidapi 2.6.7
+    /// `src/linux_native/ioctl.rs:26`). The device's report-ID byte arrives in byte 0, so a `len`-byte ask
+    /// delivers `len - 1` payload bytes. Unlike the write side, where the kernel strips the report number
+    /// from the data stage.
     pub(crate) fn read_profile_feature_packet(&self, report_id: u8, len: usize) -> Result<Vec<u8>> {
         if len < 2 {
             return Err(Error::DeviceCommunication(format!(
