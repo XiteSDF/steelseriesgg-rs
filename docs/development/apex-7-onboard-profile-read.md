@@ -68,6 +68,15 @@ transfer: an earlier version of this document described a 13-byte "pacing frame"
 no such transfer exists on the wire. The words `f4 01 60 00` do appear on the wire, as `f4 00`-family
 frames zero-padded to 64 bytes.
 
+The engine's tail after a profile transfer is three output reports: `69` (Gamesense OLED off), `89 <profile>`
+(deploy that profile) and `41 00` (profile not volatile); the engine sleeps 250 ms behind the deploy frame.
+`ssgg onboard read` sends four frames at the end of a read (see "Procedure", `Apex7::send_end_sequence`): those
+three plus `6c 00 00`, which closes driver mode - the read's opening chain opened it with `6c 00 01`, and
+closing it is what the engine does at the end of a session. §Driver mode is the engine-side reading of all of
+this, including the `ff` frame the frame inventory above lists exactly once (recorded by the kit under the
+capture's "idle, do nothing" step, `summary.md`): no engine-side name for it in this family, direction not
+settled, not sent by this crate.
+
 The read requests are exactly three shapes:
 
 | buffer offset | size | count |
@@ -102,6 +111,10 @@ for each chunk c in 0..12:
         write feature report 0, 642 bytes: 83 00 | buffer_offset u16 | 512 u16
         GET_REPORT wValue 0x0300 wLength 642 -> the file bytes behind the report-ID byte
     sleep 11 ms
+write output report 0, 64 bytes: 69 00 …  89 (slot+1) 00 …  41 00 00 …  6c 00 00 00 …
+                                                                    # closing: OLED off, deploy that slot
+                                                                    # (250 ms sleep), not volatile, close
+                                                                    # driver mode (the chain opened it)
 ```
 
 12 pulls of 1024 bytes cover 12288 bytes, enough for the 11648-byte schema A payload and the
@@ -267,12 +280,51 @@ would receive a **four-frame** chain; the 2026-10-18 measurement that made the c
 here on 2026-10-18 and reverted the same day for that reason. Pulls and payload reads never repeat (their file
 and buffer offsets differ), so nothing after the chain is affected by the choice.
 
+## Driver mode (engine side)
+
+Engine-side reading of the frames that open and close a session. `ONBOARD.md` records that the `lisp/` descriptors
+(dumped from the Windows engine, untracked in the working copy) are not to be referenced in code comments, so the
+engine-side citations live here and the code states wire facts and points to this section.
+
+Driver mode is one command per family, and its **shape is not the same across families**:
+
+| Family | Command | Report chunk | Engine-side facts |
+|---|---|---|---|
+| legacy Apex (the `0x1612` family this read targets) | `0x6C` | 65 | `base_apex_legacy.lisp:562`, `:570` - report 0, command `0x6C`, `profile_driver_mode 0`, `macro_driver_mode 1` to open, both 0 to close. The engine writes the opening frame at device init (`:181`, wrapped in `devour-but-log-panic`, commented that on old MP firmware the write "will return zeros on the IN endpoint, which throws any consequent 'read' command off") and the closing frame in its `shutdown` handler (`:303`) |
+| Apex 3 | **`0x03`** | **33** | `apex_3.lisp:23`, `:32` - report 0, command `0x03`, `reserved 0`, `profile_button_driver_mode 0`, `macro_button_driver_mode 1`, and the opening and closing structs are **byte-identical**, so on this family opening and closing are the same frame on the wire |
+| Apex 3 TKL | `0x6C` | 65 | `apex_3_tkl.lisp:100`, `:109` - opens with `profile_driver_mode 1`, `macro_driver_mode 1` (the legacy family opens with 0), closes with both 0. `apex_3_tkl.lisp:99` states what the mode is for: "software driver mode must be enabled for SSKey combos to be included in the keyboard report" |
+
+The read path is implemented for the legacy family only, and its two driver-mode frames are that family's: the opening
+chain's fourth frame `6c 00 01` and the closing sequence's last frame `6c 00 00`. A port of the read to the Apex 3
+family cannot reuse the closing frame: on Apex 3 the command byte is `0x03`, in a 33-byte report, and the closing
+frame is byte-identical to the opening frame.
+
+The engine's session close in the legacy family writes three frames (`base_apex_legacy.lisp:299-304`):
+`reset_all_illumination` (command `0x3B`, `:692`), `disable_gamesense_oled` (command `0x69`, `:724`) and
+`end_driver_mode` (`0x6C` with the last byte 0, `:570`). The read's closing sequence writes the last two, not the
+lighting reset.
+
+The deploy pair behind every profile file in the capture is `load_profile` (command `0x89`, `profile_id` typed
+`(range 1 5)`, sent as `succ index` by `switch_to_onboard_config`, `:2280`, `:2300`) with the engine's own sleep
+`chunk HIDSLEEP 4 (uint32-to-bytes 250)` - "the firmware to finish deploying", `:2289` - and `set_profile_volatile`
+(command `0x41`, sent as 0 by `post_deploy_onboard` for every slot index `>= 0`, `:2291`, `:2531`).
+
+**The `ff` frame.** The capture has exactly one 64-byte `ff` frame, recorded by the kit under its "idle, do nothing"
+step (`summary.md`). Driver mode in this family is `0x6C` and on Apex 3 it is `0x03`, so `ff` is not the family's
+driver-mode frame; no lisp of the family names a `0xff` command; its direction (IN versus OUT) is not settled. This
+crate does not send it. A version of this code sent it as a closing frame on 2026-10-18 and it was removed on
+2026-10-19, on the same pass that put `6c 00 00` in its place.
+
 ## Safety
 
-Read-only code. `ssgg onboard` writes nothing to the keyboard: the push command (`0x05`) is named in
-`src/devices/keyboards/apex_legacy_profile.rs` for completeness and nothing sends it. Do not add profile writes: the
-profile blob contains blocks this layout does not explain, and writing a synthetic blob can put the
-keyboard in a state GG itself cannot repair. `read` requires `--yes`; `decode` never touches a device.
+The read's transfers are reads, and it ends with the engine's closing sequence - four frames that make the
+keyboard **run** the slot that was read (`89 <slot + 1>`) and close the driver mode its own opening chain opened
+(`6c 00 00`), see `Apex7::send_end_sequence`, "Procedure" and §Driver mode. Nothing else in the protocol's write
+direction is sent: the push command (`0x05`) is named in
+`src/devices/keyboards/apex_legacy_profile.rs` for completeness and nothing sends it, and no profile payload is
+written. Do not add profile writes: the profile blob contains blocks this layout does not explain, and writing a
+synthetic blob can put the keyboard in a state GG itself cannot repair. `read` requires `--yes`; `decode` never
+touches a device.
 
 ## What is not settled
 
@@ -293,9 +345,17 @@ keyboard in a state GG itself cannot repair. `read` requires `--yes`; `decode` n
   report after every frame (GG's `read-chunk HIDIO 65`). Why an undrained answer silences the frames after it
   is not measured - the command-queue flow-control reading is inference.
 - GG's write direction (`03 00 <offset> <size> <payload>`, 144 transfers in the capture): not used
-  here, and there is no read-back command known for this family, so `ssgg onboard` writes nothing.
-- The remaining `wValue 0x0200` frames of the capture (`0x6e`, `0x68`, `0x6a`, `0x89`, `0x41`, `0x69`,
-  `0xff`) and the 57-byte lighting block layout, which is copied from the engine decoder and unverified.
+  here, and there is no read-back command known for this family, so `ssgg onboard` writes no profile payload.
+  The only writes the read sends are the four closing frames (`onboard_end_sequence`).
+- What the closing sequence does on hardware. The first three frames are named on the engine side, and none of
+  the four has been sent from this crate on hardware: does `89` switch the keyboard to the slot (the engine's
+  config-switching function is what sends it), what does disabling the Gamesense OLED look like on an Apex 7, and
+  what changes when driver mode is closed? `ONBOARD.md` step 8 is the test. The capture's single `ff` frame
+  (recorded in the kit's "idle" step, `summary.md`) is unaccounted for: no engine-side name for it in this family
+  and its direction is not settled, so it is not sent (§Driver mode).
+- The other `wValue 0x0200` frames of the capture (`0x6e` x10, `0x68` x6, `0x6a` x6 = idle in/out, Gamesense
+  OLED enable, restart graphics) and the 57-byte lighting block layout, which is copied from the engine decoder
+  and unverified.
 - Whether the read-back can carry a window at all. Every answer in the capture is the file head plus
   zeros; no capture in this repo shows a payload-read reply that changes with the requested offset.
 - The Linux framing of the read-back. GG asks report number 0 on interface 1 in both directions; the run

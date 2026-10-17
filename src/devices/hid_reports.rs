@@ -59,9 +59,28 @@ pub enum CommandCode {
     /// [EXPERIMENTAL] Legacy Apex frame `f4 00`, seen in GG's opening chain and answered `00 01 00…`;
     /// meaning unknown, and nothing in this crate sends it.
     EngineStatus = 0xF4,
-    /// [EXPERIMENTAL] Legacy Apex frame `6c 00 01`, seen in GG's opening chain; no answer was ever
-    /// captured, the meaning is unknown, and nothing in this crate sends it.
-    OpenFiles = 0x6C,
+    /// `[EXPERIMENTAL]` Legacy Apex driver mode (0x6C): the opening frame `6c 00 01` (last byte 1) and the
+    /// closing frame `6c 00 00` (last byte 0) - same report number 0, same command, one byte apart. The engine
+    /// writes the opening frame at device init and the closing frame when it closes a session; the read's opening
+    /// chain sends the opening frame ([`ONBOARD_INIT_CHAIN`]) and its closing sequence sends the closing frame
+    /// ([`onboard_end_sequence`]). Only the opening frame is in the reference capture. The engine side of all of
+    /// it - the sleep behind the deploy frame, the lighting-reset frame the engine also writes on closing (which
+    /// this crate does not send), and the Apex 3 family's different driver-mode frames (`0x03` in a 33-byte
+    /// report on Apex 3, `0x6C` with a different opening byte on Apex 3 TKL) - is written up in
+    /// `docs/development/apex-7-onboard-profile-read.md` §Driver mode.
+    DriverMode = 0x6C,
+    /// `[EXPERIMENTAL]` Legacy Apex Gamesense OLED off (0x69), the engine's Gamesense OLED-off frame, one of the
+    /// frames it writes when it closes a session; in this crate it is the first frame of
+    /// [`onboard_end_sequence`]. See `docs/development/apex-7-onboard-profile-read.md` §Driver mode.
+    DisableGamesenseOled = 0x69,
+    /// `[EXPERIMENTAL]` Legacy Apex profile deploy (0x89): the closing-sequence frame `89 <slot + 1>`, the
+    /// engine's profile-deploy frame. This one writes: it makes the keyboard run the slot. See
+    /// [`onboard_end_sequence`].
+    LoadProfile = 0x89,
+    /// `[EXPERIMENTAL]` Legacy Apex profile volatile flag (0x41): the closing-sequence frame `41 00`, which the
+    /// engine sends as 0 for every real slot index. The same byte on the Apex Pro 2023 engine path is an OLED
+    /// frame; the two share the value, not the report shape. See [`onboard_end_sequence`].
+    SetProfileVolatile = 0x41,
 }
 
 impl fmt::Display for CommandCode {
@@ -80,7 +99,10 @@ impl fmt::Display for CommandCode {
             CommandCode::OnboardPayloadRead => write!(f, "ONBOARD_PAYLOAD_READ_EXPERIMENTAL"),
             CommandCode::FirmwareVersion => write!(f, "FIRMWARE_VERSION_EXPERIMENTAL"),
             CommandCode::EngineStatus => write!(f, "ENGINE_STATUS_EXPERIMENTAL"),
-            CommandCode::OpenFiles => write!(f, "OPEN_FILES_EXPERIMENTAL"),
+            CommandCode::DriverMode => write!(f, "DRIVER_MODE_EXPERIMENTAL"),
+            CommandCode::DisableGamesenseOled => write!(f, "DISABLE_GAMESENSE_OLED_EXPERIMENTAL"),
+            CommandCode::LoadProfile => write!(f, "LOAD_PROFILE_EXPERIMENTAL"),
+            CommandCode::SetProfileVolatile => write!(f, "SET_PROFILE_VOLATILE_EXPERIMENTAL"),
         }
     }
 }
@@ -105,7 +127,10 @@ impl CommandCode {
             0x83 => Some(CommandCode::OnboardPayloadRead),
             0x90 => Some(CommandCode::FirmwareVersion),
             0xF4 => Some(CommandCode::EngineStatus),
-            0x6C => Some(CommandCode::OpenFiles),
+            0x6C => Some(CommandCode::DriverMode),
+            0x69 => Some(CommandCode::DisableGamesenseOled),
+            0x89 => Some(CommandCode::LoadProfile),
+            0x41 => Some(CommandCode::SetProfileVolatile),
             _ => None,
         }
     }
@@ -500,7 +525,7 @@ pub const ONBOARD_MAX_READ_LEN: usize = ONBOARD_GET_WIRE_BYTES - 1 - 5;
 /// The argument byte does not matter on hardware: an Apex 7 wired answered `90 00` and `90 01` the same
 /// way (2026-10-17). GG's chain polls with both 11 ms apart; this crate sends the whole chain
 /// ([`ONBOARD_INIT_CHAIN`]) in front of the first pull, which starts with this poll. The chain's other
-/// frames, `f4 00` ([`CommandCode::EngineStatus`]) and `6c 00 01` ([`CommandCode::OpenFiles`]), have
+/// frames, `f4 00` ([`CommandCode::EngineStatus`]) and `6c 00 01` ([`CommandCode::DriverMode`]), have
 /// unknown meanings and are sent because the read needs them (see [`OnboardInitCommand`]).
 ///
 /// The read sends this frame as the first entry of [`ONBOARD_INIT_CHAIN`] (the chain's bytes for frame 1
@@ -549,7 +574,7 @@ pub const ONBOARD_INIT_FRAME_COUNT: usize = 6;
 /// poll is answered on the wire, but the payload replies come back as scrambled bytes; with this chain
 /// sent the same read collects a profile slot (Apex 7, 2026-10-18). Which frame arms the resource buffer
 /// is not known: in the capture `f4 00` ([`CommandCode::EngineStatus`]) answers `00 01 00 …` and `6c 00 01`
-/// ([`CommandCode::OpenFiles`]) is answered by nothing, so this crate sends all six frames the way GG does.
+/// ([`CommandCode::DriverMode`]) is answered by nothing, so this crate sends all six frames the way GG does.
 /// `90 00` and `90 01` ([`CommandCode::FirmwareVersion`]) answer with the ASCII firmware version on
 /// hardware (2026-10-17).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -575,7 +600,7 @@ pub const ONBOARD_INIT_CHAIN: [OnboardInitCommand; ONBOARD_INIT_FRAME_COUNT] = [
         argument: [0x00, 0x00],
     },
     OnboardInitCommand {
-        command: CommandCode::OpenFiles,
+        command: CommandCode::DriverMode,
         argument: [0x00, 0x01],
     },
     OnboardInitCommand {
@@ -587,6 +612,43 @@ pub const ONBOARD_INIT_CHAIN: [OnboardInitCommand; ONBOARD_INIT_FRAME_COUNT] = [
         argument: [0x01, 0x00],
     },
 ];
+
+/// Number of frames in the read's closing sequence, see [`onboard_end_sequence`].
+pub const ONBOARD_END_FRAME_COUNT: usize = 4;
+
+/// `[EXPERIMENTAL]` The frames that close a profile session: `69` (Gamesense OLED off), `89 <slot + 1>` (deploy
+/// that slot), `41 00` (the profile is not volatile), `6c 00 00` (close driver mode) - the same 64-byte output
+/// reports as [`ONBOARD_INIT_CHAIN`], built with [`OnboardInitCommand`].
+///
+/// The first three are in the reference capture's frame inventory, one deploy/volatile pair behind each profile
+/// file. **`6c 00 00` is not** - it is the engine's session-closing frame, and the capture's GG was killed
+/// rather than closed, so its closing frames are not on the wire. The read sends it because its own opening
+/// chain put the device into driver mode (`6c 00 01`, [`ONBOARD_INIT_CHAIN`]): the read closes what it opened.
+/// The engine-side detail is in `docs/development/apex-7-onboard-profile-read.md` §Driver mode.
+///
+/// **These frames write to the device.** `89` makes the keyboard run the slot it names.
+#[must_use]
+pub fn onboard_end_sequence(profile: u8) -> [OnboardInitCommand; ONBOARD_END_FRAME_COUNT] {
+    [
+        OnboardInitCommand {
+            command: CommandCode::DisableGamesenseOled,
+            argument: [0x00, 0x00],
+        },
+        OnboardInitCommand {
+            command: CommandCode::LoadProfile,
+            // The engine's `succ index`: slots are 0-based in this crate, 1-based on the wire.
+            argument: [profile.saturating_add(1), 0x00],
+        },
+        OnboardInitCommand {
+            command: CommandCode::SetProfileVolatile,
+            argument: [0x00, 0x00],
+        },
+        OnboardInitCommand {
+            command: CommandCode::DriverMode,
+            argument: [0x00, 0x00],
+        },
+    ]
+}
 
 impl HidCommand for OnboardInitCommand {
     fn command_code(&self) -> CommandCode {
@@ -1867,6 +1929,57 @@ mod tests {
     }
 
     #[test]
+    fn end_sequence_matches_the_engine_tail() {
+        let builder = HidReportBuilder::new(HidDeviceType::Keyboard);
+        // The closing sequence behind a slot-2 read: OLED off, deploy with the 1-based profile id, volatile 0,
+        // close driver mode. Only the first three are in the capture's frame inventory - the fourth is the
+        // engine's session-closing frame.
+        let expected: [(u8, [u8; 2]); ONBOARD_END_FRAME_COUNT] = [
+            (0x69, [0x00, 0x00]),
+            (0x89, [0x03, 0x00]),
+            (0x41, [0x00, 0x00]),
+            (0x6c, [0x00, 0x00]),
+        ];
+        for (index, frame) in onboard_end_sequence(2).iter().enumerate() {
+            let mut buffer = [0u8; ONBOARD_OUTPUT_REPORT_SIZE];
+            let size = builder
+                .build_report(*frame, &mut buffer)
+                .expect("tail frame builds in a 64-byte report");
+            let (command, argument) = expected[index];
+            assert_eq!(size, ONBOARD_OUTPUT_REPORT_SIZE);
+            assert_eq!(buffer[0], 0x00, "report number 0, as the capture's wValue 0x0200");
+            assert_eq!(
+                &buffer[1..4],
+                &[command, argument[0], argument[1]],
+                "tail frame {} in GG's order",
+                index + 1
+            );
+            assert!(buffer[4..].iter().all(|b| *b == 0), "zero padded data stage");
+        }
+
+        // The closing frame is the driver-mode close: the chain's own command byte with the last byte cleared -
+        // the read closes the driver mode its opening chain opened.
+        let closing = onboard_end_sequence(0)[ONBOARD_END_FRAME_COUNT - 1];
+        assert_eq!(closing.command, CommandCode::DriverMode);
+        assert_eq!(closing.argument, [0x00, 0x00], "closing driver mode uses 0");
+        assert_eq!(
+            ONBOARD_INIT_CHAIN[3].command, closing.command,
+            "the chain's fourth frame and the closing frame share the command byte"
+        );
+        assert_eq!(
+            ONBOARD_INIT_CHAIN[3].argument,
+            [0x00, 0x01],
+            "the chain's frame opens driver mode (last byte 1)"
+        );
+
+        // The deploy argument is the engine's `succ index`: the five slots go out as 1..=5.
+        for slot in 0..=4u8 {
+            let deployed = onboard_end_sequence(slot)[1].argument[0];
+            assert_eq!(deployed, slot + 1, "slot {slot} deploys as profile {deployed}");
+        }
+    }
+
+    #[test]
     fn pull_frame_matches_the_capture_layout() {
         let cmd = OnboardPullCommand {
             fs_id: 0x0201,
@@ -2138,7 +2251,7 @@ mod tests {
         let apply_data = vec![0x00, 0x09]; // Apply command
         assert_eq!(builder.parse_command_code(&apply_data), Some(CommandCode::Apply));
 
-        let unknown_data = vec![0x00, 0xFF]; // Unknown command
+        let unknown_data = vec![0x00, 0xFF]; // No command in this crate parses as 0xFF
         assert_eq!(builder.parse_command_code(&unknown_data), None);
 
         let perkey_data = vec![0x00, 0x2A, 0x00, 0x01]; // Per-key command

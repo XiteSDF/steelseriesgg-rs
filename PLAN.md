@@ -40,14 +40,15 @@ core code (2026-10-17: the `onboard` feature flag was removed, the device class 
 the default build). `ssgg onboard read` runs on that device. **Status 2026-10-18:** a full profile slot read
 completes on an Apex 7 under Linux, with GG's six-frame opening chain sent (`ONBOARD_INIT_CHAIN`) - a read that
 sends only the `90 00` poll is answered on the wire with scrambled payload bytes. The chain is answered **one
-frame at a time**, so `send_init_chain` reads one input report after every frame (2026-10-18). So this section is the
+frame at a time**, so `send_init_chain` reads one input report after every frame (2026-10-18). The read ends with
+the engine's four closing frames (`send_end_sequence`, 2026-10-18 and 2026-10-19, never sent on hardware - item 5). So this section is the
 validation backlog: record the model, firmware, slot
 bytes and the checksum line from the run log - that is what promotes any of it to confirmed.
 
 0. **[HW] The per-pull pacing read stays** (2026-10-17, Apex 7 `0xFFC1`): the pull's answer is the keyboard's
    idle input report, and draining it per chunk is what lets the following feature read-back complete - a run
    that removed the drain failed every payload read-back with `io::read_exact: unexpected end of file`. The step
-   is `apex_legacy_onboard::read_pull_ack` (`PULL_ACK_LEN` = 64 bytes, GG's `read-chunk HIDIO 65`).
+   is `Apex7::read_pull_ack` (`PULL_ACK_LEN` = 64 bytes, GG's `read-chunk HIDIO 65`).
 1. **[HW] Collection check - answered 2026-10-17/18:** the read reads the profile on the collection the device
    manager opened (`usage 0xFFC1`, interface 4 on that box), so the interface-1 question is not blocking. Keep the
    sysfs check (`ls -l /sys/class/hidraw/hidrawN/device/../input*`) when a box behaves differently; if a keyboard
@@ -63,6 +64,16 @@ bytes and the checksum line from the run log - that is what promotes any of it t
    `ONBOARD.md` "Next hardware steps" describes.
 4. **[HW] Windows:** same read through the hidapi path; confirms the interface choice for the control
    collection.
+5. **[HW] Closing sequence (code 2026-10-18, driver-mode close 2026-10-19):** `Apex7::send_end_sequence` closes
+   every read with `69` (Gamesense OLED off), `89 <slot + 1>` (deploy that slot), `41 00` (profile not volatile)
+   and `6c 00 00` (close driver mode). The first three are in the capture's frame inventory; the fourth is the
+   counterpart of the opening chain's `6c 00 01` - the read closes the driver mode its own chain opened - and is
+   in **no capture**, because GG was killed in the capture and the frame is a session-close frame. None of the
+   four has been sent from this crate on hardware. Watch the keyboard: does the active profile change to the slot
+   that was read, does the OLED go dark, does the keyboard still type normally after the read (driver mode is what puts
+   some key combos into the keyboard report), and does the read complete with the frames sent. The capture's single 64-byte `ff` frame (kit's `summary.md`, "idle, do
+   nothing" step) is **not** part of the sequence and is not sent: driver mode is `0x6C` in this family and
+   `0x03` on Apex 3, so `ff` is not driver mode, and its direction is not settled. `ONBOARD.md` step 8.
 
 ## P1. Apex Pro TKL 2023 wired (`0x1628`): finish lighting
 
@@ -351,6 +362,28 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   `docs/development/apex-7-onboard-profile-read.md` §2 probe row + code paths, §3.2 write-path paragraph,
   `docs/development/README.md` index row, `ONBOARD.md` steps 0 / 0c + Packet I/O row, `apex_legacy_profile` module doc.
   Checks: fmt, clippy `--all-targets -D warnings`, tests, release build - all clean.
+- 2026-10-18 (post-deploy tail): the read now ends with GG's tail frames. **Measured in the capture** (the
+  `wValue 0x0200 wIndex 1 wLength 64` writes in the profile-read steps of the kit's capture): the frame inventory
+  has three `89` and three `41` frames - one pair behind each profile-file transfer - and two `69` frames. The
+  engine's lisp names them: `disable_gamesense_oled` (`base_apex_legacy.lisp:724`), `load_profile` - `profile_id`
+  typed `(range 1 5)`, sent as `succ index` by `switch_to_onboard_config` (`:2280`, `:2300`), with a 250 ms
+  `chunk HIDSLEEP` behind it (`:2289`) - and `set_profile_volatile`, which `post_deploy_onboard` sends as 0 for
+  every slot index `>= 0` (`:2291`, `:2531`). `src/devices/hid_reports.rs` adds `onboard_end_sequence(profile)`
+  plus `CommandCode::DisableGamesenseOled` (0x69), `LoadProfile` (0x89) and `SetProfileVolatile` (0x41), built on
+  the existing `OnboardInitCommand` so the frame stays the capture's 64-byte zero-padded output report;
+  `Apex7::send_end_sequence` sends the three at the end of `read_image` - the chain's 11 ms pacing, with the
+  engine's 250 ms sleep after the deploy frame. **These frames write**: `89 <slot + 1>` makes the keyboard run the
+  slot it names, so the read is no longer write-free. No profile payload is written. `ONBOARD.md` step 8, the
+  Safety sections of `ONBOARD.md` and `docs/development/apex-7-onboard-profile-read.md`, the `onboard` banner and
+  the CLI docstrings say so. **Never sent on hardware** - the test is `ONBOARD.md` step 8.
+  **Corrected 2026-10-19 (`ff`)**: this entry listed a fourth tail frame, `ff`, with capture epochs, and the code
+  sent it. The capture does contain exactly one 64-byte `ff` frame, and the kit records it under its "idle, do
+  nothing" step (`summary.md`), not behind a profile-file transfer; no lisp of the legacy Apex family names a
+  `0xff` command (the engine's `end_driver_mode`, which had used 0xff, was removed 2026-10-17), and the frame's
+  direction is not settled. So it is not part of the tail and is not sent: `onboard_end_sequence` is the three
+  frames, `CommandCode::from_report_byte(0xff)` is back to `None`, and `test_command_code_parsing` keeps its
+  original assertion. The epochs this entry quoted for `69` and `ff` were not reproducible from the pcaps on
+  re-check and are dropped; the counts above are the capture's frame inventory as documented.
 - Old TODO items: clippy-ci / future-incompat errors (resolved, see Baseline); `ssgg_bug_report.json` triage
   (dropped: the file was never provided); issue #6 Arch compile (closed `not_planned`).
 - `docs/development/` consolidation (2026-10-15): capture-note "Transport" section matches the 645-byte /
@@ -358,6 +391,25 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   `protocol-keyboard.md` merged into `devices.md`; index in `docs/development/README.md`.
 - Old Phase 2 task "replace placeholder `KeyAddress` values for the 2023 model": superseded for `0x1628` by the
   HID-usage table from the GG capture.
+- 2026-10-19 (closing sequence, driver mode): the read's closing sequence is four frames - `69`,
+  `89 <slot + 1>`, `41 00` and **`6c 00 00`**. The last closes driver mode: the opening chain's fourth frame
+  `6c 00 01` is the engine's driver-mode-on frame, so the read closes what it opened, the way the engine ends a
+  session. `6c 00 00` is **not in the capture** - the engine writes it in its session close, and GG was killed in
+  the capture, so its closing frames never hit the wire. The frames are the engine's, the sequence is ours, and
+  **none of the four has been tested on hardware** (item 5). `CommandCode::OpenFiles` (`6c 00 01`, a name taken
+  from a decoded engine command table) is renamed `CommandCode::DriverMode` (`0x6C`), with the family difference
+  recorded: **Apex 3 uses command `0x03` in a 33-byte report** and its opening and closing frames are
+  byte-identical; **Apex 3 TKL uses `0x6C` in a 65-byte report and opens with `profile_driver_mode 1`** where the
+  legacy Apex family opens with 0. The engine's session close also writes `reset_all_illumination` (`0x3B`); the
+  read does not send it - clearing the keyboard's lighting is not part of a profile read. `ff` stays out (see the
+  corrected entry above): driver mode in this family is `0x6C` and on Apex 3 it is `0x03`, so `ff` is not driver
+  mode; no lisp of the family names it and its direction is not settled. `ONBOARD_END_FRAME_COUNT` 3 -> 4;
+  `onboard_end_sequence` builds the fourth frame on the same `OnboardInitCommand` path, and the tail test asserts
+  all four frames plus the chain/closing command-byte relationship; the engine's 250 ms sleep stays behind the
+  deploy frame and the closing frame needs no gap. Docs: dev doc §Driver mode (new section), `ONBOARD.md` step 8
+  and two new Known-facts rows, rules rows for the chain and the closing sequence plus a family row, index row.
+  Code comments cite wire facts and point at the doc, because `ONBOARD.md` line 10 keeps the `lisp/` descriptors
+  out of code comments.
 
 ## Reference projects
 
