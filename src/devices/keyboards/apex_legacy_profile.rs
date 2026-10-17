@@ -2,7 +2,7 @@
 //!
 //! This module is the pure half of the read path: frame builders, reply parsing, payload assembly,
 //! struct decode, checksum reporting and JSON. It performs no I/O. The hardware loop is
-//! [`crate::devices::keyboards::apex_legacy_onboard`].
+//! [`crate::devices::keyboards::apex7`] (`Apex7`'s own read methods).
 //!
 //! It lives in this keyboard namespace next to its consumers, because everything
 //! in it belongs to this one platform: the reply framing, resource-buffer and window sizes, file-id

@@ -1,33 +1,113 @@
-//! [EXPERIMENTAL] Apex 7 and the rest of the legacy "macho" Apex family.
+//! Apex 7 and the boards of its legacy "macho" platform, including the `[EXPERIMENTAL]` on-board
+//! profile read.
 //!
-//! Wraps [`GenericKeyboard`] — its [`HidReportBuilder`](crate::devices::hid_reports::HidReportBuilder)
-//! and the open [`HidDevice`](hidapi::HidDevice) — and adds the on-board profile read: packet reads
-//! and writes go through [`GenericKeyboard`]'s profile transfers on the collection the device manager
-//! opened, which stays open for the whole read (`usbhid` polls a
-//! collection's interrupt endpoint only while a descriptor on that node is open, so the interrupt
-//! reports the read consumes (the `0x90` answer, the packet after each pull) have nowhere to arrive on a
-//! per-report open).
+//! Frame construction, reply parsing, payload geometry and decoding live in
+//! [`crate::devices::keyboards::apex_legacy_profile`]; every wire fact the read depends on is stated
+//! in that module's doc, once. This module is the transfer machinery: it sends GG's opening chain (which
+//! starts with the firmware poll), the pull frames, the pacing read that follows each pull and the payload
+//! reads, collects the replies and assembles a
+//! [`ProfileImage`](crate::devices::keyboards::apex_legacy_profile::ProfileImage).
 //!
-//! Frame construction, reply parsing, payload geometry and decode live in [`crate::devices::keyboards::apex_legacy_profile`].
+//! The transfers run on the handle this device already owns - the collection the device manager opened,
+//! held open for the whole read, which is what the packet methods below use. `usbhid` polls a collection's
+//! interrupt endpoint only while a descriptor on that node is open, so the interrupt reports the read
+//! consumes (the `0x90` answer and the packet after each pull) can only arrive on a handle that stays open
+//! for the whole read: measured on an Apex 7 in the 2026-10-16 Linux run capture (`linux-read.pcapng`),
+//! where a reader that opened the node per report collected nothing
+//! (`docs/development/apex-7-onboard-profile-read.md`, "Input reports: the node must be open when the
+//! report arrives"). Apex 7 wired works through hidapi: the same `SET_REPORT wValue 0x0200` and
+//! `wValue 0x0300` shapes the reference capture shows, on the collection hidapi opened.
 //!
-//! `[EXPERIMENTAL]`: the protocol is reverse-engineered from the 2026-10-15 Windows USBPcap capture of
-//! official GG on an Apex 7 (PID `0x1612`, firmware `4.16.8`), written up in
-//! `docs/development/apex-7-onboard-profile-read.md`. No read has completed on hardware from this code,
-//! and this device writes no profile: there is no read-back command for the family.
+//! `[EXPERIMENTAL]`: the read completes on hardware - a full profile slot has been read from an Apex 7
+//! under Linux (reported 2026-10-18; model, firmware and the decoded bytes are not recorded in this repo
+//! yet). What is still unproven is the decode: slot layout, checksum words and the per-slot compare
+//! against GG (`ONBOARD.md` steps 3-5). This module never writes a profile.
 
 use std::ops::{Deref, DerefMut};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
-use super::apex_legacy_onboard;
-use super::apex_legacy_profile::ProfileImage;
+use super::apex_legacy_profile::{
+    ChunkRecord, DEVICE_RESOURCE_BUFFER_LEN, GG_GAP_MS, GG_INPUT_READ_BYTES, MAX_READ_LEN, PAYLOAD_READ_LEN,
+    PROFILE_FILE_BYTES, PULLS_PER_FILE, ProfileImage, READ_REPLY_FRAMING_LEN, READ_REPORT_LEN, READS_PER_PULL,
+    ReadReply, SCHEMA_B, hex_of, parse_firmware_version, parse_read_reply_at, profile_file_id, reply_mismatch,
+    schema_of, validate_profile,
+};
 use super::{GenericKeyboard, Keyboard};
+use crate::devices::hid_reports::{
+    HidCommand, ONBOARD_FEATURE_REPORT_SIZE, ONBOARD_INIT_CHAIN, ONBOARD_INIT_FRAME_COUNT, ONBOARD_OUTPUT_REPORT_SIZE,
+    OnboardPullCommand, OnboardReadCommand,
+};
 use crate::devices::key_mapping::{KeyId, KeyMapping};
 use crate::devices::product_ids;
 use crate::devices::zone_mapping::{ZoneEffect, ZoneMapping};
 use crate::devices::{Device, DeviceType};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::rgb::{Color, PerKeyEffect};
+
+/// Report number to ask for when reading a payload read back: **0**, which is the
+/// `GET_REPORT wValue 0x0300 wIndex 1` control read the reference capture shows. The kernel writes the
+/// device's own report-ID byte into byte 0 of the buffer, so the reply's leading `03` arrives there
+/// whatever we ask for. Earlier builds asked `0x83` (the command byte as a report number), which
+/// produced `wValue 0x0383` in the 2026-10-15 Linux capture - a report number the keyboard never
+/// declared - and that run answered nothing.
+/// `[EXPERIMENTAL]`
+const READ_REPLY_ID: u8 = 0x00;
+/// Buffer size to ask the transport for when reading a payload read back: [`READ_REPORT_LEN`] (642), the
+/// capture's `GET_REPORT wValue 0x0300 wIndex 1 wLength 642`. The read side forwards this number to the
+/// device as `wLength` verbatim, so 643 is the ask that never completes (`Connection timed out`, measured
+/// 2026-10-15). The device's report-ID byte lands in buffer[0], so a full answer is `[report ID][641 bytes]`.
+/// `[EXPERIMENTAL]` The 642-byte ask answered on hardware (Apex 7, 2026-10-16 and 2026-10-18).
+const READ_REPLY_BUFFER_LEN: usize = READ_REPORT_LEN;
+/// Poll acknowledges and status reports the reply collector skips.
+const ACK_REPORT_IDS: [u8; 2] = [0x0B, 0x12];
+/// Bytes to read for the pacing packet that follows a pull. The pull has no answer of its own: the device
+/// keeps streaming its ordinary input reports on the interrupt endpoint (report `0x01`, all-zero on an idle
+/// keyboard, 1.7-3.7 ms after the pull in the capture) and GG consumes one packet per chunk as pacing, taking
+/// no bytes from it (GG's `read-chunk HIDIO 65`: report-ID slot plus 64 data bytes, see
+/// [`GG_INPUT_READ_BYTES`], which is what this asks hidapi for).
+const PULL_ACK_LEN: usize = GG_INPUT_READ_BYTES;
+/// Polls per reply collection round, in milliseconds.
+const REPLY_POLL_MS: u64 = 50;
+/// Reply budget for one payload read, in milliseconds: the feature-report poll loop runs until this
+/// expires, then the input-endpoint fallback starts. A fixed budget, not a caller-set deadline (the
+/// `--timeout` knob is gone).
+const REPLY_BUDGET_MS: u64 = 2_000;
+/// Input-report polls allowed per reply before giving up.
+const REPLY_INPUT_ATTEMPTS: u32 = 20;
+/// Reads allowed per pull before giving up (the device streams input reports, so one answer is expected).
+const PULL_ACK_ATTEMPTS: u32 = 4;
+/// Bytes to read for one opening-chain answer: GG's input read size, [`GG_INPUT_READ_BYTES`] (a report-ID
+/// slot plus 64 data bytes), which every chain answer fits (`0x6E` with the ASCII version, `0x12` with
+/// `00 01 …`).
+const CHAIN_REPLY_LEN: usize = GG_INPUT_READ_BYTES;
+/// Reads per chain frame. One: the frame that follows must not consume this frame's answer, and a frame
+/// GG leaves unanswered (`6c 00 01`) must not stall the chain.
+const CHAIN_REPLY_ATTEMPTS: u32 = 1;
+/// Size of the schema probe pull, in bytes: the 2-byte probe on the profile file of slot 0 the reference
+/// capture shows in front of the file read (`[85][00][0201][0][2]`, answered `03 0b 00`).
+const PROBE_PULL_LEN: u16 = 2;
+/// Largest input report a profile collection can return (Apex 7 profile collections report 1024).
+const INPUT_REPORT_MAX_LEN: usize = 1024;
+
+/// A payload read reply arrives as `[report ID][641 bytes]`, and a header-echoing reply spends
+/// [`READ_REPLY_FRAMING_LEN`] of those bytes on its header: that is why a read frame never asks for more
+/// than [`MAX_READ_LEN`] (636) - a larger ask could not be carried by any reply.
+const _: () = assert!(MAX_READ_LEN + READ_REPLY_FRAMING_LEN < READ_REPLY_BUFFER_LEN);
+
+// The transfers the profile protocol needs are the packet I/O of the keyboard this device owns:
+// `GenericKeyboard::write_profile_packet` for output frames (not `send_report`: its write goes through
+// `write_padded_report`, whose global hid optimizer drops a report byte-identical to one sent in the last 50 ms,
+// and the opening chain repeats `90 00` and `90 01` - see [`Apex7::write_output_command`]), the keyboard's
+// `send_feature` for the feature-report read request, and `read_profile_feature_packet` /
+// `read_profile_input_packet` for the two reply shapes - all on the handle the device manager opened, open for
+// the whole read.
+//
+// `[EXPERIMENTAL]`: on hardware the opening chain, the pull, the pacing read and the payload read-back all
+// complete on an Apex 7 (2026-10-17/18); the read request is answered by the `GET_REPORT` control-IN reply
+// the capture shows. The chain is what makes the payload readable: without it the replies come back
+// scrambled.
 
 /// Apex 7 and the boards of its platform that take the on-board profile protocol.
 ///
@@ -74,14 +154,332 @@ impl Apex7 {
     ///
     /// # Errors
     ///
-    /// Returns an error when the slot is out of range, the collection rejects a frame, or it never
-    /// answers a payload read.
+    /// Returns an error when the slot is out of range, the collection rejects a frame, it answers a schema
+    /// this read cannot decode, or it never answers a payload read.
     pub async fn read_profile(&self, profile: u8) -> Result<ProfileImage> {
-        apex_legacy_onboard::read_profile(&self.inner, profile).await
+        // The read plan blocks on reply polls and GG's inter-frame pacing, so it runs on its own thread. A
+        // scoped thread borrows this device and the scope is joined before this returns, which is the whole
+        // reason to use `std::thread::scope`: the borrow is checked, not asserted.
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| self.read_image(profile))
+                .join()
+                .map_err(|_| Error::Other("onboard read worker panicked".to_string()))?
+        })
+    }
+
+    /// Runs one read: GG's opening chain, the schema probe, then [`PULLS_PER_FILE`] pulls, each with its
+    /// pacing read and payload reads.
+    fn read_image(&self, profile: u8) -> Result<ProfileImage> {
+        validate_profile(profile)?;
+        let fs_id = profile_file_id(profile);
+        let read_len = PAYLOAD_READ_LEN as u16;
+
+        // The geometry this platform's read always has; `ssgg --debug onboard read ...` shows it before
+        // the first byte moves.
+        tracing::info!(
+            "onboard read geometry: profile slot {profile} (file {fs_id:04X}) is {PULLS_PER_FILE} pulls of \
+             {DEVICE_RESOURCE_BUFFER_LEN} bytes, {} payload reads of {PAYLOAD_READ_LEN} bytes, {} of the {} \
+             payload bytes covered",
+            PULLS_PER_FILE * READS_PER_PULL,
+            PULLS_PER_FILE * READS_PER_PULL * PAYLOAD_READ_LEN,
+            PROFILE_FILE_BYTES,
+        );
+
+        // GG's opening chain runs in front of the first pull, and the firmware version line comes from its
+        // first poll; the read does not produce a clean payload without it (see [`Self::send_init_chain`]).
+        let firmware = self.send_init_chain()?;
+
+        // GG's 2-byte probe follows, and the schema word it answers decides whether this read can decode
+        // what it is about to pull (see [`Self::probe_schema`]).
+        self.probe_schema(fs_id)?;
+
+        let mut chunks: Vec<ChunkRecord> = Vec::with_capacity(PULLS_PER_FILE);
+        for chunk in 0..PULLS_PER_FILE {
+            let file_offset = (chunk * DEVICE_RESOURCE_BUFFER_LEN) as u32;
+            let (ack_report_id, ack_hex) = self.pull_window(fs_id, file_offset, DEVICE_RESOURCE_BUFFER_LEN as u16)?;
+            let mut reads: Vec<ReadReply> = Vec::with_capacity(READS_PER_PULL);
+            for read in 0..READS_PER_PULL {
+                let buffer_offset = (read * PAYLOAD_READ_LEN) as u16;
+                reads.push(self.read_window(&format!("chunk {chunk}"), buffer_offset, read_len)?);
+            }
+            chunks.push(ChunkRecord {
+                index: chunk,
+                fs_id,
+                file_offset,
+                ack_report_id,
+                ack_hex,
+                reads,
+            });
+        }
+
+        ProfileImage::assemble(profile, chunks).map(|image| image.with_firmware(firmware))
+    }
+
+    /// Runs GG's 2-byte probe in front of the file read and checks the schema word it answers.
+    ///
+    /// The probe is a pull of [`PROBE_PULL_LEN`] bytes at file offset 0 - the shape the capture shows for
+    /// the profile file of slot 0 - followed by one payload read at buffer offset 0, whose answer starts
+    /// with the schema word (`03 0b 00 …` on the reference device, i.e. [`SCHEMA_B`]).
+    ///
+    /// The read decodes [`SCHEMA_B`] only, so any other answer stops the read here: it is the cheapest
+    /// place to find out (nothing has been written, the device has only been asked to pull), and a schema
+    /// this decoder cannot lay out would surface later as a profile whose checksum never matches.
+    /// `[EXPERIMENTAL]`: the schema word has been read on hardware (Apex 7, 2026-10-18).
+    fn probe_schema(&self, fs_id: u16) -> Result<u16> {
+        self.pull_window(fs_id, 0, PROBE_PULL_LEN)?;
+        let reply = self.read_window("schema probe", 0, PAYLOAD_READ_LEN as u16)?;
+        let schema = schema_of(&reply.data);
+        if schema != SCHEMA_B {
+            return Err(Error::Profile(format!(
+                "device answers schema {schema:#06x} at payload offset 0; this read is implemented for \
+                 {SCHEMA_B:#06x} (schema B) and measured on hardware with that schema only"
+            )));
+        }
+        Ok(schema)
+    }
+
+    /// Fills the device's resource buffer with one pull frame and drains the pacing packet that follows it.
+    ///
+    /// Returns the pacing packet's report ID and hex text for the chunk record (`(0, "")` when nothing
+    /// arrived, which is logged, not an error - see [`Self::read_pull_ack`]).
+    fn pull_window(&self, fs_id: u16, file_offset: u32, size: u16) -> Result<(u8, String)> {
+        let path = self.collection_label();
+        self.write_output_command(OnboardPullCommand {
+            fs_id,
+            file_offset,
+            size,
+        })
+        .map_err(|e| {
+            Error::DeviceCommunication(format!(
+                "onboard pull frame (file {fs_id:04X} offset {file_offset} size {size}) on {path} rejected: {e}"
+            ))
+        })?;
+        match self.read_pull_ack() {
+            Some(report) if !report.is_empty() => Ok((report[0], hex_of(&report))),
+            _ => {
+                tracing::debug!(
+                    "no input report arrived after the pull for file {fs_id:04X} offset {file_offset} on {path}"
+                );
+                Ok((0, String::new()))
+            }
+        }
+    }
+
+    /// Requests one payload window and collects its reply, then paces the way GG's read spec paces
+    /// ([`GG_GAP_MS`] between transfers).
+    fn read_window(&self, label: &str, buffer_offset: u16, read_len: u16) -> Result<ReadReply> {
+        let path = self.collection_label();
+        self.write_feature_command(OnboardReadCommand {
+            buffer_offset,
+            size: read_len,
+        })
+        .map_err(|e| {
+            Error::DeviceCommunication(format!(
+                "onboard read request for {label} buffer offset {buffer_offset} on {path} rejected: {e}"
+            ))
+        })?;
+        let reply = self.read_reply_report(PAYLOAD_READ_LEN)?;
+        let parsed = parse_read_reply_at(&reply, read_len, READ_REPLY_FRAMING_LEN)?;
+        if let Some(msg) = reply_mismatch(&parsed, buffer_offset, read_len) {
+            tracing::debug!("onboard read: {msg}");
+        }
+        if GG_GAP_MS > 0 {
+            std::thread::sleep(Duration::from_millis(GG_GAP_MS));
+        }
+        Ok(parsed)
+    }
+
+    /// Sends GG's opening chain: [`ONBOARD_INIT_CHAIN`], six 64-byte output frames
+    /// ([`crate::devices::hid_reports::OnboardInitCommand`]) [`GG_GAP_MS`] apart - `90 00`, `90 01`,
+    /// `f4 00`, `6c 00 01`, `90 00`, `90 01` - draining one interrupt report after **every** frame, and
+    /// returning the firmware version the first `90 00` answers.
+    ///
+    /// The chain is not optional. On hardware a read that sends only the `90 00` poll
+    /// ([`crate::devices::hid_reports::OnboardFirmwareVersionCommand`]) is answered on the wire and the
+    /// payload replies come back as scrambled bytes; with this chain the same read collects a profile slot
+    /// (Apex 7, 2026-10-18). Which frame arms the resource buffer is unknown - `f4 00` answers `00 01 00 …`
+    /// in the capture and `6c 00 01` answers nothing - so all six frames go, the way GG sends them. A
+    /// refused frame fails the read: a keyboard that drops the chain cannot be read cleanly.
+    ///
+    /// **Each frame is answered only after the previous answer has been read.** Measured 2026-10-18: a
+    /// chain run that drained just the first answer saw the answers of `90 00` and `90 01` and nothing from
+    /// frame 3 on, with the frames on the wire. GG's session keeps the interrupt stream read throughout (its
+    /// read spec issues a `read-chunk HIDIO 65` per transfer), so a read per frame matches GG's pattern; the
+    /// flow-control reading (the device's command queue keeps one answer pending) is inference, not measured.
+    fn send_init_chain(&self) -> Result<Option<String>> {
+        let path = self.collection_label();
+        let mut firmware = None;
+        for (index, frame) in ONBOARD_INIT_CHAIN.iter().enumerate() {
+            self.write_output_command(*frame).map_err(|e| {
+                Error::DeviceCommunication(format!(
+                    "onboard opening chain frame {} of {ONBOARD_INIT_FRAME_COUNT} ({}) on {path} rejected: {e}",
+                    index + 1,
+                    frame.description()
+                ))
+            })?;
+            if GG_GAP_MS > 0 {
+                // The answer lands 1-3 ms after the frame, and GG's own cadence is one frame per GG_GAP_MS.
+                std::thread::sleep(Duration::from_millis(GG_GAP_MS));
+            }
+            let answer = self.read_interrupt_report(CHAIN_REPLY_LEN, CHAIN_REPLY_ATTEMPTS);
+            match answer.as_deref() {
+                Some(report) if index == 0 => firmware = parse_firmware_version(report),
+                Some(report) => {
+                    tracing::debug!(
+                        "onboard opening chain frame {} on {path} answered {}",
+                        index + 1,
+                        hex_of(&report[..report.len().min(8)])
+                    );
+                }
+                None => {
+                    tracing::debug!("onboard opening chain frame {} on {path} answered nothing", index + 1);
+                }
+            }
+        }
+        if firmware.is_none() {
+            tracing::debug!("onboard opening chain on {path} answered no firmware version");
+        }
+        Ok(firmware)
+    }
+
+    /// Collects one payload reply: the feature-report reply the capture shows, then the interrupt
+    /// endpoint. Returns `[report ID][payload…]`, the shape `parse_read_reply_at` consumes.
+    fn read_reply_report(&self, payload_len: usize) -> Result<Vec<u8>> {
+        let path = self.collection_label();
+        let stop = Instant::now() + Duration::from_millis(REPLY_BUDGET_MS);
+        let mut empty_answers = 0u32;
+        let mut last_error: Option<Error> = None;
+
+        while Instant::now() < stop {
+            match self.read_profile_feature_packet(READ_REPLY_ID, READ_REPLY_BUFFER_LEN) {
+                Ok(report) if reply_carries_payload(&report, payload_len) => return Ok(report),
+                Ok(report) => {
+                    empty_answers = empty_answers.saturating_add(1);
+                    tracing::debug!(
+                        "onboard read on {path}: feature reply of {} bytes (report {:#04X}) carries no \
+                         payload of {payload_len} bytes",
+                        report.len(),
+                        report.first().copied().unwrap_or(0),
+                    );
+                }
+                Err(e) => {
+                    last_error = Some(Error::DeviceCommunication(format!("payload read on {path}: {e}")));
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(REPLY_POLL_MS));
+        }
+
+        let mut input_attempts = 0u32;
+        while input_attempts < REPLY_INPUT_ATTEMPTS {
+            input_attempts = input_attempts.saturating_add(1);
+            match self.read_profile_input_packet(INPUT_REPORT_MAX_LEN, REPLY_POLL_MS) {
+                Ok(report) if reply_carries_payload(&report, payload_len) => {
+                    tracing::debug!(
+                        "onboard read: reply arrived on {path} as a {}-byte input report",
+                        report.len()
+                    );
+                    return Ok(report);
+                }
+                Ok(report) if !is_ack(&report) => {
+                    tracing::debug!(
+                        "onboard read on {path}: ignored a {}-byte input report (report {:#04X})",
+                        report.len(),
+                        report.first().copied().unwrap_or(0),
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::debug!("onboard read on {path}: input report read failed: {e}");
+                    break;
+                }
+            }
+        }
+
+        let reason = match last_error {
+            Some(e) => e.to_string(),
+            None => format!("{empty_answers} feature reply answer(s) carried no payload of {payload_len} bytes"),
+        };
+        Err(Error::DeviceCommunication(format!(
+            "no profile payload reply from {path}: {reason}"
+        )))
+    }
+
+    /// Reads the pacing packet that follows a pull. Its content is not looked at - GG's read specifiers keep
+    /// zero bytes of it - and the pull has no answer of its own: the device keeps streaming its ordinary
+    /// input reports on the interrupt endpoint (report `0x01`, all-zero on an idle keyboard, 1.7-3.7 ms after
+    /// the pull in the capture). The drain is load-bearing: a run on 2026-10-17 that skipped it failed every
+    /// payload read-back.
+    fn read_pull_ack(&self) -> Option<Vec<u8>> {
+        self.read_interrupt_report(PULL_ACK_LEN, PULL_ACK_ATTEMPTS)
+    }
+
+    /// Identity of the collection the read runs on, for logs and read errors.
+    fn collection_label(&self) -> String {
+        let info = self.inner.info();
+        format!(
+            "vid {:04x}:pid {:04x} interface {} ({})",
+            info.vendor_id, info.product_id, info.interface_number, info.path
+        )
+    }
+
+    /// Polls the collection for one non-empty report of at most `len` bytes.
+    fn read_interrupt_report(&self, len: usize, attempts: u32) -> Option<Vec<u8>> {
+        let path = self.collection_label();
+        for _ in 0..attempts {
+            match self.read_profile_input_packet(len, REPLY_POLL_MS) {
+                Ok(report) if !report.is_empty() => return Some(report),
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::debug!("onboard input-report poll on {path}: {e}");
+                    break;
+                }
+            }
+        }
+        None
+    }
+
+    /// Serializes a command through the keyboard's [`HidReportBuilder`] and sends it as an output report:
+    /// report number 0 plus the 64-byte data stage, i.e. `SET_REPORT wValue 0x0200 wLength 64` as the
+    /// reference capture shows (the kernel takes the report number out of the data stage, so the buffer is
+    /// one byte longer than the wire).
+    ///
+    /// This is [`GenericKeyboard::write_profile_packet`], deliberately not [`GenericKeyboard::send_report`]:
+    /// `send_report` writes through [`crate::devices::write_padded_report`], whose global
+    /// [`crate::devices::HidOptimizer`] skips any report byte-identical to one sent in the last 50 ms, and the
+    /// opening chain contains such frames - `90 00` and `90 01` each appear twice, 20 ms apart on the read's
+    /// 5 ms cadence - so on `send_report` frames 5 and 6 never reach the device and the keyboard sees a
+    /// four-frame chain. The 2026-10-18 measurement that made the chain load-bearing had all six frames on the
+    /// wire, and `ONBOARD.md` step 0 is open on which frames the keyboard needs.
+    fn write_output_command<C: HidCommand>(&self, command: C) -> Result<()> {
+        let mut buffer = [0u8; ONBOARD_OUTPUT_REPORT_SIZE];
+        let len = self.inner.report_builder.build_report(command, &mut buffer)?;
+        if len != buffer.len() {
+            return Err(Error::DeviceCommunication(format!(
+                "onboard output report built {len} of {} bytes",
+                buffer.len()
+            )));
+        }
+        self.inner.write_profile_packet(&buffer)
+    }
+
+    /// Serializes a command through the keyboard's [`HidReportBuilder`] and sends it as a feature report on
+    /// report number 0 (`SET_REPORT wValue 0x0300 wLength 642` in the capture).
+    fn write_feature_command<C: HidCommand>(&self, command: C) -> Result<()> {
+        let mut buffer = [0u8; ONBOARD_FEATURE_REPORT_SIZE];
+        let len = self.inner.report_builder.build_report(command, &mut buffer)?;
+        if len != buffer.len() {
+            return Err(Error::DeviceCommunication(format!(
+                "onboard feature report built {len} of {} bytes",
+                buffer.len()
+            )));
+        }
+        self.inner.send_feature(&buffer, ONBOARD_FEATURE_REPORT_SIZE)
     }
 }
 
-// Deref gives the Device trait methods of the wrapped keyboard.
+// Delegate Device trait.
 impl Deref for Apex7 {
     type Target = GenericKeyboard;
 
@@ -138,9 +536,25 @@ crate::impl_keyboard_with_delegation!(Apex7, {
     }
 });
 
+/// A reply carries a payload when it is long enough to hold `payload_len` bytes behind its report-ID
+/// byte and its report ID is not a poll acknowledge.
+fn reply_carries_payload(report: &[u8], payload_len: usize) -> bool {
+    if report.is_empty() {
+        return false;
+    }
+    !ACK_REPORT_IDS.contains(&report[0]) && report.len() > payload_len
+}
+
+fn is_ack(report: &[u8]) -> bool {
+    report.first().is_some_and(|id| ACK_REPORT_IDS.contains(id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::devices::keyboards::apex_legacy_profile::{
+        MAX_PROFILE_INDEX, PROFILE_FS_BASE, profile_file_id, validate_profile,
+    };
 
     #[test]
     fn the_family_predicate_selects_the_device() {
@@ -151,6 +565,32 @@ mod tests {
                 "PID {pid:#06x} is not the legacy platform discovery wraps in Apex7"
             );
         }
+    }
+
+    #[test]
+    fn reply_carries_payload_needs_room_behind_the_report_id() {
+        assert!(reply_carries_payload(&[0x03, 0x01, 0x02], 2));
+        assert!(!reply_carries_payload(&[0x03, 0x01], 2));
+        assert!(!reply_carries_payload(&[0x0B, 0x0a, 0x00, 0x00], 2));
+        assert!(!reply_carries_payload(&[0x12, 0x00], 2));
+        assert!(!reply_carries_payload(&[], 2));
+    }
+
+    #[test]
+    fn the_read_geometry_is_the_captured_one() {
+        assert_eq!(profile_file_id(0), PROFILE_FS_BASE);
+        assert_eq!(
+            PULLS_PER_FILE * DEVICE_RESOURCE_BUFFER_LEN,
+            12_288,
+            "the fixed read covers the payload of the reference capture"
+        );
+        assert_eq!(
+            READS_PER_PULL,
+            DEVICE_RESOURCE_BUFFER_LEN / PAYLOAD_READ_LEN,
+            "the fixed read drains the buffer in 512-byte windows"
+        );
+        assert!(validate_profile(MAX_PROFILE_INDEX).is_ok());
+        assert!(validate_profile(MAX_PROFILE_INDEX + 1).is_err());
     }
 
     mod onboard {
