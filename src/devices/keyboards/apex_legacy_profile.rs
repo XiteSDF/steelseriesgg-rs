@@ -524,6 +524,9 @@ pub fn payload_len_for_schema(schema: u16) -> Result<usize> {
     match schema {
         SCHEMA_A => Ok(PAYLOAD_LEN_A),
         SCHEMA_B => Ok(PAYLOAD_LEN_B),
+        0 => Err(Error::Profile(
+            "this slot has no saved profile: the schema word is 0x0000 (GG writes 0x000A / 0x000B)".to_string(),
+        )),
         other => Err(Error::Profile(format!(
             "profile schema 0x{other:04X} is not one of the supported schemas 0x{SCHEMA_A:04X} / 0x{SCHEMA_B:04X}"
         ))),
@@ -542,12 +545,23 @@ pub fn compute_checksum(data: &[u8]) -> u32 {
 }
 
 /// One `key_mapping` entry: a function selector plus its four key codes.
+///
+/// The binding classification is what makes a stock profile readable: GG's factory defaults bind
+/// every key to itself (`0x51` + its own HID code), and GG's own writes leave unused slots as
+/// `0x00 00 00 00 00`. Both mean "this key types normally", so they are reported as `self` and
+/// `none`; only anything else is a `custom` binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct KeyMapping {
+    /// Mapping slot this entry belongs to (table index = GG's mapping offset).
+    pub offset: usize,
+    /// Key this slot belongs to, from [`OFFSET_TO_HID`] (`null` = the device has no key at that slot).
+    pub hid_code: Option<u8>,
     /// Function selector (`0x00` = key deactivated, `0x71` = macro, `0x62` = META, …).
     pub function: u8,
     /// Function selector as a name, for the human-readable summary only.
     pub function_name: String,
+    /// `self` = bound to its own key, `none` = all-zero slot, `custom` = a real remap.
+    pub binding: &'static str,
     /// Four raw key-code bytes, hex.
     pub key_codes: String,
 }
@@ -597,8 +611,8 @@ pub struct RapidTap {
     pub pairs: Vec<RapidTapPair>,
 }
 
-/// One Rapid Tap pair.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// One Rapid Tap pair (GG's `onboard_rapid_tap_pair`: five bytes).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RapidTapPair {
     /// First HID code.
     pub hid_1: u8,
@@ -608,6 +622,8 @@ pub struct RapidTapPair {
     pub mode: u8,
     /// High bit of the mode byte, reported separately.
     pub report_both_keys: bool,
+    /// The two reserved bytes of the on-board pair, hex.
+    pub reserved: String,
 }
 
 /// Summary of the macro data block (never dumped in full by the JSON writer).
@@ -670,26 +686,31 @@ pub struct OnboardProfile {
 
 /// Layout of the decoded blocks.
 ///
-/// The Windows engine's own decoder for this payload is a sequential struct stream: schema word,
-/// 24-byte name, the 57-byte lighting block, the META toggle byte, then four mapping tables of
-/// 4-byte entries (128 buttons, 2 wheels, 128 button META, 2 wheel META). The offsets below are
-/// that stream read through. Everything from the GUID on is inferred: the engine's decoder ends at
-/// the checksum word, and no read-back shows where the OLED and macro blocks sit in a payload.
+/// This is the engine's own payload struct, read through: `profile_all_settings_struct` (schema A)
+/// and `profile_all_settings_schema_b_struct` (schema B) in `lisp/apex_7.lisp` and
+/// `lisp/base_apex_legacy.lisp`, whose byte comments give every offset below. `key_mapping` is
+/// `function: uint8` plus `key_codes: bytearray (size 4)` - five bytes per mapping entry, not four;
+/// `onboard_rapid_tap_pair` is five bytes. A real read image of the factory profile (slot 0, schema
+/// B, firmware 4.16.3) agrees: at stride 5, 112 of the 128 base slots are `0x51` + the slot's own
+/// HID code and the 5th byte is 0 in all 128, and the trailing checksum verifies over
+/// `payload[0..11692]` (STM32 CRC-32 = `0xAE57B9DC`, measured 2026-10-19).
 ///
-/// `[EXPERIMENTAL]` - the mapping counts (128/2/128/2) and the entry stride (4) are GG's; the
-/// offsets of the OLED, Rapid Tap and macro blocks are a sequential guess that fills the payload.
-/// The engine's start-location table for a neighbouring Apex 7 model names 644 and 2088 for the
-/// OLED and macro blocks, which matches neither of the two layouts above.
+/// Schema A: … wheel META (1375) → OLED (1385) → macro (2025) → GUID (11625) → 3 pad → CRC (11644).
+/// Schema B: … wheel META (1375) → OLED (1385) → Rapid Tap (2025) → macro (2076) → GUID (11676) →
+/// CRC (11692), with no padding word.
+///
+/// `[EXPERIMENTAL]`: the field meanings inside each block are still reverse-engineered; the block
+/// offsets and strides are GG's own struct spec and match a hardware read.
 /// Offset of the Rapid Tap enable byte (schema [`SCHEMA_B`]).
 pub const RAPID_TAP_ENABLE_OFFSET: usize = OLED_OFFSET + OLED_LEN;
 /// Offset of the Rapid Tap pair table (schema [`SCHEMA_B`]).
 pub const RAPID_TAP_PAIRS_OFFSET: usize = RAPID_TAP_ENABLE_OFFSET + 1;
-/// Bytes of the Rapid Tap block: one enable byte plus ten 4-byte pairs.
+/// Bytes of the Rapid Tap block: one enable byte plus ten 5-byte pairs.
 pub const RAPID_TAP_LEN: usize = 1 + 10 * RAPID_TAP_PAIR_LEN;
-/// Stride of one Rapid Tap pair.
-pub const RAPID_TAP_PAIR_LEN: usize = 4;
-/// Offset of the OLED pixel block.
-pub const OLED_OFFSET: usize = GUID_OFFSET + GUID_LEN + GUID_PADDING_LEN;
+/// Stride of one Rapid Tap pair (`onboard_rapid_tap_pair`).
+pub const RAPID_TAP_PAIR_LEN: usize = 5;
+/// Offset of the OLED pixel block, right behind the wheel META table in both schemas.
+pub const OLED_OFFSET: usize = WHEEL_META_MAPPINGS_OFFSET + WHEEL_MAPPING_COUNT * KEY_MAPPING_LEN;
 /// Length of the OLED pixel block.
 pub const OLED_LEN: usize = 640;
 /// Offset of the button mapping table.
@@ -723,12 +744,10 @@ pub fn profile_name(data: &[u8]) -> String {
 pub const META_TOGGLE_HID_OFFSET: usize = LIGHTING_OFFSET + LIGHTING_LEN;
 /// Length of the GUID field.
 pub const GUID_LEN: usize = 16;
-/// Offset of the 16-byte profile GUID.
-pub const GUID_OFFSET: usize = WHEEL_META_MAPPINGS_OFFSET + WHEEL_MAPPING_COUNT * KEY_MAPPING_LEN;
-/// Bytes between the GUID and the checksum in a schema [`SCHEMA_A`] payload.
+/// Bytes between the GUID and the checksum in a schema [`SCHEMA_A`] payload (schema B has none).
 pub const GUID_PADDING_LEN: usize = 3;
-/// Mapping table entry stride, GG's `apex_7_key_mapping_entry_size`.
-pub const KEY_MAPPING_LEN: usize = 4;
+/// Mapping table entry stride: GG's `key_mapping` (`function` byte + 4 `key_codes` bytes).
+pub const KEY_MAPPING_LEN: usize = 5;
 /// Buttons in each mapping table, GG's decode loop.
 pub const BUTTON_MAPPING_COUNT: usize = 128;
 /// Wheels in each mapping table.
@@ -737,6 +756,61 @@ pub const WHEEL_MAPPING_COUNT: usize = 2;
 pub const MACRO_OFFSET_A: usize = OLED_OFFSET + OLED_LEN;
 /// Offset of the macro block behind Rapid Tap (schema [`SCHEMA_B`]).
 pub const MACRO_OFFSET_B: usize = RAPID_TAP_PAIRS_OFFSET + 10 * RAPID_TAP_PAIR_LEN;
+/// Offset of the 16-byte profile GUID, behind the macro block (schema [`SCHEMA_A`]).
+pub const GUID_OFFSET_A: usize = MACRO_OFFSET_A + MACRO_DATA_LEN;
+/// Offset of the 16-byte profile GUID, behind the macro block (schema [`SCHEMA_B`]).
+pub const GUID_OFFSET_B: usize = MACRO_OFFSET_B + MACRO_DATA_LEN;
+
+/// Offset of the GUID block for a schema word; any other schema reads it where schema B puts it.
+#[must_use]
+pub fn guid_offset_for_schema(schema: u16) -> usize {
+    if schema == SCHEMA_B {
+        GUID_OFFSET_B
+    } else {
+        GUID_OFFSET_A
+    }
+}
+
+/// GG's `device-offset-lookup-table`, inverted: mapping slot → HID usage code, `0xFF` = the device
+/// has no key in that slot. Slots 120..127 belong to the `0xF1..0xF8` function codes, which are not
+/// keys; they carry the wheel and media bindings of the profile.
+pub const OFFSET_TO_HID: [u8; BUTTON_MAPPING_COUNT] = [
+    41, 53, 43, 57, 225, 224, 255, 255, 58, 30, 20, 4, 100, 227, 72, 97, 59, 31, 26, 22, 29, 226, 74, 87, 60, 32, 8, 7,
+    27, 255, 75, 92, 61, 33, 21, 9, 6, 139, 83, 93, 62, 34, 23, 10, 25, 44, 84, 94, 63, 35, 28, 11, 5, 138, 85, 133,
+    64, 36, 24, 13, 17, 136, 86, 89, 65, 37, 12, 14, 16, 255, 77, 90, 66, 38, 18, 15, 54, 230, 78, 91, 67, 39, 19, 51,
+    55, 231, 95, 99, 68, 45, 47, 52, 56, 240, 96, 88, 69, 46, 48, 50, 135, 228, 255, 255, 70, 137, 49, 40, 229, 80,
+    255, 255, 71, 42, 73, 76, 82, 81, 79, 98, 241, 242, 243, 244, 245, 246, 247, 248,
+];
+
+/// Inverse of [`OFFSET_TO_HID`]: HID usage code → mapping slot, `0xFF` = not a mapping key. GG's
+/// `device-offset-lookup-table` verbatim, with its `-1` entries (which the engine stores as 255)
+/// kept as 255 here.
+pub const HID_TO_OFFSET: [u8; 256] = [
+    255, 255, 255, 255, 11, 52, 36, 27, 26, 35, 43, 51, 66, 59, 67, 75, 68, 60, 74, 82, 10, 34, 19, 42, 58, 44, 18, 28,
+    50, 20, 9, 17, 25, 33, 41, 49, 57, 65, 73, 81, 107, 0, 113, 2, 45, 89, 97, 90, 98, 106, 99, 83, 91, 1, 76, 84, 92,
+    3, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 14, 114, 22, 30, 115, 70, 78, 118, 109, 117, 116, 38,
+    46, 54, 62, 23, 95, 63, 71, 79, 31, 39, 47, 86, 94, 15, 119, 87, 12, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    55, 255, 100, 61, 105, 53, 37, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 5, 4, 21,
+    13, 101, 108, 77, 85, 255, 255, 255, 255, 255, 255, 255, 255, 93, 120, 121, 122, 123, 124, 125, 126, 127, 255, 255,
+    255, 255, 255, 255, 255,
+];
+
+/// The key a mapping slot belongs to (`None` when the device has no key in that slot).
+#[must_use]
+pub fn offset_to_hid(offset: usize) -> Option<u8> {
+    OFFSET_TO_HID.get(offset).copied().filter(|&hid| hid != 0xFF)
+}
+
+/// The mapping slot a key belongs to (`None` for keys the profile does not bind, e.g. `0x65` Select).
+#[must_use]
+pub fn hid_to_offset(hid: u8) -> Option<usize> {
+    let slot = HID_TO_OFFSET[usize::from(hid)];
+    if slot == 0xFF { None } else { Some(usize::from(slot)) }
+}
 
 /// Function selector names, for summaries only; `0x00` means the key is deactivated.
 pub fn function_name(function: u8) -> &'static str {
@@ -798,8 +872,8 @@ pub fn hex_of(data: &[u8]) -> String {
     out
 }
 
-/// Decode one `key_mapping` entry.
-fn key_mapping(data: &[u8], at: usize) -> Result<KeyMapping> {
+/// Decode one `key_mapping` entry and classify it against the slot's own key.
+fn key_mapping(data: &[u8], at: usize, offset: usize) -> Result<KeyMapping> {
     if at + KEY_MAPPING_LEN > data.len() {
         return Err(Error::Profile(format!(
             "key mapping at {at} needs {} bytes, the payload has {}",
@@ -807,16 +881,31 @@ fn key_mapping(data: &[u8], at: usize) -> Result<KeyMapping> {
             data.len()
         )));
     }
+    let codes = &data[at + 1..at + KEY_MAPPING_LEN];
+    let function = data[at];
+    let own = offset_to_hid(offset);
+    // GG's two "types normally" encodings: an all-zero slot (what GG itself writes) and the factory
+    // default, a combo key whose only code is the slot's own key.
+    let binding = if codes.iter().all(|b| *b == 0) && function == 0 {
+        "none"
+    } else if function == 0x51 && own.is_some_and(|hid| codes[0] == hid) && codes[1..].iter().all(|b| *b == 0) {
+        "self"
+    } else {
+        "custom"
+    };
     Ok(KeyMapping {
-        function: data[at],
-        function_name: function_name(data[at]).to_string(),
-        key_codes: hex_of(&data[at + 1..at + KEY_MAPPING_LEN]),
+        offset,
+        hid_code: own,
+        function,
+        function_name: function_name(function).to_string(),
+        binding,
+        key_codes: hex_of(codes),
     })
 }
 
 fn key_table(data: &[u8], at: usize, count: usize) -> Result<Vec<KeyMapping>> {
     (0..count)
-        .map(|i| key_mapping(data, at + i * KEY_MAPPING_LEN))
+        .map(|i| key_mapping(data, at + i * KEY_MAPPING_LEN, i))
         .collect()
 }
 
@@ -877,14 +966,17 @@ pub fn decode(data: &[u8]) -> Result<OnboardProfile> {
                     hid_2: data[at + 1],
                     mode: data[at + 2] & 0x7f,
                     report_both_keys: data[at + 2] & 0x80 != 0,
+                    reserved: hex_of(&data[at + 3..at + RAPID_TAP_PAIR_LEN]),
                 }
             })
             .collect(),
     });
 
     let macro_offset = if schema_b { MACRO_OFFSET_B } else { MACRO_OFFSET_A };
-    let guid_offset = GUID_OFFSET;
-    let crc_offset = data.len() - 4;
+    let guid_offset = guid_offset_for_schema(schema);
+    // The checksum word is the last four bytes of the schema's payload, not of the image: a read
+    // image is padded out to whole resource buffers behind it.
+    let crc_offset = checksum_offset(expected);
     let computed = compute_checksum(&data[..crc_offset]);
     let stored = u32::from_le_bytes([
         data[crc_offset],
@@ -1015,6 +1107,15 @@ mod tests {
         data[META_TOGGLE_HID_OFFSET] = 0x62;
         data[LIGHTING_OFFSET + 6] = 0xFF; // lock key colour red
         data[LIGHTING_OFFSET + 53..LIGHTING_OFFSET + 57].copy_from_slice(&1500u32.to_le_bytes());
+        // GG's factory default layer: every mapped key bound to itself (`0x51` + its own HID code).
+        for offset in 0..BUTTON_MAPPING_COUNT {
+            let Some(hid) = offset_to_hid(offset) else {
+                continue;
+            };
+            let at = BUTTON_MAPPINGS_OFFSET + offset * KEY_MAPPING_LEN;
+            data[at] = 0x51;
+            data[at + 1] = hid;
+        }
         data[BUTTON_MAPPINGS_OFFSET + KEY_MAPPING_LEN] = 0x04; // second mapping: left shift
         data[BUTTON_MAPPINGS_OFFSET + KEY_MAPPING_LEN + 1] = 0xE0;
         if schema == SCHEMA_B {
@@ -1030,8 +1131,8 @@ mod tests {
         };
         data[macro_offset] = 0x01;
         data[macro_offset + 1] = 0xA7;
-        data[GUID_OFFSET] = 0xAB;
-        let crc_offset = len - 4;
+        data[guid_offset_for_schema(schema)] = 0xAB;
+        let crc_offset = checksum_offset(len);
         let computed = compute_checksum(&data[..crc_offset]);
         data[crc_offset..].copy_from_slice(&computed.to_le_bytes());
         data
@@ -1311,6 +1412,98 @@ mod tests {
         assert_eq!(profile.guid_padding, "00 00 00");
         assert!(profile.crc_ok, "stored crc matches the computed one");
         assert_eq!(profile.crc_region_len, PAYLOAD_LEN_A - 4);
+    }
+
+    #[test]
+    fn block_offsets_are_the_engine_struct_stream() {
+        // GG's `profile_all_settings_schema_b_struct` byte comments (apex_7.lisp).
+        assert_eq!(KEY_MAPPING_LEN, 5, "function byte + four key codes");
+        assert_eq!(BUTTON_MAPPINGS_OFFSET, 85);
+        assert_eq!(WHEEL_MAPPINGS_OFFSET, 725);
+        assert_eq!(BUTTON_META_MAPPINGS_OFFSET, 735);
+        assert_eq!(WHEEL_META_MAPPINGS_OFFSET, 1375);
+        assert_eq!(
+            OLED_OFFSET, 1385,
+            "OLED sits behind the wheel META table, not behind the GUID"
+        );
+        assert_eq!(RAPID_TAP_ENABLE_OFFSET, 2025);
+        assert_eq!(RAPID_TAP_PAIRS_OFFSET, 2026);
+        assert_eq!(RAPID_TAP_PAIR_LEN, 5, "onboard_rapid_tap_pair has two reserved bytes");
+        assert_eq!(MACRO_OFFSET_A, 2025);
+        assert_eq!(MACRO_OFFSET_B, 2076);
+        assert_eq!(GUID_OFFSET_A, 11_625);
+        assert_eq!(GUID_OFFSET_B, 11_676);
+        assert_eq!(checksum_offset(PAYLOAD_LEN_A), 11_644);
+        assert_eq!(checksum_offset(PAYLOAD_LEN_B), 11_692);
+        assert_eq!(
+            GUID_OFFSET_A + GUID_LEN + GUID_PADDING_LEN,
+            checksum_offset(PAYLOAD_LEN_A),
+            "schema A pads three bytes between the GUID and the checksum; schema B does not"
+        );
+        assert_eq!(GUID_OFFSET_B + GUID_LEN, checksum_offset(PAYLOAD_LEN_B));
+    }
+
+    #[test]
+    fn factory_defaults_are_not_reported_as_bindings() {
+        let profile = decode(&synthetic_payload(SCHEMA_B)).unwrap();
+        let kinds: Vec<&str> = profile.button_mappings.iter().map(|m| m.binding).collect();
+        assert_eq!(kinds[0], "self", "slot 0 is Esc bound to Esc");
+        assert_eq!(
+            profile.button_mappings[0].hid_code,
+            Some(0x29),
+            "slot 0 belongs to Esc per GG's offset table"
+        );
+        assert_eq!(kinds[1], "custom", "the synthetic remap is the only custom binding");
+        let unmapped = [6usize, 7, 29, 69, 102, 103, 110, 111];
+        for offset in unmapped {
+            assert_eq!(profile.button_mappings[offset].binding, "none");
+            assert_eq!(
+                profile.button_mappings[offset].hid_code, None,
+                "slot {offset} is a slot this keyboard has no key for"
+            );
+        }
+        let customs = kinds.iter().filter(|k| **k == "custom").count();
+        assert_eq!(customs, 1, "a stock profile reads as a stock profile");
+    }
+
+    #[test]
+    fn offset_and_hid_tables_invert_each_other() {
+        let mut mapped = 0;
+        for offset in 0..BUTTON_MAPPING_COUNT {
+            if let Some(hid) = offset_to_hid(offset) {
+                mapped += 1;
+                assert_eq!(hid_to_offset(hid), Some(offset), "slot {offset} <-> 0x{hid:02X}");
+            }
+        }
+        assert_eq!(mapped, 120, "GG's device-offset-lookup-table maps 120 of the 128 slots");
+        assert_eq!(
+            hid_to_offset(0x65),
+            None,
+            "Select has no mapping slot, so it cannot be remapped on-board"
+        );
+        assert_eq!(hid_to_offset(0xF1), Some(120), "the function-code slots");
+    }
+
+    #[test]
+    fn checksum_is_the_payload_tail_not_the_image_tail() {
+        // A read image is padded with whole resource buffers behind the payload; the checksum word
+        // belongs to the payload, so decoding an image must not read the padding as the checksum.
+        let mut image = vec![0u8; PROFILE_FILE_BYTES];
+        let payload = synthetic_payload(SCHEMA_B);
+        image[..payload.len()].copy_from_slice(&payload);
+        let profile = decode(&image).expect("an image is a payload with a padded tail");
+        assert!(
+            profile.crc_ok,
+            "stored {:08X} computed {:08X}",
+            profile.crc_stored, profile.crc_computed
+        );
+        assert_eq!(profile.crc_region_len, PAYLOAD_LEN_B - 4);
+        assert_eq!(profile.macro_data.len, MACRO_DATA_LEN);
+        assert_eq!(
+            profile.guid,
+            hex_of(&payload[GUID_OFFSET_B..GUID_OFFSET_B + GUID_LEN]),
+            "the GUID comes from the payload, not from the padding"
+        );
     }
 
     #[test]

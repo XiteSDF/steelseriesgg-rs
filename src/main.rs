@@ -808,8 +808,9 @@ async fn cmd_profile(action: ProfileAction) -> Result<()> {
 /// [EXPERIMENTAL] Read the on-board profile of a legacy Apex keyboard.
 ///
 /// Reads only. The protocol is reverse-engineered from the GG USBPcap capture written up in
-/// docs/development/apex-7-onboard-profile-read.md; a full slot read has completed on an Apex 7, the
-/// decoded layout and the checksum words are still unverified.
+/// docs/development/apex-7-onboard-profile-read.md; a full slot read has completed on an Apex 7 and
+/// the decoded layout and checksum now match GG's payload struct and a hardware read of the factory
+/// profile. Field meanings inside the OLED and macro blocks are still reverse-engineered.
 async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAction) -> Result<()> {
     use steelseries_gg::devices::keyboards::apex_legacy_profile::{hex_dump, profile_json, schema_of, to_json};
 
@@ -957,7 +958,9 @@ fn print_onboard_banner() {
     println!("[EXPERIMENTAL] legacy Apex on-board profile read");
     println!("  reverse-engineered from one GG USBPcap capture; it only reads - it sends no frames that");
     println!("  change anything on the keyboard.");
-    println!("  slot layout, checksums and the decode are still unverified - compare a read with GG.");
+    println!("  the slot layout and checksum match GG's payload struct and a hardware read of the factory");
+    println!("  profile (CRC verified); the field meanings inside the OLED and macro blocks are still");
+    println!("  reverse-engineered - compare a read with GG.");
     println!("  watch the keyboard while it runs: if lighting flickers, Ctrl-C stops the read.");
     println!();
 }
@@ -994,18 +997,37 @@ fn print_onboard_profile(profile: &steelseries_gg::devices::keyboards::apex_lega
 
     println!("schema: {} (0x{:04X})", profile.schema_name, profile.schema);
     println!(
-        "checksum: stored {:08X}, computed {:08X} over {} bytes, match: {}",
-        profile.crc_stored, profile.crc_computed, profile.crc_region_len, profile.crc_ok
+        "checksum: stored {:08X}, computed {:08X} over the {}-byte payload (offsets 0..{}), match: {}",
+        profile.crc_stored, profile.crc_computed, profile.crc_region_len, profile.crc_region_len, profile.crc_ok
     );
     println!("name: {:?} (raw bytes {})", profile.name, profile.name_hex);
-    println!("guid: {:?} (schema A padding {})", profile.guid, profile.guid_padding);
+    println!(
+        "guid: {:?} ({} padding after the GUID{})",
+        profile.guid,
+        profile.guid_padding,
+        if profile.guid_padding.is_empty() {
+            ": schema B has none"
+        } else {
+            ""
+        }
+    );
     println!("META toggle HID code: 0x{:02X}", profile.meta_toggle_hid);
     println!(
-        "mappings: {} buttons, {} wheels, {} button META, {} wheel META",
+        "mappings: {} buttons, {} wheels, {} button META, {} wheel META, {} bytes per entry",
         profile.button_mappings.len(),
         profile.wheel_mappings.len(),
         profile.button_meta_mappings.len(),
-        profile.wheel_meta_mappings.len()
+        profile.wheel_meta_mappings.len(),
+        steelseries_gg::devices::keyboards::apex_legacy_profile::KEY_MAPPING_LEN
+    );
+    println!(
+        "bindings: {} custom on the base layer, {} on the META layer (GG's factory default - a key bound to itself - and empty slots are not counted)",
+        profile.button_mappings.iter().filter(|m| m.binding == "custom").count(),
+        profile
+            .button_meta_mappings
+            .iter()
+            .filter(|m| m.binding == "custom")
+            .count()
     );
 
     let l = &profile.lighting;
