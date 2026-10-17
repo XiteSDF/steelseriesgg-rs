@@ -52,8 +52,8 @@ open when the report arrives"); a session handle was tried and reverted 2026-10-
 feature flag was removed on 2026-10-15; experimental paths are labelled in code and docs instead of feature-gated.
 Writes that could change persistent device state (the on-board profile) stay unwired until a read-back exists and the
 user approves the first write. The same rule covers the legacy Apex family: `ssgg onboard` writes **no profile
-payload** — `CMD_PUSH_PAYLOAD` stays unsent and no `03 00` block is sent — and `read` requires `--yes`
-(because it is reverse-engineered protocol code writing request frames to a raw device node). Since 2026-10-19
+payload** — `CMD_PUSH_PAYLOAD` stays unsent and no `03 00` block is sent. The `--yes` confirmation gate on
+`read` was dropped 2026-10-19. Since 2026-10-19
 the read writes **nothing** to the keyboard: GG's opening chain and closing sequence are not sent (measured not
 needed). The engine's deploy frame `0x89` is the one frame in that family that would change device state, it
 stays a named builder sent by nothing, and `ONBOARD.md` step 8 keeps its untested keyboard-effect questions.

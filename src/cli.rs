@@ -201,7 +201,7 @@ pub(crate) enum Commands {
 /// chain and closing sequence, so neither is sent).
 #[derive(Subcommand)]
 pub(crate) enum OnboardAction {
-    /// Read one profile from a legacy Apex keyboard. Requires --yes.
+    /// Read one profile from a legacy Apex keyboard. Read-only: it writes no profile.
     Read(OnboardReadArgs),
 
     /// Decode a profile image saved by an earlier read (no device, no hardware).
@@ -214,9 +214,10 @@ pub(crate) enum OnboardAction {
 /// (5 ms) and read with the reply framing the reference capture shows.
 #[derive(clap::Args)]
 pub(crate) struct OnboardReadArgs {
-    /// On-board profile slot (0-4). The pull count, buffer size, window size, pacing and reply framing
-    /// are protocol constants, not options.
-    #[arg(short, long, default_value = "0")]
+    /// GG's config number, 1-5 (`Config 1` .. `Config 5`). The read addresses slot `N - 1`, which is
+    /// the file GG pulls as `0x020N`. The pull count, buffer size, window size, pacing and reply
+    /// framing are protocol constants, not options.
+    #[arg(short, long, default_value = "1", value_parser = clap::value_parser!(u8).range(1..=5))]
     pub(crate) profile: u8,
 
     /// Device as `vid:pid` (default: the first Apex 7-family keyboard found). The read runs on that
@@ -224,17 +225,14 @@ pub(crate) struct OnboardReadArgs {
     #[arg(short, long)]
     pub(crate) device: Option<String>,
 
-    /// Confirm the device read (required: experimental protocol code, talks to hardware)
-    #[arg(short, long)]
-    pub(crate) yes: bool,
-
-    /// Write the assembled profile image here
-    #[arg(short, long)]
+    /// Where to write the JSON decode report. Default: the profile name the read returns, sanitized
+    /// (`Config 1` -> `config_1.json`), in the current directory
+    #[arg(short, long, value_name = "FILE")]
     pub(crate) out: Option<PathBuf>,
 
-    /// Write the JSON report here
-    #[arg(long)]
-    pub(crate) json: Option<PathBuf>,
+    /// Also write the assembled profile image, as bytes. No default: bytes are only wanted with a path
+    #[arg(long, value_name = "FILE")]
+    pub(crate) bin: Option<PathBuf>,
 
     /// Hex-dump the whole profile image to stdout
     #[arg(long)]
@@ -247,12 +245,13 @@ pub(crate) struct OnboardReadArgs {
 
 #[derive(clap::Args)]
 pub(crate) struct OnboardDecodeArgs {
-    /// Profile image file (assembled by `ssgg onboard read --out`)
+    /// Profile image file (assembled by `ssgg onboard read --bin`)
     pub(crate) file: PathBuf,
 
-    /// Write the JSON decode report here
-    #[arg(short, long)]
-    pub(crate) json: Option<PathBuf>,
+    /// Where to write the JSON decode report. Default: the profile name in the image, sanitized
+    /// (`Config 1` -> `config_1.json`), in the current directory
+    #[arg(short, long, value_name = "FILE")]
+    pub(crate) out: Option<PathBuf>,
 
     /// Hex-dump profile bytes
     #[arg(long)]

@@ -145,6 +145,8 @@ impl Apex7 {
     }
 
     /// Read one on-board profile slot (slots `0..=4`; everything else about the read is fixed geometry).
+    /// GG names the same slots `Config 1` .. `Config 5`, and `ssgg onboard read --profile N` passes
+    /// `N - 1` here.
     ///
     /// The read plan polls the device and sleeps for GG's inter-frame pacing, so it runs on a scoped
     /// thread and blocks this task's thread until the read finishes (about 2 s for a slot on the
@@ -180,9 +182,10 @@ impl Apex7 {
         // The geometry this platform's read always has; `ssgg --debug onboard read ...` shows it before
         // the first byte moves.
         tracing::info!(
-            "onboard read geometry: profile slot {profile} (file {fs_id:04X}) is {PULLS_PER_FILE} pulls of \
+            "onboard read geometry: profile slot {profile} = GG config {} (file {fs_id:04X}) is              {PULLS_PER_FILE} pulls of \
              {DEVICE_RESOURCE_BUFFER_LEN} bytes, {} payload reads of {PAYLOAD_READ_LEN} bytes, {} of the {} \
              payload bytes covered",
+            profile + 1,
             PULLS_PER_FILE * READS_PER_PULL,
             PULLS_PER_FILE * READS_PER_PULL * PAYLOAD_READ_LEN,
             PROFILE_FILE_BYTES,

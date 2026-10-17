@@ -117,7 +117,9 @@ pub const PAYLOAD_READ_LEN: usize = 512;
 pub const PULLS_PER_FILE: usize = 12;
 /// File id of profile slot 0; slot `n` is this plus `n`.
 pub const PROFILE_FS_BASE: u16 = 0x0201;
-/// Highest profile slot the device offers (`0..=4`), a fixed slot count of the platform.
+/// Highest profile slot the device offers (`0..=4`), a fixed slot count of the platform. GG names the
+/// same slots `Config 1` .. `Config 5`, and `ssgg onboard` takes that number: `--profile N` reads slot
+/// `N - 1`, the file it pulls as `0x020N`.
 pub const MAX_PROFILE_INDEX: u8 = 4;
 /// File id of the per-profile lighting config of slot 0.
 pub const LIGHTING_FS_BASE: u16 = 0x0301;
@@ -1053,6 +1055,36 @@ pub fn summary_line(profile: &OnboardProfile) -> String {
     )
 }
 
+/// File stem a profile name yields for a dump file: lowercase ASCII alphanumerics kept, every other
+/// character `_`, leading and trailing `_` dropped. `None` when nothing survives it - an unsaved slot
+/// answers with a zero name, and a name in another alphabet has no ASCII letters.
+#[must_use]
+pub fn profile_file_stem(name: &str) -> Option<String> {
+    let stem: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let stem = stem.trim_matches('_');
+    (!stem.is_empty()).then(|| stem.to_string())
+}
+
+/// Default file name for a profile dump: the profile name (`Config 1` -> `config_1.json`), or GG's config
+/// number when the read carries no name to build one from (`Config 3` answers a zero name, and the
+/// fallback is `profile_config_3.json`).
+#[must_use]
+pub fn profile_dump_name(name: &str, config: u8) -> String {
+    profile_file_stem(name).map_or_else(
+        || format!("profile_config_{config}.json"),
+        |stem| format!("{stem}.json"),
+    )
+}
+
 /// JSON representation of a decoded profile.
 pub fn profile_json(profile: &OnboardProfile) -> Result<String> {
     serde_json::to_string_pretty(profile).map_err(|e| Error::Profile(format!("serialize profile: {e}")))
@@ -1630,6 +1662,26 @@ mod tests {
         assert_eq!(image_diff(&a, &b), None);
         assert_eq!(image_diff(&a, &c), Some(3 * PAYLOAD_READ_LEN));
         assert_eq!(a.diff(&c), Some(3 * PAYLOAD_READ_LEN));
+    }
+
+    #[test]
+    fn dump_names_come_from_the_profile_name() {
+        assert_eq!(profile_file_stem("Config 1").as_deref(), Some("config_1"));
+        assert_eq!(profile_file_stem("  My Profile 23  ").as_deref(), Some("my_profile_23"));
+        assert_eq!(
+            profile_file_stem("Config 1 (v2)!").as_deref(),
+            Some("config_1__v2"),
+            "trailing separators are dropped"
+        );
+        assert_eq!(profile_file_stem(""), None, "an unsaved slot answers with a zero name");
+        assert_eq!(profile_file_stem("Конфиг"), None, "no ASCII to build a name from");
+        assert_eq!(
+            profile_file_stem("Конфиг 1").as_deref(),
+            Some("1"),
+            "a digit survives on its own"
+        );
+        assert_eq!(profile_dump_name("Config 1", 1), "config_1.json");
+        assert_eq!(profile_dump_name("", 3), "profile_config_3.json");
     }
 
     #[test]

@@ -816,10 +816,13 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
 
     match action {
         OnboardAction::Read(args) => {
-            let profile = args.profile;
-            if !args.yes {
-                return require_yes("read the on-board profile");
-            }
+            // GG names its configs 1-5; the read addresses the 0-based slot behind that number.
+            let Some(slot) = args.profile.checked_sub(1) else {
+                return Err(Error::InvalidConfig(format!(
+                    "config {} is not a config number: use 1-5 (GG's Config 1 .. Config 5)",
+                    args.profile
+                )));
+            };
             let Some(manager) = manager.as_mut() else {
                 return Err(Error::Other("the on-board profile read needs a device".to_string()));
             };
@@ -835,8 +838,8 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
             println!();
 
             if args.verify {
-                let first = keyboard.read_onboard_profile(profile).await?;
-                let second = keyboard.read_onboard_profile(profile).await?;
+                let first = keyboard.read_onboard_profile(slot).await?;
+                let second = keyboard.read_onboard_profile(slot).await?;
                 let diff = first
                     .data
                     .iter()
@@ -852,33 +855,31 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
                     }
                     None => println!("the two reads agree on all {} profile bytes", first.data.len()),
                 }
-                if let Some(out) = args.out.as_ref() {
-                    secure_write_async(out.clone(), first.data.clone()).await?;
-                    let second_path = out.with_extension("second.bin");
+                let json = onboard_json_path(args.out.as_deref(), &first.data, args.profile);
+                secure_write_async(json.clone(), to_json(&first)?).await?;
+                println!("JSON report of the first read written to {}", json.display());
+                if let Some(bin) = args.bin.as_ref() {
+                    secure_write_async(bin.clone(), first.data.clone()).await?;
+                    let second_path = bin.with_extension("second.bin");
                     secure_write_async(second_path.clone(), second.data.clone()).await?;
                     println!(
                         "both profile images written: {} and {}",
-                        out.display(),
+                        bin.display(),
                         second_path.display()
                     );
                 }
-                if let Some(json) = args.json.as_ref() {
-                    secure_write_async(json.clone(), to_json(&first)?).await?;
-                    println!("JSON report of the first read written to {}", json.display());
-                }
             } else {
-                let image = keyboard.read_onboard_profile(profile).await?;
+                let image = keyboard.read_onboard_profile(slot).await?;
                 print_onboard_image(&image, &label);
                 if args.hex {
                     print!("{}", hex_dump(&image.data, 0, image.data.len()));
                 }
-                if let Some(out) = args.out.as_ref() {
-                    secure_write_async(out.clone(), image.data.clone()).await?;
-                    println!("profile image written to {}", out.display());
-                }
-                if let Some(json) = args.json.as_ref() {
-                    secure_write_async(json.clone(), to_json(&image)?).await?;
-                    println!("JSON report written to {}", json.display());
+                let json = onboard_json_path(args.out.as_deref(), &image.data, args.profile);
+                secure_write_async(json.clone(), to_json(&image)?).await?;
+                println!("JSON report written to {}", json.display());
+                if let Some(bin) = args.bin.as_ref() {
+                    secure_write_async(bin.clone(), image.data.clone()).await?;
+                    println!("profile image written to {}", bin.display());
                 }
             }
         }
@@ -895,10 +896,9 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
                 let to = (from + args.hex_len).min(data.len());
                 print!("{}", hex_dump(&data, from, to));
             }
-            if let Some(json) = args.json.as_ref() {
-                secure_write_async(json.clone(), profile_json(&profile)?).await?;
-                println!("JSON decode report written to {}", json.display());
-            }
+            let json = onboard_json_path(args.out.as_deref(), &data, 1);
+            secure_write_async(json.clone(), profile_json(&profile)?).await?;
+            println!("JSON decode report written to {}", json.display());
         }
     }
 
@@ -946,12 +946,16 @@ fn parse_vid_pid(spec: &str) -> Option<(u16, u16)> {
     ))
 }
 
-fn require_yes(what: &str) -> Result<()> {
-    println!("Refusing to {what} without --yes:");
-    println!("  this is experimental, reverse-engineered protocol code that talks to a keyboard through");
-    println!("  a raw device node. It reads the on-board profile and writes nothing.");
-    println!("Add --yes when you accept that.");
-    Ok(())
+/// Where an on-board dump is written: `--out` when given, otherwise the file name the profile name
+/// yields (`Config 1` -> `config_1.json`), read out of the image itself. `config` is GG's config number
+/// (1-5), used only when the image carries no name to build a file name from.
+fn onboard_json_path(given: Option<&std::path::Path>, data: &[u8], config: u8) -> std::path::PathBuf {
+    use steelseries_gg::devices::keyboards::apex_legacy_profile::{profile_dump_name, profile_name};
+
+    given.map_or_else(
+        || std::path::PathBuf::from(profile_dump_name(&profile_name(data), config)),
+        |path| path.to_path_buf(),
+    )
 }
 
 fn print_onboard_banner() {

@@ -19,7 +19,8 @@ Moved from `PLAN.md`:
 
 Implemented 2026-10-15 from the GG capture: a `0x90` firmware-version poll, `0x85` pulls,
 `0x83` payload reads, checksum, payload decode, `ssgg onboard read|decode`. Only the profile slot is
-selectable (`--profile 0..4`); the geometry is compile-time constants. The 13-byte "pacing frame" earlier
+selectable (`--profile 1..5`, GG's `Config 1` .. `Config 5`: `--profile N` reads slot `N - 1`, the file
+GG pulls as `0x020N`); the geometry is compile-time constants. The 13-byte "pacing frame" earlier
 versions sent is not in the capture and was removed. GG's six-frame opening chain (`90 00`,
 `90 01`, `f4 00`, `6c 00 01`, `90 00`, `90 01`) was removed on 2026-10-17, restored on 2026-10-18 when a read
 with only the `90 00` poll answered with scrambled payload bytes, and **removed again on 2026-10-19: measured
@@ -29,8 +30,12 @@ Every protocol byte in it is `[EXPERIMENTAL]`. **The read changes nothing on the
 firmware poll, the probe, the pulls and the payload reads. Wire format, layout table and open questions:
 `docs/development/apex-7-onboard-profile-read.md`.
 
-**Read status (2026-10-18, updated 2026-10-19):** `ssgg onboard read --yes --profile N` completes a full slot
-read on an Apex 7 under Linux. That closes the transport questions (steps 1, 1a, 1b) and the framing question
+**Read status (2026-10-18, updated 2026-10-19):** `ssgg onboard read --profile N` completes a full slot
+read on an Apex 7 under Linux, and the slot-0 read image (`p0.bin`, wired, firmware 4.16.3) **decodes with a
+checksum match** (`AE57B9DC` over 11692 bytes) once the layout was corrected to GG's payload struct: 5-byte
+mapping entries, OLED at 1385, Rapid Tap at 2025/2026 with 5-byte pairs, macro at 2076, GUID at 11676, the
+checksum word at the payload tail (11692) and not at the tail of the 12288-byte image. The read decodes as
+112 self-bound keys, 12 empty slots and 4 shipped media-cluster bindings on the base layer. That closes the transport questions (steps 1, 1a, 1b) and the framing question
 (step 2). It is reported without the run log, so record the model, firmware, slot contents and the checksum
 line from the run here before anything is promoted to confirmed - the label stays until then. The 2026-10-18
 run had GG's chain and closing sequence in it; the runs have neither, and the chain question
@@ -131,19 +136,20 @@ capture's replies show - `--reply-header` and the short-read framing sweep are g
    elsewhere is a code change, not a flag. The profile bytes a read collects are the evidence: a schema word
    (`0b 00`) with a readable name (`Config 1` .. `Config 5`) behind the report-ID byte is framing 0; anything
    else is recorded here and becomes the constant.
-3. **[HW] Slot by slot, then the checksum line:** the read of one slot works (2026-10-17/18). Remaining:
-`--profile 1..4` - every read
-   prints that slot's schema word. Schema `0x000A` / `0x000B` means the decode applies; anything else is a
-   third schema - record it, do not guess. A `checksum: stored ..., computed ..., match:
-   true` would validate the CRC and the 12 x 1024 split at once; the capture does not predict it, because the
-   payload-read reply is a file head that repeats the head (`0b 00` + the name) and never the requested
-   window - 241 GG reads give 33 distinct payloads, 179 of them all zero.
-4. **[HW] Reproducibility:** `ssgg onboard read --yes --profile 0 --out /tmp/p0b.bin --verify`. Pacing is
+3. **[HW] Slot by slot, then the checksum line:** the read of one slot works (2026-10-17/18) and its checksum
+matches (2026-10-19, slot 0). Remaining:
+`--profile 2..5` - every read
+   prints that slot's schema word. Schema `0x000A` / `0x000B` means the decode applies; schema `0x0000` is a
+   slot GG never saved and `decode` says so. A `checksum: ... match: true` validates the CRC and the
+   12 x 1024 split at once (slot 0: true).
+4. **[HW] Reproducibility:** `ssgg onboard read --profile 1 --bin /tmp/p1.bin --verify`. Pacing is
    `GG_GAP_MS`, a constant: a gap ladder needs a code change, and whatever the keyboard tolerates is recorded
    there.
-5. **[HW] Layout check:** decode `/tmp/p0.bin` (`ssgg onboard decode`) and compare name, lighting colours,
-   key mappings and macro count with what GG shows for that slot. This is the only way to settle the inferred
-   offsets (GUID, OLED, Rapid Tap, macro) and the 260-byte tail.
+5. **[HW] Layout check:** the offsets are settled (GG's payload struct, hardware-verified by the CRC, 2026-10-19,
+   §Payload layout in `docs/development/apex-7-onboard-profile-read.md`). Remaining: compare name, lighting
+   colours, key mappings and macro count with what **GG shows** for the same slot in its UI - the field
+   meanings inside the OLED and macro blocks are still unverified, and only GG can say whether the decoded
+   colours and mappings are what it displays.
 6. **[HW] Windows:** same read through the hidapi path (no udev rule needed); confirms the interface choice for
    the control collection.
 7. Only after 1-4: extend to the lighting files (`0x0301`-`0x0305`, reply report ID `0x03`), then promote what
@@ -185,7 +191,9 @@ capture's replies show - `--reply-header` and the short-read framing sweep are g
 | Packet I/O | `src/devices/keyboards/mod.rs`: `GenericKeyboard` does the profile packet I/O on the `device` handle it already owns - `connected_device` (the one handle accessor, shared with the lighting sends, same "Device not connected" message), no cache, so repeated frames go out; `send_report` runs the hid optimizer, which drops a report identical to one sent in the last 50 ms - see the write-path note in step 0), `send_feature`, `read_profile_feature_packet`, `read_profile_input_packet`, core code; `Apex7` runs the read plan - `read_image`, `firmware_version`, `probe_schema`, `pull_window`, `read_window` - on its own handle on a scoped thread (`std::thread::scope`, 2026-10-18, which replaced `spawn_blocking` fed by an `unsafe` transmute to `&'static` - the scoped borrow is checked, and the read blocks the task's thread for its ~2 s). The plan takes the slot only: `strict` (no flag fed it) and the `deadline` reply-budget plumbing (always `None`) are gone, one payload read has one fixed `REPLY_BUDGET_MS`. No transport type: `OnboardTransport` with its `HandleTransport` and `PathTransport`, and the per-call path-open helpers (`send_feature_report_raw`, `read_feature_report_raw`, `write_output_report_raw`, `read_input_report_raw`) were all removed on 2026-10-17; Apex 7 wired works through hidapi |
 | Keyboard device | `src/devices/keyboards/apex7.rs`: `Apex7` wraps `GenericKeyboard` (its `HidReportBuilder` and the open `HidDevice`) and runs the read on its own handle; `onboard_family(pid)` selects `0x1612`, `0x1614`, `0x1616`, `0x1618` and `discovery::open_keyboard` wraps those PIDs in it - the read path is core code, labelled `[EXPERIMENTAL]`, so a family board keeps standard lighting in every build |
 | Device API | `Keyboard::supports_onboard_profile`, `Keyboard::read_onboard_profile` (`[EXPERIMENTAL]`, core code); every other keyboard answers "not supported" |
-| CLI | `ssgg onboard read / decode` (`src/cli.rs`, `src/main.rs`); `read --profile 0..4` runs on the `Apex7` device (its own handle, `--device vid:pid` selects the keyboard) and takes `--out`, `--json`, `--hex`, `--verify`, `--yes` - every other number of the read is a protocol constant, not a flag, and the CLI prints none of them; the geometry - slot, file id, pulls, payload reads - is logged by the read loop at `info` level, so `ssgg --debug onboard read` shows it before the first transfer; `decode` works on a saved image and touches no device |
+| CLI | `ssgg onboard read / decode` (`src/cli.rs`, `src/main.rs`); `read --profile 1..5` takes GG's config number (`Config 1` .. `Config 5`) and addresses slot `N - 1` - the library API stays 0-based, the read's `--debug` geometry line prints both - and runs on the `Apex7` device (its own handle, `--device vid:pid` selects the keyboard) and takes `-o/--out` (JSON path, default: the profile name it reads - `Config 1` -> `config_1.json`), `--bin` (raw image, only when a path is given), `--hex`, `--verify`; there is no `--yes` (2026-10-19: the read sends request frames only, so no confirmation gate) and no `--json` (the JSON dump is the default output). Every other number of the read is a protocol constant, not a flag, and the CLI prints none of them; the geometry - slot, file id, pulls, payload reads - is logged by the read loop at `info` level, so `ssgg --debug onboard read` shows it before the first transfer; `decode` works on a saved image and touches no device |
+| Capture kit | `scripts/capture-onboard-kit/`: the capture script (explicit device list) and the analysis script that rebuilds a slot from a control transfer and reports its checksum line; see its `README.md` |
+| Profile JSON editor | `tools/profile-gui/`: browser page, no build step, no deps - opens the `read --json` / `decode --json` dumps, edits them on a drawn ANSI board (keys bound through GG's `device-offset-lookup-table`, embedded as `HID2OFF`/`OFF2HID`), classifies every mapping as `self` / `none` / `custom` so a factory profile reads as having no remaps, and saves JSON with unknown fields preserved; `selftest.mjs` (109 checks) and `preview.mjs` run it under node. JSON only: no device access, no checksum recompute; see its `README.md` |
 
 Two facts from the first Linux run (2026-10-15, Apex 7 `the hidraw node`) that shape the transport:
 

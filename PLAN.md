@@ -43,9 +43,16 @@ finding that a read with only the `90 00` poll answers with scrambled payload by
 runs, which collect a slot with none of GG's chain frames and none of its closing frames on the
 wire. `ONBOARD_INIT_CHAIN`/`send_init_chain` and the four closing frames
 (`send_end_sequence`, 2026-10-18 and 2026-10-19) are out of the code: **the read sends request frames only and
-changes nothing on the keyboard**. So this section is the
-validation backlog: record the model, firmware, slot
-bytes and the checksum line from the run log - that is what promotes any of it to confirmed.
+changes nothing on the keyboard**. **Updated 2026-10-19: the slot-0 read image decodes with a checksum match** (`p0.bin`, wired Apex 7,
+firmware 4.16.3, `AE57B9DC` over `payload[0..11692]`), which settles the payload layout: 5-byte
+`key_mapping` entries (the decoder used 4-byte entries, so the fourth code of every mapping was cut off
+and the GUID, OLED, Rapid Tap and macro offsets all sat 128+ bytes early), OLED at 1385, Rapid Tap at
+2025/2026 with 5-byte pairs, macro at 2076, GUID at 11676, and the checksum word at the **payload** tail,
+not at the tail of the 12288-byte read image (the image is padded with whole resource buffers).
+`decode` reports each mapping as `self` / `none` / `custom`, so the factory slot reads as 112 self-bound
+keys, 12 empty slots and 4 shipped media-cluster bindings - no remaps on the base layer. So this section
+is the validation backlog: record the model, firmware, slot bytes and the checksum line from the run log -
+that is what promotes any of it to confirmed.
 
 0. **[HW] The per-pull pacing read stays** (2026-10-17, Apex 7 `0xFFC1`): the pull's answer is the keyboard's
    idle input report, and draining it per chunk is what lets the following feature read-back complete - a run
@@ -60,9 +67,9 @@ bytes and the checksum line from the run log - that is what promotes any of it t
    reads collect profile bytes with, matching the capture. The geometry, pacing, single `90 00` poll and reply framing are
    constants (`ReadConfig` and its CLI tunables are gone), so a keyboard that anchors its payload elsewhere is a code
    change measured from a `--debug` capture first; the `90` poll answer in the log confirms the device path.
-3. **[HW] Slots `1..4`, then `--verify`** (slot 0 reads since 2026-10-17/18): `ssgg onboard read --yes --profile N
-   --out /tmp/pN.bin --json /tmp/pN.json`; every read
-   prints that slot's schema word. Pacing is the `GG_GAP_MS` constant, so a gap ladder is a code change. Record the checksum line and the decoded layout as
+3. **[HW] Configs `2..5`, then `--verify`** (Config 1 reads and decodes with `crc_ok: true` since 2026-10-19; 2026-10-19 also made `--profile` take GG's 1-based config number): `ssgg onboard read --profile N
+   --bin /tmp/pN.bin`; every read
+   prints that slot's schema word (`0x0000` means the slot was never saved). Pacing is the `GG_GAP_MS` constant, so a gap ladder is a code change. Record the checksum line and the decoded layout as
    `ONBOARD.md` "Next hardware steps" describes.
 4. **[HW] Windows:** same read through the hidapi path; confirms the interface choice for the control
    collection.
@@ -220,6 +227,19 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
 
 ## Done or dropped (do not redo)
 
+- 2026-10-19: on-board **payload layout** fixed against the Windows engine's own struct (`apex_7.lisp`
+  `onboard_profile_payload`) and verified on hardware by the checksum: 5-byte `key_mapping` entries
+  (function byte + 4 key codes, not 4 bytes total), 5-byte Rapid Tap pairs, OLED block at 1385, wheel
+  META at 1375, macro at 2076 (schema B), GUID at 11676, schema padding only in schema A, 3-byte
+  `rapid_tap_enable`, and the CRC-32/STM32 word at the payload tail (`11644` / `11692`) - the read image is
+  padded with whole resource buffers behind the payload, which is why every earlier CRC candidate over the
+  image tail disagreed. Added to the JSON: per-entry `offset`/`hid_code` (from GG's
+  `device-offset-lookup-table`, embedded as `OFFSET_TO_HID`/`HID_TO_OFFSET`, 120 of 128 slots), `binding`
+  = `self` / `none` / `custom`, and a `profile.summary` line that counts only `custom` as remaps. GUI
+  (`tools/profile-gui`) matches: neutral caps for self-bound and empty keys, a Custom-bindings list, four
+  code bytes per entry. Slot-0 factory read of a wired Apex 7 (firmware 4.16.3) decodes as 112 self-bound,
+  12 empty, 4 media-cluster entries, `crc_ok: true`; its JSON is
+  `tools/profile-gui/examples/sample-identity.json` (name and block heads blanked).
 - Issue #120 audio hang (5 s timeout in `src/audio/pulse.rs`).
 - Protocol-docs reconciliation, capability-label cleanup, Windows pollrate "unsupported on this driver" notice,
   SignalRGB research (it drives devices directly via its own plugins; no SteelSeries bytes in public docs).
@@ -421,8 +441,8 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   the chain, and the command codes nothing sends any more (`EngineStatus 0xF4`, `DisableGamesenseOled 0x69`,
   `SetProfileVolatile 0x41`). This supersedes the entry above (the four-frame closing sequence, never sent on
   hardware) and the 2026-10-18 chain result: the read now sends request frames only and **changes nothing on the
-  keyboard**; `read --yes` stays required because it is reverse-engineered protocol code writing to a raw device
-  node. `CommandCode::DriverMode` (`0x6C`) and `CommandCode::LoadProfile` (`0x89`, a device write - it makes the
+  keyboard**, and `read` needs no confirmation flag: 2026-10-19 dropped `--yes` (with `require_yes`, its last
+  user) because the read sends request frames only. `CommandCode::DriverMode` (`0x6C`) and `CommandCode::LoadProfile` (`0x89`, a device write - it makes the
   keyboard run the slot) stay in `hid_reports` as named builders, sent by nothing. `OnboardFirmwareVersionCommand`
   is typed with a source byte - `FirmwareSource::Keyboard` (`90 00`) answers the firmware running the keyboard,
   `FirmwareSource::Led` (`90 01`) the LED controller's; both read on an Apex 7, and the capture has both
@@ -432,6 +452,21 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   read does not need (new), header / transfers table / §Write path / §Driver mode / §Safety / open questions
   updated, `ONBOARD.md` steps 0, 0b, 8 superseded with a new facts section, rule-file chain and closing rows
   rewritten as "GG sends it, ssgg does not", index row and item 5 updated.
+- 2026-10-19 (profile JSON GUI): `tools/profile-gui/` - a dependency-free browser page that opens the
+  `ssgg onboard read` / `onboard decode` JSON dumps (written by default, named from the profile name in the
+  image), shows the slot on a drawn ANSI keyboard,
+  edits per-key mappings (base and META, function byte + `key_codes`), the lighting block, Rapid Tap
+  pairs, the four wheel mappings and the profile name, and saves the JSON with fields it does not know
+  preserved. Keys bind through the legacy family's HID -> offset table (`base_apex_legacy.lisp`,
+  `device-offset-lookup-table` inverted - the same inverse GG's own `onboard-to-config-button-mapping`
+  uses), so the editor addresses `button_mappings` indices, shows each key's offset on the cap, and
+  draws the 17 mapped codes with no place on an ANSI shape in a strip, so no offset is hidden. Function
+  names mirror `function_name` in `apex_legacy_profile.rs`. **JSON-only**: no device access, `crc_*`
+  never recomputed, the `oled`/`macro_data` payload summaries cannot be rebuilt (the panel says so).
+  Checks: `node tools/profile-gui/selftest.mjs` (84 checks, incl. a fake-DOM pass that builds the real
+  page and clicks it, and the real capture dump when `p0.json` is in the repo), `node tools/profile-gui/preview.mjs`
+  renders the board to SVG. Next steps belong to items 5 and 7 (hardware read, hardware write); the 2023
+  actuation JSON is a different shape and is not handled.
 
 ## Reference projects
 

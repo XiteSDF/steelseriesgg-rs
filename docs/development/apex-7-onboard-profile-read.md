@@ -2,9 +2,11 @@
 
 Source: capture notes (Windows USBPcap capture of SteelSeries GG talking to an
 Apex 7, PID `0x1612`, 2026-10-15, firmware `4.16.8`). Every item below is `[EXPERIMENTAL]`. Read status
-2026-10-18: `ssgg onboard read` completes a full slot read on an Apex 7 under Linux (operator-reported;
-model, firmware and the decoded bytes are not recorded here), so the **read** is replayed on hardware —
-what is not verified is the decode (slot layout, checksum words, the per-slot compare against GG). The read
+2026-10-19: `ssgg onboard read` completes a full slot read on an Apex 7 under Linux (Config 1, wired,
+firmware `4.16.3`), and that read image now **decodes**: the block layout matches GG's payload struct and
+its CRC-32/STM32 over `payload[0..11692]` equals the stored word `AE57B9DC`. Before the layout fix
+(5-byte mapping entries, OLED behind the wheel META table, GUID behind the macro block) the same image was
+decoded over a 12284-byte region and never matched. The read
 sends no frames that change anything on the keyboard: GG's opening chain and its closing sequence turned out
 not to be needed (2026-10-19, §Sequences the read does not need). Code: `src/devices/hid_reports.rs` (the command codes
 and every report buffer: `OnboardFirmwareVersionCommand`
@@ -125,7 +127,8 @@ implements and what has been measured on hardware, so a device answering any oth
 anything is pulled, rather than later as a profile whose checksum never matches. Measured 2026-10-18: the
 probe's schema word is read on an Apex 7. `[EXPERIMENTAL]` (the refusal threshold is a decoder limitation,
 not a device fact).
-`ssgg --debug onboard read --yes --profile N` runs the whole read, and the read loop logs its geometry (`info` level) before the first transfer; frames are built
+`ssgg --debug onboard read --profile N` (GG's config number, 1-5; the read addresses slot `N - 1`, the
+file it pulls as `0x020N`) runs the whole read, and the read loop logs its geometry (`info` level) before the first transfer; frames are built
 per chunk from the typed commands, nothing materialises a transfer list (`Step`, `StepKind`,
 `ReadConfig::steps()`, `init_steps()`, `plan_json` and the `onboard plan` subcommand were removed
 2026-10-17).
@@ -155,25 +158,30 @@ Block layout, in the order the Windows engine's decoder walks the payload:
 | 2 | profile name, 24 bytes | engine decoder |
 | 27 | lighting block, 57 bytes (lock/meta/win colours, dimmers, idle mode and timeout, three lock-key HID codes, OLED illumination options, 6 trailing reserved bytes) | engine decoder, layout `[EXPERIMENTAL]` |
 | 84 | META toggle HID code | engine decoder |
-| 85 | 128 button mappings, 4-byte entries | engine decoder |
-| 597 | 2 wheel mappings | engine decoder |
-| 605 | 128 button META mappings | engine decoder |
-| 1117 | 2 wheel META mappings | engine decoder |
-| 1125 | profile GUID, 16 bytes | **inferred** |
-| 1141 | 3 padding bytes (schema A) | **inferred** |
-| 1144 | OLED pixel block, 640 bytes | engine decoder says 640 bytes; offset **inferred** |
-| 1784 | Rapid Tap: 1 enable byte + 10 pairs of `(HID, HID, mode, reserved)` (schema B only) | engine decoder for the 10 pairs; offset **inferred** |
-| 1784 / 1825 | macro data, 9600 bytes (schema A / schema B) | **inferred** |
-| end − 4 | checksum (u32 LE) | confirmed |
-| end − 260 | — | unaccounted bytes in schema A, 267 in schema B |
+| 85 | 128 button mappings, **5-byte** entries (`key_mapping`: function byte + 4 key codes) | engine struct, verified on hardware |
+| 725 | 2 wheel mappings, 5-byte entries | engine struct |
+| 735 | 128 button META mappings, 5-byte entries | engine struct, verified on hardware |
+| 1375 | 2 wheel META mappings, 5-byte entries | engine struct |
+| 1385 | OLED pixel block, 640 bytes (`oled_settings: bytearray (size 640)`) | engine struct, verified on hardware |
+| 2025 / 2026 | Rapid Tap (schema B only): 1 enable byte + 10 **5-byte** `onboard_rapid_tap_pair` (`hid1`, `hid2`, `mode`, 2 reserved bytes) | engine struct, verified on hardware |
+| 2025 / 2076 | macro data, 9600 bytes (`uint16` count + bytes) (schema A / schema B) | engine struct, verified on hardware |
+| 11625 / 11676 | profile GUID, 16 bytes (schema A / schema B) | engine struct, verified on hardware |
+| 11641 | 3 padding bytes (schema A only - schema B has none) | engine struct |
+| 11644 / 11692 | checksum (u32 LE) = payload length − 4 | **verified on hardware 2026-10-19** (`AE57B9DC`) |
 
-Each mapping entry is `function HID byte`, `key_1`, `key_2`, `key_3`; a zero function byte means
-"no key bound", mode nibbles `0x80` report key 1 only, `0x08` key 2, `0x04` key 3 (mode 3 = report
-keys 1 and 2, which is what the Rapid Tap pairs use).
+GG's `device-offset-lookup-table` (`lisp/base_apex_legacy.lisp`) maps a key's HID usage to its slot in
+these tables: 120 of the 128 slots, `0xFF` for the 8 slots this device has no key for. Slots 120-127
+belong to the `0xF1..0xF8` function codes - the media cluster - and carry the shipped media bindings.
 
-The Windows engine's start-location table for a neighbouring Apex 7 model names 644 and 2088 for the
-OLED and macro blocks; neither the 4-byte nor the 5-byte entry hypothesis lands on those numbers, so
-they are recorded as an open question, not as a layout.
+**A factory-default entry is not a binding.** In the wired Apex 7 read, 112 of the 128 base slots are
+`0x51` (combo_key) with the slot's **own** key as the first code and zeros behind it - a key bound to
+itself - and the 12 remaining slots are all zero, which is what GG writes for a key the profile does not
+bind. Only the 4 media-cluster slots hold anything else, and the META layer holds the shipped shortcuts
+(`0x62` meta, `0x71` macro, and combos such as `RAlt+RCtrl+RShift+Esc` on META+M). `decode` reports each
+entry as `binding: "self" | "none" | "custom"`, and the profile summary counts only `custom`.
+
+Rapid Tap mode nibbles belong to the pairs, not to the mappings: `0x80` report key 1 only, `0x08` key 2,
+`0x04` key 3 (mode 3 = report keys 1 and 2).
 
 ## Reply framing (measured; the anchor is a constant, not a flag)
 
@@ -198,8 +206,9 @@ same pull. So the read-back carries the file head (schema word, and a name) and 
 window, which is why `ssgg onboard read` assembles payloads only as a labelled experiment: reassembling GG's 24 reads of file `0x0201` with framing 0 gives an image whose schema word
 reads `0x000B` and whose name reads `Config 1`, with no checksum word at the offsets the schema A and
 schema B layouts predict (CRC-32/STM32 over the 11648-byte and 11696-byte regions, as u32 and as u16
-words, matches nothing). `decode` prints stored and computed checksum words side by side and never claims
-a profile is verified.
+words, matches nothing). `decode` prints stored and computed checksum
+words side by side; on the hardware read of Config 1 (firmware 4.16.3) they agree, `AE57B9DC`
+over 11692 bytes.
 
 An earlier version of this section claimed all 241 answers start with 20 fixed bytes
 (`ff ff 00 …`), that the report-ID byte of the answers
@@ -352,17 +361,19 @@ The read's transfers are reads: it sends the firmware poll, the pulls and the pa
 *writes* used to live, and `89 <slot + 1>` in it is the frame that makes the keyboard run the slot read;
 `OnboardLoadProfileCommand` names it and nothing in ssgg sends it. No profile payload is written either:
 do not add profile writes - the profile blob contains blocks this layout does not explain, and writing a
-synthetic blob can put the keyboard in a state GG itself cannot repair. `read` requires `--yes` because it is
-reverse-engineered protocol code writing request frames to a raw device node; `decode` never touches a
-device.
+synthetic blob can put the keyboard in a state GG itself cannot repair. `read` needs no confirmation flag (2026-10-19: `--yes`
+was dropped) - it is reverse-engineered protocol code, but it writes request frames only and changes
+nothing on the keyboard; `decode` never touches a device. Both write the JSON decode report by default,
+named from the profile name the image carries (`Config 1` -> `config_1.json`, and GG's config number when
+a slot carries no name); `--bin FILE` writes the raw image and `--hex` hex-dumps it. `--profile` takes
+GG's config number `1..5` and addresses slot `N - 1`, the file `0x020N`.
 
 ## What is not settled
 
-- Where this platform keeps the profile checksum. GG's assembled image ends in zeros at the offsets
-  the schema A and schema B layouts predict, and the CRC-32/STM32 of every region candidate matches
-  none of them. The 2022/2023 profile blobs use a word at blob offset 12320 (see
-  [apex-pro-tkl-2023-gg-capture.md](apex-pro-tkl-2023-gg-capture.md)); nothing in this capture says the
-  legacy family does the same.
+- ~~Where this platform keeps the profile checksum.~~ Settled 2026-10-19: it is the last word of the
+  *payload* (schema A at `11648-4`, schema B at `11696-4`), not of the 12288-byte read image - the image is
+  padded with whole resource buffers behind the payload, and reading the image tail as the checksum is what
+  made every CRC of the capture disagree.
 - What `f4 00` and `6c 00 01` do. GG sends them in its opening chain, `f4 00` answers `00 01 00 …` and
   `6c 00 01` is not answered at all; meanings still unknown. **The chain is not needed: measured 2026-10-19,
   `ssgg onboard read` collects a profile slot without any of the six frames** (§Sequences the read does not

@@ -332,19 +332,24 @@ ssgg fuzz
 Reads the profile a legacy Apex keyboard keeps in its own flash (Apex 7, Apex Raw, Apex 2014).
 The protocol is reverse-engineered from a GG capture; the pacing frame, the pull and the
 payload-read request were accepted by an Apex 7 on 2026-10-15, and its answers come on the interrupt
-endpoint, so every claim here is labelled and the two subcommands that touch the keyboard require `--yes`.
-The code reads only: it never writes the on-board profile. Format and open questions:
+endpoint, so every claim here is labelled. The code reads only: it never writes the on-board profile, and
+the read sends no frame that changes anything on the keyboard. Format and open questions:
 [docs/development/apex-7-onboard-profile-read.md](docs/development/apex-7-onboard-profile-read.md).
 
 ```bash
 cargo build --release
 
 # no hardware touched: decode a profile image saved by an earlier read
-ssgg onboard decode /tmp/p0.bin --json /tmp/p0.json
+ssgg onboard decode /tmp/p0.bin
 
-# talk to the keyboard (experimental, needs confirmation)
-ssgg onboard read --yes --profile 0 --out /tmp/p0.bin --json /tmp/p0.json
+# talk to the keyboard (experimental, read-only); N is GG's config number, 1-5
+ssgg onboard read --profile 1
 ```
+
+Both write the JSON decode report, and the default file name is the profile name the image carries:
+`Config 1` -> `config_1.json` in the current directory (`-o FILE` picks another, an unsaved slot with no
+name falls back to `profile_slot_N.json`). `--bin FILE` additionally writes the raw 12288-byte image, and
+`--hex` hex-dumps it (`decode --hex --hex-from N --hex-len M` for a window).
 
 On Linux the read needs write access to the keyboard's control-collection `/dev/hidraw` node (the udev
 rule in `assets/99-steelseries.rules` grants it to the `input` group).
