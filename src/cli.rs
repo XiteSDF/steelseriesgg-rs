@@ -225,14 +225,20 @@ pub(crate) struct OnboardReadArgs {
     #[arg(short, long)]
     pub(crate) device: Option<String>,
 
-    /// Where to write the JSON decode report. Default: the profile name the read returns, sanitized
-    /// (`Config 1` -> `config_1.json`), in the current directory
+    /// Where to write the decoded profile as JSON - the same report `onboard decode` writes for this
+    /// image, and the format `tools/profile-gui` opens. Default: the profile name the read returns,
+    /// sanitized (`Config 1` -> `config_1.json`), in the current directory
     #[arg(short, long, value_name = "FILE")]
     pub(crate) out: Option<PathBuf>,
 
     /// Also write the assembled profile image, as bytes. No default: bytes are only wanted with a path
     #[arg(long, value_name = "FILE")]
     pub(crate) bin: Option<PathBuf>,
+
+    /// Also write the read record as JSON: the per-pull chunk headers, framing stats, image hash and the
+    /// first bytes of the image. Capture diagnostics, not the profile. No default
+    #[arg(long, value_name = "FILE")]
+    pub(crate) report: Option<PathBuf>,
 
     /// Hex-dump the whole profile image to stdout
     #[arg(long)]

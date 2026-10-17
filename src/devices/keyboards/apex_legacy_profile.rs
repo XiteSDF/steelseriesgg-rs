@@ -1635,6 +1635,108 @@ mod tests {
         assert_eq!(value["data_len"], PROFILE_FILE_BYTES);
     }
 
+    /// The dump format shared by `onboard read`, `onboard decode` and `tools/profile-gui`: the
+    /// top-level keys in report order, and the keys of every nested object the GUI reads. Pinned
+    /// because a renamed field silently drops data in the GUI and in any dump a user diffs.
+    #[test]
+    fn profile_json_keeps_the_documented_report_layout() {
+        let data = synthetic_payload(SCHEMA_B);
+        let profile = decode(&data).unwrap();
+        let text = profile_json(&profile).unwrap();
+        let top: Vec<String> = text
+            .lines()
+            .filter_map(|line| {
+                let line = line.strip_prefix("  ")?;
+                line.strip_prefix('"')?.split('"').next().map(str::to_string)
+            })
+            .collect();
+        assert_eq!(
+            top,
+            [
+                "schema",
+                "schema_name",
+                "name",
+                "name_hex",
+                "lighting",
+                "meta_toggle_hid",
+                "button_mappings",
+                "wheel_mappings",
+                "button_meta_mappings",
+                "wheel_meta_mappings",
+                "oled",
+                "rapid_tap",
+                "macro_data",
+                "guid",
+                "guid_padding",
+                "crc_stored",
+                "crc_computed",
+                "crc_ok",
+                "crc_region_len",
+            ]
+        );
+
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        // serde_json parses objects sorted, so every expectation here is a sorted key list.
+        let keys_of = |value: &serde_json::Value| -> Vec<String> {
+            let node = value.as_array().map_or(value, |array| &array[0]);
+            node.as_object()
+                .map(|object| object.keys().cloned().collect())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            keys_of(&value["lighting"]),
+            [
+                "disabled_win_key_color",
+                "idle_mode_dimmer",
+                "idle_timeout_ms",
+                "lock_key_color",
+                "lock_key_hid_codes",
+                "meta_key_background_dimmer",
+                "meta_key_color",
+                "meta_mapped_elements",
+                "oled_illumination_options",
+                "win_key_hid_code",
+            ]
+        );
+        assert_eq!(keys_of(&value["lighting"]["lock_key_color"]), ["b", "g", "r"]);
+        for table in [
+            "button_mappings",
+            "wheel_mappings",
+            "button_meta_mappings",
+            "wheel_meta_mappings",
+        ] {
+            assert_eq!(
+                keys_of(&value[table]),
+                [
+                    "binding",
+                    "function",
+                    "function_name",
+                    "hid_code",
+                    "key_codes",
+                    "offset"
+                ],
+                "{table} entries"
+            );
+        }
+        assert_eq!(
+            keys_of(&value["oled"]),
+            ["fnv1a_64", "head", "len", "nonzero", "offset"]
+        );
+        assert_eq!(keys_of(&value["rapid_tap"]), ["enable", "pairs"]);
+        assert_eq!(
+            keys_of(&value["rapid_tap"]["pairs"]),
+            ["hid_1", "hid_2", "mode", "report_both_keys", "reserved"]
+        );
+        assert_eq!(
+            keys_of(&value["macro_data"]),
+            ["fnv1a_64", "head", "len", "nonzero", "offset"]
+        );
+        assert_eq!(value["button_mappings"].as_array().unwrap().len(), 128);
+        assert_eq!(value["wheel_mappings"].as_array().unwrap().len(), 2);
+        assert_eq!(value["button_meta_mappings"].as_array().unwrap().len(), 128);
+        assert_eq!(value["wheel_meta_mappings"].as_array().unwrap().len(), 2);
+    }
+
     #[test]
     fn image_diff_finds_the_first_difference() {
         let record = |first: u8| ChunkRecord {

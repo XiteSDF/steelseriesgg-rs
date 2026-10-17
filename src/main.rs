@@ -812,7 +812,7 @@ async fn cmd_profile(action: ProfileAction) -> Result<()> {
 /// the decoded layout and checksum now match GG's payload struct and a hardware read of the factory
 /// profile. Field meanings inside the OLED and macro blocks are still reverse-engineered.
 async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAction) -> Result<()> {
-    use steelseries_gg::devices::keyboards::apex_legacy_profile::{hex_dump, profile_json, schema_of, to_json};
+    use steelseries_gg::devices::keyboards::apex_legacy_profile::{hex_dump, profile_json, schema_of};
 
     match action {
         OnboardAction::Read(args) => {
@@ -856,8 +856,9 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
                     None => println!("the two reads agree on all {} profile bytes", first.data.len()),
                 }
                 let json = onboard_json_path(args.out.as_deref(), &first.data, args.profile);
-                secure_write_async(json.clone(), to_json(&first)?).await?;
-                println!("JSON report of the first read written to {}", json.display());
+                secure_write_async(json.clone(), profile_json(&decode(&first.data)?)?).await?;
+                println!("JSON decode report of the first read written to {}", json.display());
+                write_onboard_report(args.report.as_ref(), &first).await?;
                 if let Some(bin) = args.bin.as_ref() {
                     secure_write_async(bin.clone(), first.data.clone()).await?;
                     let second_path = bin.with_extension("second.bin");
@@ -875,8 +876,9 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
                     print!("{}", hex_dump(&image.data, 0, image.data.len()));
                 }
                 let json = onboard_json_path(args.out.as_deref(), &image.data, args.profile);
-                secure_write_async(json.clone(), to_json(&image)?).await?;
-                println!("JSON report written to {}", json.display());
+                secure_write_async(json.clone(), profile_json(&decode(&image.data)?)?).await?;
+                println!("JSON decode report written to {}", json.display());
+                write_onboard_report(args.report.as_ref(), &image).await?;
                 if let Some(bin) = args.bin.as_ref() {
                     secure_write_async(bin.clone(), image.data.clone()).await?;
                     println!("profile image written to {}", bin.display());
@@ -956,6 +958,22 @@ fn onboard_json_path(given: Option<&std::path::Path>, data: &[u8], config: u8) -
         || std::path::PathBuf::from(profile_dump_name(&profile_name(data), config)),
         |path| path.to_path_buf(),
     )
+}
+
+/// The per-pull read record as JSON: chunk headers, framing stats, the image hash. Capture diagnostics
+/// for comparing a read with GG's capture; the decoded profile is what `--out` writes.
+async fn write_onboard_report(
+    path: Option<&std::path::PathBuf>,
+    image: &steelseries_gg::devices::keyboards::apex_legacy_profile::ProfileImage,
+) -> Result<()> {
+    use steelseries_gg::devices::keyboards::apex_legacy_profile::to_json;
+
+    let Some(path) = path else {
+        return Ok(());
+    };
+    secure_write_async(path.to_path_buf(), to_json(image)?).await?;
+    println!("read record written to {}", path.display());
+    Ok(())
 }
 
 fn print_onboard_banner() {
