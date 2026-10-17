@@ -321,6 +321,36 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   putting `wLength 641` on the wire, one byte short of GG - that is why "643 produces `ETIMEDOUT`" and "no reply
   payload arrived" both read as facts. Recorded in `apex-7-onboard-profile-read.md` (§3 transfer map, §3.1
   comparison, §5 collection map) and `linux-read-interval.md` §5.
+- 2026-10-18 (schema gate + read plan on the device): two changes in the same pass.
+  **The probe is now the gate.** The read runs GG's 2-byte file-head probe as its first step (`Apex7::probe_schema`:
+  2-byte pull at file offset 0, then one window read at buffer offset 0 - the pair the transfer map lists) and
+  **refuses any schema word that is not `0x000B`**, because schema B is what `apex_legacy_profile` decodes and what
+  has been measured: a schema A device now stops before anything is pulled instead of surfacing later as a profile
+  whose checksum never matches. Measured 2026-10-18: the probe's schema word arrives on an Apex 7. Open question,
+  `ONBOARD.md` step 0c: whether the probe is load-bearing for the read at all.
+  **The read plan lives on `Apex7` now.** `send_init_chain`, `probe_schema`, `pull_window`, `read_window`,
+  `read_reply_report`, `read_pull_ack`, `read_interrupt_report`, `write_output_command`, `write_feature_command`
+  and `read_image` are methods of `Apex7`; the `apex_legacy_onboard` module is deleted, the duplicated pull/read
+  blocks the probe introduced are factored into `pull_window`/`read_window` shared by the probe and the chunk loop,
+  and the plan takes `&mut self` (the write path needs it), so `Keyboard::read_onboard_profile` became `&mut self`
+  and `ssgg onboard read` binds the keyboard mutably.
+  **Output frames: `send_report` tried, `write_profile_packet` kept.** The write path was measured in source for
+  this: `send_report` writes via `write_padded_report`, whose global `HidOptimizer` **drops any report
+  byte-identical to one sent in the last 50 ms** (`src/devices/mod.rs:124-185, 217`), while
+  `GenericKeyboard::write_profile_packet` calls `device.write` with no cache. The opening chain repeats `90 00`
+  and `90 01` 20 ms after their first copy, so through `send_report` frames 5 and 6 never reach the device and
+  the keyboard sees a four-frame chain - against the measurement that made the chain load-bearing,
+  which had all six on the wire. `send_report` was switched in on the owner's request and reverted the same day
+  for exactly that reason; `write_output_command` is back on `write_profile_packet`, which is also why the plan
+  stayed `&self` and `Keyboard::read_onboard_profile` did not become `&mut self`. Written up in
+  `docs/development/apex-7-onboard-profile-read.md` ("Write path", plus a row in the Windows-vs-Linux table) and
+  `ONBOARD.md` step 0, with the `--debug` signature "Skipping duplicate HID report" for spotting a drop.
+  My earlier note for this round claimed the opposite (that `send_report` was the dedup-free write and the chain
+  needed `write_profile_packet`): the mechanism was right, the direction was not - the dedup lives in
+  `write_padded_report`, the path `send_report` uses.
+  `docs/development/apex-7-onboard-profile-read.md` §2 probe row + code paths, §3.2 write-path paragraph,
+  `docs/development/README.md` index row, `ONBOARD.md` steps 0 / 0c + Packet I/O row, `apex_legacy_profile` module doc.
+  Checks: fmt, clippy `--all-targets -D warnings`, tests, release build - all clean.
 - Old TODO items: clippy-ci / future-incompat errors (resolved, see Baseline); `ssgg_bug_report.json` triage
   (dropped: the file was never provided); issue #6 Arch compile (closed `not_planned`).
 - `docs/development/` consolidation (2026-10-15): capture-note "Transport" section matches the 645-byte /

@@ -2,7 +2,6 @@
 
 pub mod apex;
 pub mod apex7;
-pub mod apex_legacy_onboard;
 pub mod apex_legacy_profile;
 pub mod apex_pro_tkl_2023;
 pub mod apex_pro_tkl_2023_profile;
@@ -221,8 +220,8 @@ pub trait Keyboard: Device {
 
     /// Read one on-board profile slot. Keyboards that do not carry the protocol return an error.
     ///
-    /// `[EXPERIMENTAL]`: the protocol is reverse-engineered from a capture of official GG and
-    /// has never completed a read on hardware from this code.
+    /// `[EXPERIMENTAL]`: the protocol is reverse-engineered from a capture of official GG. A full
+    /// slot read completes on an Apex 7 under Linux (2026-10-18); the decode is not verified.
     async fn read_onboard_profile(
         &self,
         _profile: u8,
@@ -476,6 +475,11 @@ impl GenericKeyboard {
 
     /// Send one output report on this keyboard's collection: `data[0]` is the report number
     /// (`SET_REPORT wValue 0x0200`).
+    ///
+    /// Use this for profile protocol transfers, not [`GenericKeyboard::send_report`]: `send_report` writes
+    /// through [`crate::devices::write_padded_report`], whose global [`crate::devices::HidOptimizer`] skips any
+    /// report byte-identical to one sent in the last 50 ms, and the on-board read sends such frames - the
+    /// opening chain repeats `90 00` and `90 01`.
     pub(crate) fn write_profile_packet(&self, data: &[u8]) -> Result<()> {
         let device = self.connected_device()?.lock();
         let written = device

@@ -10,10 +10,13 @@ the payload replies come back scrambled (2026-10-18). Nothing in this protocol w
 and every report buffer: `OnboardFirmwareVersionCommand`, `OnboardInitCommand` / `ONBOARD_INIT_CHAIN`,
 `OnboardPullCommand`,
 `OnboardReadCommand`), `src/devices/keyboards/apex_legacy_profile.rs` (reply framing, payload geometry, reply parsing, decode - the module moved there on 2026-10-17, from `src/onboard_profile.rs`, because everything in it is specific to this legacy platform),
-`src/devices/keyboards/apex_legacy_onboard.rs` (read plan, reply assembly, polling),
 `src/devices/keyboards/apex7.rs` (`Apex7`: the keyboard device of the legacy Apex family, which wraps
-`GenericKeyboard`) - the packet I/O is `GenericKeyboard`'s own profile transfers on the handle it owns
-(`write_profile_packet`, `read_profile_feature_packet`, `read_profile_input_packet`, …), `ssgg onboard` (`src/cli.rs`, `src/main.rs`). Discovery builds `Apex7` for the family
+`GenericKeyboard`, and the read plan, reply assembly and polling - its own `read_profile` /
+`read_image` / `send_init_chain` / `probe_schema` / `pull_window` / `read_window` methods; the
+`apex_legacy_onboard` module these lived in was folded into `Apex7` on 2026-10-19) - the packet I/O is
+`GenericKeyboard`'s own profile transfers on the handle it owns
+(`write_profile_packet` for output frames - not `send_report`, whose write dedups: see "Write path" below -
+`send_feature`, `read_profile_feature_packet`, `read_profile_input_packet`), `ssgg onboard` (`src/cli.rs`, `src/main.rs`). Discovery builds `Apex7` for the family
 (the device class is part of the device tree); the read path
 (transport, read plan, `Keyboard::read_onboard_profile`) is core code, labelled `[EXPERIMENTAL]`, as are the report builders.
 
@@ -103,7 +106,13 @@ for each chunk c in 0..12:
 
 12 pulls of 1024 bytes cover 12288 bytes, enough for the 11648-byte schema A payload and the
 11696-byte schema B payload. A schema-only read is the opening chain, one 2-byte pull of the file head
-and one 2-byte read (GG's own probe, kept in the transfer map; `ssgg onboard` has no schema-probing mode).
+and one 2-byte read (GG's own probe, kept in the transfer map). `ssgg onboard read` runs that pair as the
+first step of every read (`Apex7::probe_schema`: 2-byte pull at file offset 0, then one window read at
+buffer offset 0) and **stops the read when the schema word is not `0x000B`** - schema B is what the decoder
+implements and what has been measured on hardware, so a device answering any other schema is refused before
+anything is pulled, rather than later as a profile whose checksum never matches. Measured 2026-10-18: the
+probe's schema word is read on an Apex 7. `[EXPERIMENTAL]` (the refusal threshold is a decoder limitation,
+not a device fact).
 `ssgg --debug onboard read --yes --profile N` runs the whole read, and the read loop logs its geometry (`info` level) before the first transfer; frames are built
 per chunk from the typed commands, nothing materialises a transfer list (`Step`, `StepKind`,
 `ReadConfig::steps()`, `init_steps()`, `plan_json` and the `onboard plan` subcommand were removed
@@ -221,12 +230,12 @@ So the packet GG reads after a pull is a **pacing token**: one HID read of the d
 (65 bytes = the report-ID slot plus the 64-byte report), issued so the kernel serialises the transfer, and
 its content is thrown away by design. All profile bytes arrive through the `0x83` window replies (the
 `GET_REPORT 0x0300` read-back), never through a pull's answer - which is what the read loop here does too
-(`apex_legacy_onboard::read_pull_ack` consumes one packet and looks at none of it).
+(`Apex7::read_pull_ack` consumes one packet and looks at none of it).
 
 **The read is required on Linux, not just a GG habit.** On 2026-10-17 an Apex 7 `0xFFC1` collection was run with
 that per-pull input read removed: every payload read-back then failed with `io::read_exact: unexpected end of
 file`, and with the read restored the same collection read the profile. The step is
-`apex_legacy_onboard::read_pull_ack` (`PULL_ACK_LEN` = 65 = GG's `read-chunk HIDIO 65`, the report plus its
+`Apex7::read_pull_ack` (`PULL_ACK_LEN` = 65 = GG's `read-chunk HIDIO 65`, the report plus its
 report-ID slot; it was 64 until 2026-10-18, which works for the pacing packet and truncates the last byte of a
 65-byte answer).
 
@@ -241,6 +250,22 @@ Timing at that level: a pull is answered in **1.7-3.7 ms**; a read request is an
 interleaved) takes **1.8 s**, i.e. about 15 ms per chunk - its 11 ms pacing plus transfer latency. The kit
 summary's "about 2 s per chunk" is a pairing artifact: it pairs the 42 `0x85` pulls of the write runs with
 the 144 `0x03` payload writes spread over the whole session.
+
+## Write path: `write_profile_packet`, not `send_report` (measured in source, 2026-10-18)
+
+The read's output frames go through `GenericKeyboard::write_profile_packet`, which calls `device.write` with no
+cache. It is not the keyboard's usual output write: `GenericKeyboard::send_report` calls `write_padded_report`
+(`src/devices/mod.rs:217`), whose global `HidOptimizer` (`src/devices/mod.rs:124`) hashes every report and
+**skips any report byte-identical to one sent in the last 50 ms** ("Skipping duplicate HID report" in
+`--debug`). Both writes put the same `SET_REPORT wValue 0x0200`, 64-byte frame on the wire for a frame the
+device has not seen recently.
+
+The difference shows up in one place, the opening chain: `90 00` and `90 01` each appear twice in
+`ONBOARD_INIT_CHAIN`, 20 ms apart on our 5 ms cadence, inside the 50 ms window. On `send_report` the device
+would receive a **four-frame** chain; the measurement that made the chain load-bearing (section
+"Opening chain") had all six frames on the wire, as the capture shows GG sending them. `send_report` was tried
+here on 2026-10-18 and reverted the same day for that reason. Pulls and payload reads never repeat (their file
+and buffer offsets differ), so nothing after the chain is affected by the choice.
 
 ## Safety
 
@@ -260,7 +285,7 @@ keyboard in a state GG itself cannot repair. `read` requires `--yes`; `decode` n
   `6c 00 01` is not answered at all. **The chain as a whole is required on hardware**: a read that sends only
   the `90 00` poll is answered on the wire and its payload replies come back as scrambled bytes, with the
   chain sent the same read collects a profile slot (Apex 7, 2026-10-18), so `ssgg onboard read` sends all six
-  frames (`ONBOARD_INIT_CHAIN`, `apex_legacy_onboard::send_init_chain`, restored 2026-10-18 after being
+  frames (`ONBOARD_INIT_CHAIN`, `Apex7::send_init_chain`, restored 2026-10-18 after being
   removed 2026-10-17). **Which of the six frames the keyboard needs is open** - that is the question to answer
   by dropping them one at a time on a run that reads a known slot. The answers are produced **one frame at a
   time**: a chain run that drained only the first answer saw `90 00` and `90 01` answered and nothing from
@@ -299,6 +324,7 @@ device 24 = the `0x1612` control interface, 612 control submits and 612 complete
 | **Read-back** | **241 GET_REPORT control-IN transfers `a1 01 wValue 0x0300 wIndex 1 wLength 642`**, one per read request, each answered by a 643-byte control-IN data stage (report-ID byte `03` + 642 payload bytes; 1..513 non-zero bytes per reply, 89% of its u32 words are zero). The name-bearing reply is `03 0b 00 …` = schema word `0x000B` + `Config 1` | GET transfers **did** appear: 24 setup blocks `a1 01 wValue 0x0300 wLength 641` - one byte short of GG's 642, because the raw-ioctl code subtracted the report-ID byte from the length it passed to the kernel. No complete carries a data stage, so no payload arrived; the 64-byte interrupt reports `ssgg` collected were `34 2e 31 …` ("4.16.8") x 68, `00 01` x 17, `85 01` x 17 |
 | Chain answers | `90 00`/`90 01` -> "4.16.8", `f4 00` -> `00 01 00 …`, `6c 00 01` -> nothing | identical, byte for byte |
 | Other traffic in the window | 144 `03` 642-byte profile writes, 72 `05` lighting frames | none (read-only run) |
+| Write path (2026-10-18, code, not this capture) | GG's engine writes each frame once | `ssgg` writes with `write_profile_packet`, no cache, so all six chain frames reach the device; the keyboard's ordinary output write `send_report` would not, because the hid optimizer drops a report byte-identical to one sent in the last 50 ms - that is chain frames 5 and 6. See "Write path" below |
 
 The point that decides everything: **the window is fetched with a GET_REPORT of the feature report**
 (`bmRequestType 0xa1`, `bRequest 0x01`, `wValue 0x0300`, `wIndex 1`, `wLength 642`) issued right after
