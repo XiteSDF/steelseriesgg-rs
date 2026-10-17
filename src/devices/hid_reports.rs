@@ -47,6 +47,30 @@ pub enum CommandCode {
     /// [EXPERIMENTAL] Apex Pro TKL 2023 on-board profile chunk (0x03, header `03 01 80`), see
     /// `ProfileChunkCommand`.
     ProfileChunk = 0x03,
+    /// [EXPERIMENTAL] Legacy Apex (Apex 7, Apex Raw, Apex 2014) resource-buffer pull (0x85), see
+    /// `OnboardPullCommand`: answered by the keyboard's ordinary input report, not by a pull-specific one.
+    OnboardPull = 0x85,
+    /// [EXPERIMENTAL] Legacy Apex on-board payload read (0x83), see `OnboardReadCommand`.
+    OnboardPayloadRead = 0x83,
+    /// [EXPERIMENTAL] Legacy Apex firmware-version poll (0x90): `90 <source>`, answered on the interrupt
+    /// endpoint with the ASCII firmware version. The source byte selects which firmware answers -
+    /// [`FirmwareSource::Keyboard`] (`90 00`) the keyboard's, [`FirmwareSource::Led`] (`90 01`) the LED
+    /// controller's. See [`OnboardFirmwareVersionCommand`].
+    FirmwareVersion = 0x90,
+    /// `[EXPERIMENTAL]` Legacy Apex driver mode (0x6C): GG's engine writes `6c 00 01` when it opens a
+    /// device and `6c 00 00` when it closes a session - same report number 0, same command, one byte
+    /// apart. Only the opening frame is in the reference capture (answered `6c 00 01 00…`). **Nothing in
+    /// ssgg sends it.** The engine side (the sleep behind the deploy frame, the lighting-reset frame the
+    /// engine also writes on closing) and the Apex 3 family split (`0x03` in a 33-byte report on Apex 3,
+    /// `0x6C` with a different opening byte on Apex 3 TKL) is in
+    /// `docs/development/apex-7-onboard-profile-read.md` §Driver mode. See [`OnboardDriverModeCommand`].
+    DriverMode = 0x6C,
+    /// `[EXPERIMENTAL]` Legacy Apex profile deploy (0x89): GG's `89 <1-based profile id>`, the
+    /// `load_profile` frame seen behind profile-file transfers in the reference capture (slots 0, 1, 2, 4
+    /// going out as 1, 2, 3, 5). **This writes to the device** - the keyboard runs the slot named - and
+    /// **nothing in ssgg sends it**: ssgg never changes the keyboard's active profile. See
+    /// [`OnboardLoadProfileCommand`].
+    LoadProfile = 0x89,
 }
 
 impl fmt::Display for CommandCode {
@@ -61,6 +85,11 @@ impl fmt::Display for CommandCode {
             CommandCode::Apex2023Direct => write!(f, "APEX2023_DIRECT_EXPERIMENTAL"),
             CommandCode::ActuationControl => write!(f, "ACTUATION_CTRL_EXPERIMENTAL"),
             CommandCode::ProfileChunk => write!(f, "PROFILE_CHUNK_EXPERIMENTAL"),
+            CommandCode::OnboardPull => write!(f, "ONBOARD_PULL_EXPERIMENTAL"),
+            CommandCode::OnboardPayloadRead => write!(f, "ONBOARD_PAYLOAD_READ_EXPERIMENTAL"),
+            CommandCode::FirmwareVersion => write!(f, "FIRMWARE_VERSION_EXPERIMENTAL"),
+            CommandCode::DriverMode => write!(f, "DRIVER_MODE_EXPERIMENTAL"),
+            CommandCode::LoadProfile => write!(f, "LOAD_PROFILE_EXPERIMENTAL"),
         }
     }
 }
@@ -81,6 +110,11 @@ impl CommandCode {
             0x40 => Some(CommandCode::Apex2023Direct),
             0x2D => Some(CommandCode::ActuationControl),
             0x03 => Some(CommandCode::ProfileChunk),
+            0x85 => Some(CommandCode::OnboardPull),
+            0x83 => Some(CommandCode::OnboardPayloadRead),
+            0x90 => Some(CommandCode::FirmwareVersion),
+            0x6C => Some(CommandCode::DriverMode),
+            0x89 => Some(CommandCode::LoadProfile),
             _ => None,
         }
     }
@@ -431,6 +465,362 @@ impl HidCommand for ProfileChunkCommand<'_> {
     fn description(&self) -> String {
         format!("Profile chunk: {} bytes at offset {}", self.data.len(), self.offset)
     }
+}
+
+/// Report buffer of a legacy Apex (Apex 7, Apex Raw, Apex 2014) on-board profile transfer, handed to
+/// the transport as `[report number][64 data bytes]` with report number 0, which is the
+/// `SET_REPORT wValue 0x0200 wIndex 1 wLength 64` transfer the 2026-10-15 reference capture shows.
+///
+/// `[EXPERIMENTAL]` Layout and sizes from
+/// `docs/development/apex-7-onboard-profile-read.md`. Only the opening-chain frames have been answered by
+/// a keyboard when sent by `ssgg` (firmware `4.16.8` on 2026-10-15).
+pub const ONBOARD_OUTPUT_REPORT_SIZE: usize = 65;
+
+/// Report buffer of a legacy Apex on-board payload read: `[report number][642 data bytes]` with report
+/// number 0, which is the `SET_REPORT wValue 0x0300 wLength 642` transfer the reference capture shows
+/// (the kernel takes the report number out of the data stage, so the buffer is one byte longer than the
+/// wire, and the 642 data bytes carry the frame zero padded).
+///
+/// `[EXPERIMENTAL]` Never reproduced on hardware.
+pub const ONBOARD_FEATURE_REPORT_SIZE: usize = 643;
+
+/// Wire bytes of a payload read-back: the `GET_REPORT wValue 0x0300 wIndex 1 wLength 642` control read
+/// the reference capture shows, which is also the length to ask the transport for. On Linux the read side
+/// sends the buffer length verbatim (`HIDIOCGFEATURE`: hidapi hands the slice length straight to the
+/// ioctl, `src/linux_native/ioctl.rs:26`), so **ask with 642, never 643** - measured 2026-10-15:
+/// 642 answers, 643 makes the control transfer never complete (`Connection timed out`). The kernel writes
+/// the device's report-ID byte into buffer[0], so the bytes behind it are 641.
+///
+/// `[EXPERIMENTAL]` Wire length capture-confirmed on Windows (Apex 7, 2026-10-15); the answering length
+/// measured on Linux the same day.
+pub const ONBOARD_GET_WIRE_BYTES: usize = 642;
+
+/// Bytes a payload read frame may ask for. A reply report arrives as `[report ID][641 bytes]`, and a
+/// header-echoing reply puts a further 5-byte header (`03 01 01 00 01`, see `READ_REPLY_HEADER_LEN` in
+/// `apex_legacy_profile`) in front of the payload, so the payload a read can ask for tops out at
+/// 642 - 1 - 5 = 636. An earlier version of this constant said 641: it subtracted the report-ID byte but
+/// not the header, which let a read frame ask for a size no reply can carry.
+pub const ONBOARD_MAX_READ_LEN: usize = ONBOARD_GET_WIRE_BYTES - 1 - 5;
+
+/// Firmware source byte for [`OnboardFirmwareVersionCommand`]: which firmware the `90` poll asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirmwareSource {
+    /// `0x00` - the firmware running the keyboard.
+    Keyboard,
+    /// `0x01` - the LED controller's firmware.
+    Led,
+}
+
+impl From<FirmwareSource> for u8 {
+    fn from(source: FirmwareSource) -> Self {
+        match source {
+            FirmwareSource::Keyboard => 0x00,
+            FirmwareSource::Led => 0x01,
+        }
+    }
+}
+
+impl fmt::Display for FirmwareSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FirmwareSource::Keyboard => write!(f, "keyboard"),
+            FirmwareSource::Led => write!(f, "LED"),
+        }
+    }
+}
+
+/// [EXPERIMENTAL] Legacy Apex firmware-version poll: `90 <source>` in a 64-byte output report
+/// (`SET_REPORT wValue 0x0200`), answered on the interrupt endpoint with the ASCII version string
+/// (`34 2e 31 36 2e 38 00…` = `4.16.8` in the reference capture).
+///
+/// The source byte picks which firmware answers: [`FirmwareSource::Keyboard`] (`90 00`) the keyboard's,
+/// [`FirmwareSource::Led`] (`90 01`) the LED controller's. Measured: the 2026-10-15 GG capture has both
+/// forms on the wire (`ssgg-capture-1612-20261015-004400/summary.md`: `90 00` answered
+/// `00 53 74 65 65 6c 53 ...` = `SteelSeries ...`), and ssgg read both strings from an Apex 7 on
+/// 2026-10-19. Decode the answer with `parse_firmware_version`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OnboardFirmwareVersionCommand {
+    /// Which firmware this poll asks for.
+    pub source: FirmwareSource,
+}
+
+impl OnboardFirmwareVersionCommand {
+    /// GG's keyboard-firmware form (`90 00`).
+    pub const KEYBOARD: Self = Self {
+        source: FirmwareSource::Keyboard,
+    };
+    /// The LED-controller form (`90 01`).
+    pub const LED: Self = Self {
+        source: FirmwareSource::Led,
+    };
+}
+
+impl HidCommand for OnboardFirmwareVersionCommand {
+    fn command_code(&self) -> CommandCode {
+        CommandCode::FirmwareVersion
+    }
+
+    fn serialize(&self, buffer: &mut [u8], _device_type: HidDeviceType) -> Result<usize> {
+        check_report_buffer(buffer, ONBOARD_OUTPUT_REPORT_SIZE)?;
+        let report = &mut buffer[..ONBOARD_OUTPUT_REPORT_SIZE];
+        report.fill(0);
+        report[1] = CommandCode::FirmwareVersion as u8;
+        report[2] = self.source.into();
+        Ok(ONBOARD_OUTPUT_REPORT_SIZE)
+    }
+
+    fn validate(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn description(&self) -> String {
+        format!(
+            "Onboard firmware version poll: 90 {:02X} ({} firmware)",
+            u8::from(self.source),
+            self.source
+        )
+    }
+}
+
+/// Which driver mode [`OnboardDriverModeCommand`] asks the keyboard for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverModeState {
+    /// `0x01` - engaged. GG's engine writes it at device init (`6c 00 01`).
+    Engaged,
+    /// `0x00` - released. GG's engine writes it at shutdown (`6c 00 00`).
+    Released,
+}
+
+impl From<DriverModeState> for u8 {
+    fn from(mode: DriverModeState) -> Self {
+        match mode {
+            DriverModeState::Engaged => 0x01,
+            DriverModeState::Released => 0x00,
+        }
+    }
+}
+
+/// [EXPERIMENTAL] Legacy Apex driver mode: `6c 00 <mode>` in a 64-byte output report
+/// (`SET_REPORT wValue 0x0200`). GG's engine writes [`DriverModeState::Engaged`] when it opens a device
+/// and [`DriverModeState::Released`] when it shuts down; only the opening frame is in the 2026-10-15
+/// capture, answered `6c 00 01 00 ...` on the interrupt endpoint.
+///
+/// **Nothing in ssgg sends this command.** The on-board profile read was measured on 2026-10-19 to work
+/// without it. The engine-side detail and the **Apex 3 family split** (Apex 3 uses command `0x03` in a
+/// 33-byte report, Apex 3 TKL uses `0x6C` and opens with driver mode engaged) is in
+/// `docs/development/apex-7-onboard-profile-read.md` §Driver mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OnboardDriverModeCommand {
+    /// Driver mode to set.
+    pub mode: DriverModeState,
+}
+
+impl HidCommand for OnboardDriverModeCommand {
+    fn command_code(&self) -> CommandCode {
+        CommandCode::DriverMode
+    }
+
+    fn serialize(&self, buffer: &mut [u8], _device_type: HidDeviceType) -> Result<usize> {
+        check_report_buffer(buffer, ONBOARD_OUTPUT_REPORT_SIZE)?;
+        let report = &mut buffer[..ONBOARD_OUTPUT_REPORT_SIZE];
+        report.fill(0);
+        report[1] = CommandCode::DriverMode as u8;
+        report[3] = self.mode.into();
+        Ok(ONBOARD_OUTPUT_REPORT_SIZE)
+    }
+
+    fn validate(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn description(&self) -> String {
+        format!("Onboard driver mode: 6c 00 {:02X}", u8::from(self.mode))
+    }
+}
+
+/// Profile slots the engine accepts: `(range 1 5)` on the wire, i.e. 0-based slots 0..=4 here.
+pub const ONBOARD_PROFILE_SLOT_COUNT: u8 = 5;
+
+/// [EXPERIMENTAL] Legacy Apex on-board profile deploy: `89 <1-based profile id>` in a 64-byte output
+/// report - GG's `load_profile`. Seen in the 2026-10-15 capture behind profile-file transfers (rows 83,
+/// 85, 111, 121: slots 0, 1, 2, 4 going out as 1, 2, 3, 5).
+///
+/// **This writes to the device**: it makes the keyboard run the slot it names. **Nothing in ssgg sends
+/// it** - the on-board profile read was measured on 2026-10-19 to work without it, and ssgg never changes
+/// the keyboard's active profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OnboardLoadProfileCommand {
+    /// Profile slot, 0-based as everywhere in this crate; the wire id is `profile + 1`.
+    pub profile: u8,
+}
+
+impl HidCommand for OnboardLoadProfileCommand {
+    fn command_code(&self) -> CommandCode {
+        CommandCode::LoadProfile
+    }
+
+    fn serialize(&self, buffer: &mut [u8], _device_type: HidDeviceType) -> Result<usize> {
+        self.validate()?;
+        check_report_buffer(buffer, ONBOARD_OUTPUT_REPORT_SIZE)?;
+        let report = &mut buffer[..ONBOARD_OUTPUT_REPORT_SIZE];
+        report.fill(0);
+        report[1] = CommandCode::LoadProfile as u8;
+        report[2] = self.profile.saturating_add(1);
+        Ok(ONBOARD_OUTPUT_REPORT_SIZE)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.profile >= ONBOARD_PROFILE_SLOT_COUNT {
+            return Err(Error::InvalidConfig(format!(
+                "profile slot {} out of range (GG accepts 0..{})",
+                self.profile,
+                ONBOARD_PROFILE_SLOT_COUNT - 1
+            )));
+        }
+        Ok(())
+    }
+
+    fn description(&self) -> String {
+        format!(
+            "Onboard profile deploy: 89 {:02X} (slot {})",
+            self.profile.saturating_add(1),
+            self.profile
+        )
+    }
+}
+
+/// Copy part of a profile file into the keyboard's resource buffer, `[EXPERIMENTAL]`:
+/// `85 | 00 | file id u16 LE | file offset u32 LE | size u16 LE | 00…` inside
+/// [`ONBOARD_OUTPUT_REPORT_SIZE`]. **The pull has no reply with content**: GG follows it with one input
+/// read and keeps none of the bytes (its read spec's byte specifier for the pull is zero length), and on the
+/// wire that packet is the keyboard's ordinary input report - report `0x01`, all-zero on an idle keyboard, in
+/// all 121 pulls of the capture. The pull is flow control; the profile bytes come from [`OnboardReadCommand`].
+/// Draining that packet is not optional on Linux - see `Apex7::read_pull_ack`.
+///
+/// Sizes and frame layout from the 2026-10-15 reference capture (121 pulls of 1024 bytes at file
+/// offsets 0, 4, 8, … 44 for the schema probe and 0..11264 for full files).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OnboardPullCommand {
+    /// Profile file id: the file base plus the profile index, and the same ids at +0x0100 for the
+    /// lighting files.
+    pub fs_id: u16,
+    /// Offset in the profile file.
+    pub file_offset: u32,
+    /// Bytes to copy into the resource buffer.
+    pub size: u16,
+}
+
+impl OnboardPullCommand {
+    /// Significant frame bytes behind the report number.
+    pub const FRAME_LEN: usize = 10;
+    /// Largest pull the capture shows, the size of the keyboard's resource buffer.
+    pub const MAX_SIZE: u16 = 1024;
+}
+
+impl HidCommand for OnboardPullCommand {
+    fn command_code(&self) -> CommandCode {
+        CommandCode::OnboardPull
+    }
+
+    fn serialize(&self, buffer: &mut [u8], _device_type: HidDeviceType) -> Result<usize> {
+        self.validate()?;
+        check_report_buffer(buffer, ONBOARD_OUTPUT_REPORT_SIZE)?;
+        let report = &mut buffer[..ONBOARD_OUTPUT_REPORT_SIZE];
+        report.fill(0);
+        report[1] = CommandCode::OnboardPull as u8;
+        report[3..5].copy_from_slice(&self.fs_id.to_le_bytes());
+        report[5..9].copy_from_slice(&self.file_offset.to_le_bytes());
+        report[9..Self::FRAME_LEN + 1].copy_from_slice(&self.size.to_le_bytes());
+        Ok(ONBOARD_OUTPUT_REPORT_SIZE)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.size > Self::MAX_SIZE {
+            return Err(Error::InvalidConfig(format!(
+                "pull of {} bytes exceeds the {}-byte resource buffer",
+                self.size,
+                Self::MAX_SIZE
+            )));
+        }
+        Ok(())
+    }
+
+    fn description(&self) -> String {
+        format!(
+            "On-board pull: file {:04X} offset {} size {}",
+            self.fs_id, self.file_offset, self.size
+        )
+    }
+}
+
+/// Read part of the keyboard's resource buffer, `[EXPERIMENTAL]`: `83 | 00 | buffer offset u16 LE |
+/// size u16 LE | 00…` inside [`ONBOARD_FEATURE_REPORT_SIZE`], sent as a feature report on report number
+/// 0, and answered by a `GET_REPORT wValue 0x0300 wIndex 1 wLength 642` read-back (see
+/// [`ONBOARD_FEATURE_REPORT_SIZE`]).
+///
+/// `[EXPERIMENTAL]` The reference capture shows every read answered with the file head (schema word and
+/// profile name) and zeros, never the requested window; the full read has never completed on hardware.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OnboardReadCommand {
+    /// Offset in the resource buffer.
+    pub buffer_offset: u16,
+    /// Bytes to return.
+    pub size: u16,
+}
+
+impl OnboardReadCommand {
+    /// Significant frame bytes behind the report number.
+    pub const FRAME_LEN: usize = 6;
+}
+
+impl HidCommand for OnboardReadCommand {
+    fn command_code(&self) -> CommandCode {
+        CommandCode::OnboardPayloadRead
+    }
+
+    fn serialize(&self, buffer: &mut [u8], _device_type: HidDeviceType) -> Result<usize> {
+        self.validate()?;
+        check_report_buffer(buffer, ONBOARD_FEATURE_REPORT_SIZE)?;
+        let report = &mut buffer[..ONBOARD_FEATURE_REPORT_SIZE];
+        report.fill(0);
+        report[1] = CommandCode::OnboardPayloadRead as u8;
+        report[3..5].copy_from_slice(&self.buffer_offset.to_le_bytes());
+        report[5..Self::FRAME_LEN + 1].copy_from_slice(&self.size.to_le_bytes());
+        Ok(ONBOARD_FEATURE_REPORT_SIZE)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if usize::from(self.size) > ONBOARD_MAX_READ_LEN {
+            return Err(Error::InvalidConfig(format!(
+                "payload read of {} bytes exceeds the {} bytes a {}-byte reply report carries behind its \
+                 5-byte header",
+                self.size, ONBOARD_MAX_READ_LEN, ONBOARD_GET_WIRE_BYTES
+            )));
+        }
+        Ok(())
+    }
+
+    fn description(&self) -> String {
+        format!(
+            "On-board payload read: buffer offset {} size {}",
+            self.buffer_offset, self.size
+        )
+    }
+}
+
+/// Serialize a command into `buffer` for plan reporting. A command that does not validate serializes
+/// to zeros: plan builders validate the read configuration first, so the zeros are a report artifact,
+/// never bytes that reach the keyboard.
+/// Reject a buffer that cannot hold a report of `report_size` bytes.
+fn check_report_buffer(buffer: &[u8], report_size: usize) -> Result<()> {
+    if buffer.len() < report_size {
+        return Err(Error::DeviceCommunication(format!(
+            "Buffer too small: {} bytes (expected {})",
+            buffer.len(),
+            report_size
+        )));
+    }
+    Ok(())
 }
 
 /// Apply/Save command to commit changes.
@@ -1492,6 +1882,245 @@ mod tests {
     use recovery::*;
 
     #[test]
+    fn firmware_poll_carries_the_source_byte() {
+        for (command, expected) in [
+            (OnboardFirmwareVersionCommand::KEYBOARD, 0x00u8),
+            (OnboardFirmwareVersionCommand::LED, 0x01),
+        ] {
+            let mut buffer = [0u8; ONBOARD_OUTPUT_REPORT_SIZE];
+            let size = command
+                .serialize(&mut buffer, HidDeviceType::Keyboard)
+                .expect("firmware poll fits");
+            assert_eq!(size, ONBOARD_OUTPUT_REPORT_SIZE);
+            assert_eq!(buffer[0], 0x00, "report number 0, as the capture's wValue 0x0200");
+            assert_eq!(&buffer[1..3], &[0x90, expected], "source {}", command.source);
+            assert_eq!(command.command_code(), CommandCode::FirmwareVersion);
+            assert!(
+                buffer[3..].iter().all(|b| *b == 0),
+                "the 64-byte data stage is zero padded like the capture's frames"
+            );
+        }
+    }
+
+    #[test]
+    fn driver_mode_command_is_the_engine_open_and_close_frames() {
+        for (mode, expected) in [(DriverModeState::Engaged, 0x01u8), (DriverModeState::Released, 0x00)] {
+            let command = OnboardDriverModeCommand { mode };
+            let mut buffer = [0u8; ONBOARD_OUTPUT_REPORT_SIZE];
+            assert_eq!(
+                command.serialize(&mut buffer, HidDeviceType::Keyboard).unwrap(),
+                ONBOARD_OUTPUT_REPORT_SIZE
+            );
+            assert_eq!(buffer[0], 0x00, "report number 0, as the capture's wValue 0x0200");
+            assert_eq!(&buffer[1..4], &[0x6c, 0x00, expected], "mode {mode:?}");
+            assert_eq!(command.command_code(), CommandCode::DriverMode);
+            assert!(buffer[4..].iter().all(|b| *b == 0), "zero padded data stage");
+        }
+    }
+
+    #[test]
+    fn load_profile_command_uses_the_1_based_profile_id() {
+        let builder = HidReportBuilder::new(HidDeviceType::Keyboard);
+        for slot in 0..ONBOARD_PROFILE_SLOT_COUNT {
+            let command = OnboardLoadProfileCommand { profile: slot };
+            let wire_id = slot.saturating_add(1);
+            let mut buffer = [0u8; ONBOARD_OUTPUT_REPORT_SIZE];
+            assert_eq!(
+                builder.build_report(command, &mut buffer).unwrap(),
+                ONBOARD_OUTPUT_REPORT_SIZE
+            );
+            assert_eq!(buffer[0], 0x00, "report number 0, as the capture's wValue 0x0200");
+            assert_eq!(
+                &buffer[1..3],
+                &[0x89, wire_id],
+                "slot {slot} goes out as profile {wire_id}"
+            );
+            assert!(buffer[3..].iter().all(|b| *b == 0), "zero padded data stage");
+        }
+        assert!(
+            OnboardLoadProfileCommand {
+                profile: ONBOARD_PROFILE_SLOT_COUNT
+            }
+            .validate()
+            .is_err(),
+            "the engine accepts five slots"
+        );
+    }
+
+    #[test]
+    fn pull_frame_matches_the_capture_layout() {
+        let cmd = OnboardPullCommand {
+            fs_id: 0x0201,
+            file_offset: 4096,
+            size: 1024,
+        };
+        let mut buffer = [0u8; ONBOARD_OUTPUT_REPORT_SIZE];
+        assert_eq!(
+            cmd.serialize(&mut buffer, HidDeviceType::Keyboard).unwrap(),
+            ONBOARD_OUTPUT_REPORT_SIZE
+        );
+        assert_eq!(buffer[0], 0x00);
+        assert_eq!(
+            &buffer[1..OnboardPullCommand::FRAME_LEN + 1],
+            [0x85, 0x00, 0x01, 0x02, 0x00, 0x10, 0x00, 0x00, 0x00, 0x04],
+            "the capture's frame bytes, behind the report number"
+        );
+        assert!(buffer[11..].iter().all(|b| *b == 0));
+        assert!(
+            OnboardPullCommand {
+                fs_id: 0x0201,
+                file_offset: 0,
+                size: 2048,
+            }
+            .validate()
+            .is_err(),
+            "a pull cannot exceed the resource buffer"
+        );
+    }
+
+    #[test]
+    fn onboard_reports_build_through_the_builder() {
+        let builder = HidReportBuilder::new(HidDeviceType::Keyboard);
+        let mut chain = [0u8; ONBOARD_OUTPUT_REPORT_SIZE];
+        assert_eq!(
+            builder
+                .build_report(OnboardFirmwareVersionCommand::KEYBOARD, &mut chain)
+                .unwrap(),
+            ONBOARD_OUTPUT_REPORT_SIZE
+        );
+        let mut pull = [0u8; ONBOARD_OUTPUT_REPORT_SIZE];
+        assert_eq!(
+            builder
+                .build_report(
+                    OnboardPullCommand {
+                        fs_id: 0x0201,
+                        file_offset: 0,
+                        size: 1024,
+                    },
+                    &mut pull
+                )
+                .unwrap(),
+            ONBOARD_OUTPUT_REPORT_SIZE
+        );
+        let mut read = [0u8; ONBOARD_FEATURE_REPORT_SIZE];
+        assert_eq!(
+            builder
+                .build_report(
+                    OnboardReadCommand {
+                        buffer_offset: 512,
+                        size: 512,
+                    },
+                    &mut read
+                )
+                .unwrap(),
+            ONBOARD_FEATURE_REPORT_SIZE
+        );
+        for buffer in [&chain[..], &pull[..], &read[..]] {
+            assert_eq!(buffer[0], 0x00, "report number 0 is byte 0 of every buffer");
+        }
+        assert!(
+            builder
+                .build_report(
+                    OnboardPullCommand {
+                        fs_id: 0x0201,
+                        file_offset: 0,
+                        size: 4096,
+                    },
+                    &mut pull
+                )
+                .is_err(),
+            "the builder rejects an invalid pull before anything is sent"
+        );
+    }
+
+    #[test]
+    fn read_frame_matches_the_capture_layout() {
+        let cmd = OnboardReadCommand {
+            buffer_offset: 512,
+            size: 512,
+        };
+        let mut buffer = [0u8; ONBOARD_FEATURE_REPORT_SIZE];
+        assert_eq!(
+            cmd.serialize(&mut buffer, HidDeviceType::Keyboard).unwrap(),
+            ONBOARD_FEATURE_REPORT_SIZE
+        );
+        assert_eq!(
+            &buffer[1..OnboardReadCommand::FRAME_LEN + 1],
+            [0x83, 0x00, 0x00, 0x02, 0x00, 0x02]
+        );
+        assert_eq!(
+            OnboardReadCommand {
+                buffer_offset: 0,
+                size: 2,
+            }
+            .serialize(&mut buffer, HidDeviceType::Keyboard)
+            .unwrap(),
+            ONBOARD_FEATURE_REPORT_SIZE
+        );
+        assert_eq!(
+            &buffer[1..OnboardReadCommand::FRAME_LEN + 1],
+            [0x83, 0x00, 0x00, 0x00, 0x02, 0x00]
+        );
+        let mut buffer = [0u8; ONBOARD_FEATURE_REPORT_SIZE];
+        assert_eq!(
+            cmd.serialize(&mut buffer, HidDeviceType::Keyboard).unwrap(),
+            ONBOARD_FEATURE_REPORT_SIZE
+        );
+        assert_eq!(buffer[0], 0x00, "report number 0, as the capture's wValue 0x0300");
+        assert!(buffer[7..].iter().all(|b| *b == 0));
+        assert!(
+            OnboardReadCommand {
+                buffer_offset: 0,
+                size: 1024,
+            }
+            .validate()
+            .is_err(),
+            "a read cannot ask for more than one reply report carries"
+        );
+        let mut small = [0u8; 64];
+        assert!(
+            cmd.serialize(&mut small, HidDeviceType::Keyboard).is_err(),
+            "the feature report needs its full buffer"
+        );
+    }
+
+    #[test]
+    fn read_back_length_and_its_ceiling_match_the_reply_the_kernel_hands_us() {
+        // Read side: the buffer length goes to the device verbatim (HIDIOCGFEATURE), so the ask equals the
+        // capture's GET wLength. Write side: the kernel strips the report number, so the 643-byte buffer of
+        // ONBOARD_FEATURE_REPORT_SIZE goes out as wLength 642. The asymmetry is the kernel's, and the
+        // measured lengths are the anchor: 642 answers, 643 never completes (2026-10-15).
+        assert_eq!(ONBOARD_GET_WIRE_BYTES, 642, "the capture's GET wLength and our ask");
+        assert_eq!(
+            ONBOARD_FEATURE_REPORT_SIZE,
+            ONBOARD_GET_WIRE_BYTES + 1,
+            "the write buffer carries a report-number byte the wire does not"
+        );
+        assert_eq!(
+            ONBOARD_MAX_READ_LEN, 636,
+            "642 reply bytes minus the report-ID byte and the 5-byte header"
+        );
+        assert!(
+            OnboardReadCommand {
+                buffer_offset: 0,
+                size: 636,
+            }
+            .validate()
+            .is_ok(),
+            "the largest payload a header-echoing reply can carry is accepted"
+        );
+        assert!(
+            OnboardReadCommand {
+                buffer_offset: 0,
+                size: 637,
+            }
+            .validate()
+            .is_err(),
+            "one byte more would not fit behind the header in the reply the kernel delivers"
+        );
+    }
+
+    #[test]
     fn test_rgb_zone_command_validation() {
         // Valid command
         let cmd = RgbZoneCommand::new_single_color(Color::RED, 5);
@@ -1592,7 +2221,7 @@ mod tests {
         let apply_data = vec![0x00, 0x09]; // Apply command
         assert_eq!(builder.parse_command_code(&apply_data), Some(CommandCode::Apply));
 
-        let unknown_data = vec![0x00, 0xFF]; // Unknown command
+        let unknown_data = vec![0x00, 0xFF]; // No command in this crate parses as 0xFF
         assert_eq!(builder.parse_command_code(&unknown_data), None);
 
         let perkey_data = vec![0x00, 0x2A, 0x00, 0x01]; // Per-key command

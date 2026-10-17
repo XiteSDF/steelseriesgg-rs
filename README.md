@@ -327,6 +327,34 @@ Run HID report fuzzing (development tool):
 ssgg fuzz
 ```
 
+### On-board profile read (`ssgg onboard`, `[EXPERIMENTAL]`)
+
+Reads the profile a legacy Apex keyboard keeps in its own flash (Apex 7, Apex Raw, Apex 2014).
+The protocol is reverse-engineered from a 2026-10-15 GG capture; the pacing frame, the pull and the
+payload-read request were accepted by an Apex 7 on 2026-10-15, and its answers come on the interrupt
+endpoint, so every claim here is labelled and the two subcommands that touch the keyboard require `--yes`.
+The code reads only: it never writes the on-board profile. Format and open questions:
+[docs/development/apex-7-onboard-profile-read.md](docs/development/apex-7-onboard-profile-read.md).
+
+```bash
+cargo build --release
+
+# no hardware touched: decode a profile image saved by an earlier read
+ssgg onboard decode /tmp/p0.bin --json /tmp/p0.json
+
+# talk to the keyboard (experimental, needs confirmation)
+ssgg onboard read --yes --profile 0 --out /tmp/p0.bin --json /tmp/p0.json
+```
+
+On Linux the read needs write access to the keyboard's control-collection `/dev/hidraw` node (the udev
+rule in `assets/99-steelseries.rules` grants it to the `input` group).
+
+The read runs on the `Apex7` device handle when the target is an Apex 7 (or its family), and on the
+candidate collections when `--device /dev/hidrawN` names a node. `--debug` shows every transfer with the
+path it went to. The stats
+block of a read reports `garbage_reads`: pages whose first four bytes are `FF` are counted as unproven and
+stored as zeroes.
+
 ## Configuration
 
 Configuration is stored in `~/.config/ssgg/config.toml`:
@@ -351,6 +379,10 @@ debug = false
 
 - `audio` - Enable audio mixer with PulseAudio/PipeWire support
 - `sonar` - Enable SteelSeries Sonar API integration
+
+The `[EXPERIMENTAL]` on-board profile read of the legacy Apex family (Apex 7, Apex Raw, Apex 2014) is part of
+the core build - it adds `ssgg onboard` and never writes the profile. Experimental protocol paths are not
+feature-gated; they carry `[EXPERIMENTAL]` labels.
 
 By default, no optional features are enabled. The Arch package ships with default features only.
 

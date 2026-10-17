@@ -1,5 +1,7 @@
 use clap::{Parser, Subcommand};
 
+use std::path::PathBuf;
+
 use steelseries_gg::devices::KeyId;
 use steelseries_gg::rgb::Color;
 use steelseries_gg::{Error, Result};
@@ -65,6 +67,12 @@ pub(crate) enum Commands {
     Pollrate {
         #[command(subcommand)]
         action: PollrateAction,
+    },
+
+    /// Read the on-board profile of a legacy Apex keyboard (experimental, reads only)
+    Onboard {
+        #[command(subcommand)]
+        action: OnboardAction,
     },
 
     /// Start the GameSense server
@@ -183,6 +191,80 @@ pub(crate) enum Commands {
         #[arg(short, long, default_value = "100")]
         delay: u64,
     },
+}
+
+/// [EXPERIMENTAL] Read the on-board profile of a legacy Apex keyboard.
+///
+/// `decode` works on a saved profile image only and never touches a device. `read` talks to a keyboard
+/// and needs `--yes`: it is reverse-engineered protocol code that writes request frames to a raw device
+/// node. It changes nothing on the keyboard (measured 2026-10-19: the read works without GG's opening
+/// chain and closing sequence, so neither is sent).
+#[derive(Subcommand)]
+pub(crate) enum OnboardAction {
+    /// Read one profile from a legacy Apex keyboard. Requires --yes.
+    Read(OnboardReadArgs),
+
+    /// Decode a profile image saved by an earlier read (no device, no hardware).
+    Decode(OnboardDecodeArgs),
+}
+
+/// One on-board profile read. The flags pick the slot, the keyboard and what to do with the result;
+/// nothing on the wire is a flag. The geometry is fixed in `apex_legacy_profile`: 25 pulls of the
+/// device's 1024-byte resource buffer, drained by five 636-byte payload windows per fill, paced like GG
+/// (5 ms) and read with the reply framing the reference capture shows.
+#[derive(clap::Args)]
+pub(crate) struct OnboardReadArgs {
+    /// On-board profile slot (0-4). The pull count, buffer size, window size, pacing and reply framing
+    /// are protocol constants, not options.
+    #[arg(short, long, default_value = "0")]
+    pub(crate) profile: u8,
+
+    /// Device as `vid:pid` (default: the first Apex 7-family keyboard found). The read runs on that
+    /// keyboard's own handle, the collection the device manager opened
+    #[arg(short, long)]
+    pub(crate) device: Option<String>,
+
+    /// Confirm the device read (required: experimental protocol code, talks to hardware)
+    #[arg(short, long)]
+    pub(crate) yes: bool,
+
+    /// Write the assembled profile image here
+    #[arg(short, long)]
+    pub(crate) out: Option<PathBuf>,
+
+    /// Write the JSON report here
+    #[arg(long)]
+    pub(crate) json: Option<PathBuf>,
+
+    /// Hex-dump the whole profile image to stdout
+    #[arg(long)]
+    pub(crate) hex: bool,
+
+    /// Read twice and compare the profile bytes
+    #[arg(long)]
+    pub(crate) verify: bool,
+}
+
+#[derive(clap::Args)]
+pub(crate) struct OnboardDecodeArgs {
+    /// Profile image file (assembled by `ssgg onboard read --out`)
+    pub(crate) file: PathBuf,
+
+    /// Write the JSON decode report here
+    #[arg(short, long)]
+    pub(crate) json: Option<PathBuf>,
+
+    /// Hex-dump profile bytes
+    #[arg(long)]
+    pub(crate) hex: bool,
+
+    /// First byte of the hex dump
+    #[arg(long, default_value = "0")]
+    pub(crate) hex_from: usize,
+
+    /// Number of bytes in the hex dump
+    #[arg(long, default_value = "64")]
+    pub(crate) hex_len: usize,
 }
 
 #[derive(Subcommand)]

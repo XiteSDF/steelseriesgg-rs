@@ -47,6 +47,10 @@ use crate::cli::normalize_volume;
 #[cfg(feature = "sonar")]
 use crate::cli::{SonarAction, StreamerAction, parse_sonar_channel};
 
+use crate::cli::OnboardAction;
+
+use steelseries_gg::devices::keyboards::apex_legacy_profile::decode;
+
 #[cfg(feature = "audio")]
 use steelseries_gg::audio::AudioMixer;
 
@@ -143,6 +147,17 @@ async fn main() -> Result<()> {
 
         Commands::Pollrate { action } => {
             cmd_pollrate(action).await?;
+        }
+
+        Commands::Onboard { action } => {
+            match &action {
+                // Only the two device-reading subcommands enumerate hardware.
+                OnboardAction::Read(_) => {
+                    let mut manager = new_device_manager()?;
+                    cmd_onboard(Some(&mut manager), action).await?;
+                }
+                _ => cmd_onboard(None, action).await?,
+            }
         }
 
         Commands::Server { port } => {
@@ -788,6 +803,240 @@ async fn cmd_profile(action: ProfileAction) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// [EXPERIMENTAL] Read the on-board profile of a legacy Apex keyboard.
+///
+/// Reads only. The protocol is reverse-engineered from the GG USBPcap capture written up in
+/// docs/development/apex-7-onboard-profile-read.md; a full slot read has completed on an Apex 7, the
+/// decoded layout and the checksum words are still unverified.
+async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAction) -> Result<()> {
+    use steelseries_gg::devices::keyboards::apex_legacy_profile::{hex_dump, profile_json, schema_of, to_json};
+
+    match action {
+        OnboardAction::Read(args) => {
+            let profile = args.profile;
+            if !args.yes {
+                return require_yes("read the on-board profile");
+            }
+            let Some(manager) = manager.as_mut() else {
+                return Err(Error::Other("the on-board profile read needs a device".to_string()));
+            };
+            let Some(keyboard) = onboard_keyboard(manager, &args.device).await else {
+                return Err(Error::DeviceNotFound(
+                    "no Apex 7-family keyboard found: the on-board profile read runs on the keyboard's own handle, selected with --device vid:pid"
+                        .to_string(),
+                ));
+            };
+            let label = onboard_device_label(keyboard.as_ref());
+            print_onboard_banner();
+            println!("reading on the {label}");
+            println!();
+
+            if args.verify {
+                let first = keyboard.read_onboard_profile(profile).await?;
+                let second = keyboard.read_onboard_profile(profile).await?;
+                let diff = first
+                    .data
+                    .iter()
+                    .zip(second.data.iter())
+                    .enumerate()
+                    .find(|(_, (a, b))| a != b)
+                    .map(|(offset, _)| offset);
+                print_onboard_image(&first, &label);
+                print_onboard_image(&second, &label);
+                match diff {
+                    Some(offset) => {
+                        println!("the two reads differ at profile byte {offset}: treat this pairing as unverified")
+                    }
+                    None => println!("the two reads agree on all {} profile bytes", first.data.len()),
+                }
+                if let Some(out) = args.out.as_ref() {
+                    secure_write_async(out.clone(), first.data.clone()).await?;
+                    let second_path = out.with_extension("second.bin");
+                    secure_write_async(second_path.clone(), second.data.clone()).await?;
+                    println!(
+                        "both profile images written: {} and {}",
+                        out.display(),
+                        second_path.display()
+                    );
+                }
+                if let Some(json) = args.json.as_ref() {
+                    secure_write_async(json.clone(), to_json(&first)?).await?;
+                    println!("JSON report of the first read written to {}", json.display());
+                }
+            } else {
+                let image = keyboard.read_onboard_profile(profile).await?;
+                print_onboard_image(&image, &label);
+                if args.hex {
+                    print!("{}", hex_dump(&image.data, 0, image.data.len()));
+                }
+                if let Some(out) = args.out.as_ref() {
+                    secure_write_async(out.clone(), image.data.clone()).await?;
+                    println!("profile image written to {}", out.display());
+                }
+                if let Some(json) = args.json.as_ref() {
+                    secure_write_async(json.clone(), to_json(&image)?).await?;
+                    println!("JSON report written to {}", json.display());
+                }
+            }
+        }
+
+        OnboardAction::Decode(args) => {
+            let data = tokio::fs::read(&args.file)
+                .await
+                .map_err(|e| Error::Other(format!("read {}: {e}", args.file.display())))?;
+            println!("schema word: {:04X}", schema_of(&data));
+            let profile = decode(&data)?;
+            print_onboard_profile(&profile);
+            if args.hex {
+                let from = args.hex_from;
+                let to = (from + args.hex_len).min(data.len());
+                print!("{}", hex_dump(&data, from, to));
+            }
+            if let Some(json) = args.json.as_ref() {
+                secure_write_async(json.clone(), profile_json(&profile)?).await?;
+                println!("JSON decode report written to {}", json.display());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// The Apex 7 as a keyboard device, when the target carries the `[EXPERIMENTAL]` on-board profile
+/// protocol. The read then runs on the handle the device manager opened, which is what `usbhid` needs
+/// for the firmware-poll answer and the pacing packet after every pull: it polls an interrupt endpoint only
+/// while a descriptor on the node is open.
+///
+/// `None` when no matching keyboard is openable, and when the target is not on the platform the
+/// protocol was reverse-engineered from (`Apex7::onboard_family`).
+async fn onboard_keyboard(manager: &mut DeviceManager, device: &Option<String>) -> Option<Box<dyn Keyboard>> {
+    use steelseries_gg::STEELSERIES_VENDOR_ID;
+    use steelseries_gg::devices::keyboards::apex7::onboard_family;
+    use steelseries_gg::devices::product_ids::APEX_7;
+
+    manager.refresh().ok()?;
+    let (vendor, product) = match device.as_ref() {
+        Some(spec) => parse_vid_pid(spec).unwrap_or((STEELSERIES_VENDOR_ID, APEX_7)),
+        None => (STEELSERIES_VENDOR_ID, APEX_7),
+    };
+    let info = manager.devices().into_iter().find(|d| {
+        d.vendor_id == vendor
+            && d.product_id == product
+            && onboard_family(d.product_id)
+            && matches!(d.device_type, steelseries_gg::devices::DeviceType::Keyboard)
+    })?;
+    let keyboard = manager.open_keyboard(info).ok()?;
+    keyboard.supports_onboard_profile().then_some(keyboard)
+}
+
+/// Where a device-driven read ran: the keyboard's name and the collection the manager opened.
+fn onboard_device_label(keyboard: &dyn Keyboard) -> String {
+    format!("{} ({})", keyboard.info().name, keyboard.info().path)
+}
+
+/// `vendor:pid` as used by `ssgg --device`.
+fn parse_vid_pid(spec: &str) -> Option<(u16, u16)> {
+    let (vendor, product) = spec.split_once(':')?;
+    Some((
+        u16::from_str_radix(vendor.trim_start_matches("0x"), 16).ok()?,
+        u16::from_str_radix(product.trim_start_matches("0x"), 16).ok()?,
+    ))
+}
+
+fn require_yes(what: &str) -> Result<()> {
+    println!("Refusing to {what} without --yes:");
+    println!("  this is experimental, reverse-engineered protocol code that talks to a keyboard through");
+    println!("  a raw device node. It reads the on-board profile and writes nothing.");
+    println!("Add --yes when you accept that.");
+    Ok(())
+}
+
+fn print_onboard_banner() {
+    println!("[EXPERIMENTAL] legacy Apex on-board profile read");
+    println!("  reverse-engineered from one GG USBPcap capture; it only reads - it sends no frames that");
+    println!("  change anything on the keyboard.");
+    println!("  slot layout, checksums and the decode are still unverified - compare a read with GG.");
+    println!("  watch the keyboard while it runs: if lighting flickers, Ctrl-C stops the read.");
+    println!();
+}
+
+fn print_onboard_image(image: &steelseries_gg::devices::keyboards::apex_legacy_profile::ProfileImage, path: &str) {
+    use steelseries_gg::devices::keyboards::apex_legacy_profile::decode;
+
+    println!("read {} profile bytes from {path}", image.data.len());
+    match image.firmware.as_deref() {
+        Some(firmware) => println!("firmware:  {firmware} (answered the 0x90 firmware poll)"),
+        None => println!("firmware:  no answer to the 0x90 firmware poll"),
+    }
+    println!(
+        "transfers: {} payload reads over {} pulls; {} bytes covered, {} short read(s)",
+        image.stats.reads_read, image.stats.chunks_read, image.stats.covered_len, image.stats.short_reads
+    );
+    println!(
+        "replies: {} header mismatch(es), {} all-zero read(s), {} all-zero pull(s), {} garbage page(s)",
+        image.stats.header_mismatches, image.stats.zero_reads, image.stats.zero_chunks, image.stats.garbage_reads
+    );
+    match decode(&image.data) {
+        Ok(profile) => print_onboard_profile(&profile),
+        Err(e) => println!("decode: {e}"),
+    }
+    println!();
+}
+
+fn print_onboard_profile(profile: &steelseries_gg::devices::keyboards::apex_legacy_profile::OnboardProfile) {
+    use steelseries_gg::devices::keyboards::apex_legacy_profile::Color;
+
+    fn color(c: &Color) -> String {
+        format!("#{:02X}{:02X}{:02X}", c.r, c.g, c.b)
+    }
+
+    println!("schema: {} (0x{:04X})", profile.schema_name, profile.schema);
+    println!(
+        "checksum: stored {:08X}, computed {:08X} over {} bytes, match: {}",
+        profile.crc_stored, profile.crc_computed, profile.crc_region_len, profile.crc_ok
+    );
+    println!("name: {:?} (raw bytes {})", profile.name, profile.name_hex);
+    println!("guid: {:?} (schema A padding {})", profile.guid, profile.guid_padding);
+    println!("META toggle HID code: 0x{:02X}", profile.meta_toggle_hid);
+    println!(
+        "mappings: {} buttons, {} wheels, {} button META, {} wheel META",
+        profile.button_mappings.len(),
+        profile.wheel_mappings.len(),
+        profile.button_meta_mappings.len(),
+        profile.wheel_meta_mappings.len()
+    );
+
+    let l = &profile.lighting;
+    println!(
+        "lighting [EXPERIMENTAL layout]: lock {} meta {} disabled win {}",
+        color(&l.lock_key_color),
+        color(&l.meta_key_color),
+        color(&l.disabled_win_key_color)
+    );
+    println!(
+        "  dimmers: META {}, idle mode {}; idle timeout {} ms; win HID 0x{:02X}; lock HID codes {}",
+        l.meta_key_background_dimmer, l.idle_mode_dimmer, l.idle_timeout_ms, l.win_key_hid_code, l.lock_key_hid_codes
+    );
+    println!("  OLED illumination options {}", l.oled_illumination_options);
+    println!("  META mapping mask {}", l.meta_mapped_elements);
+
+    match &profile.rapid_tap {
+        Some(rt) => println!(
+            "rapid tap [EXPERIMENTAL]: enable 0x{:02X}, {} key pairs",
+            rt.enable,
+            rt.pairs.len()
+        ),
+        None => println!("rapid tap: absent (schema A has no rapid-tap block)"),
+    }
+
+    for (label, block) in [("OLED", &profile.oled), ("macro", &profile.macro_data)] {
+        println!(
+            "{label}: {} bytes at offset {}, {} non-zero, FNV-1a {}, head {}",
+            block.len, block.offset, block.nonzero, block.fnv1a_64, block.head
+        );
+    }
 }
 
 async fn cmd_pollrate(action: PollrateAction) -> Result<()> {
