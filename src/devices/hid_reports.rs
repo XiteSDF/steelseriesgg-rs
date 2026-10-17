@@ -52,35 +52,25 @@ pub enum CommandCode {
     OnboardPull = 0x85,
     /// [EXPERIMENTAL] Legacy Apex on-board payload read (0x83), see `OnboardReadCommand`.
     OnboardPayloadRead = 0x83,
-    /// [EXPERIMENTAL] Legacy Apex firmware-version poll (0x90), answered on the interrupt endpoint with
-    /// the ASCII firmware version. Both arguments answer on hardware (`90 00` and `90 01`, Apex 7 wired,
-    /// 2026-10-17). See [`OnboardFirmwareVersionCommand`].
+    /// [EXPERIMENTAL] Legacy Apex firmware-version poll (0x90): `90 <source>`, answered on the interrupt
+    /// endpoint with the ASCII firmware version. The source byte selects which firmware answers -
+    /// [`FirmwareSource::Keyboard`] (`90 00`) the keyboard's, [`FirmwareSource::Led`] (`90 01`) the LED
+    /// controller's. See [`OnboardFirmwareVersionCommand`].
     FirmwareVersion = 0x90,
-    /// [EXPERIMENTAL] Legacy Apex frame `f4 00`, seen in GG's opening chain and answered `00 01 00…`;
-    /// meaning unknown, and nothing in this crate sends it.
-    EngineStatus = 0xF4,
-    /// `[EXPERIMENTAL]` Legacy Apex driver mode (0x6C): the opening frame `6c 00 01` (last byte 1) and the
-    /// closing frame `6c 00 00` (last byte 0) - same report number 0, same command, one byte apart. The engine
-    /// writes the opening frame at device init and the closing frame when it closes a session; the read's opening
-    /// chain sends the opening frame ([`ONBOARD_INIT_CHAIN`]) and its closing sequence sends the closing frame
-    /// ([`onboard_end_sequence`]). Only the opening frame is in the reference capture. The engine side of all of
-    /// it - the sleep behind the deploy frame, the lighting-reset frame the engine also writes on closing (which
-    /// this crate does not send), and the Apex 3 family's different driver-mode frames (`0x03` in a 33-byte
-    /// report on Apex 3, `0x6C` with a different opening byte on Apex 3 TKL) - is written up in
-    /// `docs/development/apex-7-onboard-profile-read.md` §Driver mode.
+    /// `[EXPERIMENTAL]` Legacy Apex driver mode (0x6C): GG's engine writes `6c 00 01` when it opens a
+    /// device and `6c 00 00` when it closes a session - same report number 0, same command, one byte
+    /// apart. Only the opening frame is in the reference capture (answered `6c 00 01 00…`). **Nothing in
+    /// ssgg sends it.** The engine side (the sleep behind the deploy frame, the lighting-reset frame the
+    /// engine also writes on closing) and the Apex 3 family split (`0x03` in a 33-byte report on Apex 3,
+    /// `0x6C` with a different opening byte on Apex 3 TKL) is in
+    /// `docs/development/apex-7-onboard-profile-read.md` §Driver mode. See [`OnboardDriverModeCommand`].
     DriverMode = 0x6C,
-    /// `[EXPERIMENTAL]` Legacy Apex Gamesense OLED off (0x69), the engine's Gamesense OLED-off frame, one of the
-    /// frames it writes when it closes a session; in this crate it is the first frame of
-    /// [`onboard_end_sequence`]. See `docs/development/apex-7-onboard-profile-read.md` §Driver mode.
-    DisableGamesenseOled = 0x69,
-    /// `[EXPERIMENTAL]` Legacy Apex profile deploy (0x89): the closing-sequence frame `89 <slot + 1>`, the
-    /// engine's profile-deploy frame. This one writes: it makes the keyboard run the slot. See
-    /// [`onboard_end_sequence`].
+    /// `[EXPERIMENTAL]` Legacy Apex profile deploy (0x89): GG's `89 <1-based profile id>`, the
+    /// `load_profile` frame seen behind profile-file transfers in the reference capture (slots 0, 1, 2, 4
+    /// going out as 1, 2, 3, 5). **This writes to the device** - the keyboard runs the slot named - and
+    /// **nothing in ssgg sends it**: ssgg never changes the keyboard's active profile. See
+    /// [`OnboardLoadProfileCommand`].
     LoadProfile = 0x89,
-    /// `[EXPERIMENTAL]` Legacy Apex profile volatile flag (0x41): the closing-sequence frame `41 00`, which the
-    /// engine sends as 0 for every real slot index. The same byte on the Apex Pro 2023 engine path is an OLED
-    /// frame; the two share the value, not the report shape. See [`onboard_end_sequence`].
-    SetProfileVolatile = 0x41,
 }
 
 impl fmt::Display for CommandCode {
@@ -98,11 +88,8 @@ impl fmt::Display for CommandCode {
             CommandCode::OnboardPull => write!(f, "ONBOARD_PULL_EXPERIMENTAL"),
             CommandCode::OnboardPayloadRead => write!(f, "ONBOARD_PAYLOAD_READ_EXPERIMENTAL"),
             CommandCode::FirmwareVersion => write!(f, "FIRMWARE_VERSION_EXPERIMENTAL"),
-            CommandCode::EngineStatus => write!(f, "ENGINE_STATUS_EXPERIMENTAL"),
             CommandCode::DriverMode => write!(f, "DRIVER_MODE_EXPERIMENTAL"),
-            CommandCode::DisableGamesenseOled => write!(f, "DISABLE_GAMESENSE_OLED_EXPERIMENTAL"),
             CommandCode::LoadProfile => write!(f, "LOAD_PROFILE_EXPERIMENTAL"),
-            CommandCode::SetProfileVolatile => write!(f, "SET_PROFILE_VOLATILE_EXPERIMENTAL"),
         }
     }
 }
@@ -126,11 +113,8 @@ impl CommandCode {
             0x85 => Some(CommandCode::OnboardPull),
             0x83 => Some(CommandCode::OnboardPayloadRead),
             0x90 => Some(CommandCode::FirmwareVersion),
-            0xF4 => Some(CommandCode::EngineStatus),
             0x6C => Some(CommandCode::DriverMode),
-            0x69 => Some(CommandCode::DisableGamesenseOled),
             0x89 => Some(CommandCode::LoadProfile),
-            0x41 => Some(CommandCode::SetProfileVolatile),
             _ => None,
         }
     }
@@ -518,25 +502,57 @@ pub const ONBOARD_GET_WIRE_BYTES: usize = 642;
 /// not the header, which let a read frame ask for a size no reply can carry.
 pub const ONBOARD_MAX_READ_LEN: usize = ONBOARD_GET_WIRE_BYTES - 1 - 5;
 
-/// [EXPERIMENTAL] Legacy Apex firmware-version poll: `90 00` in a 64-byte output report
-/// (`SET_REPORT wValue 0x0200`), answered on the interrupt endpoint with the ASCII firmware version
+/// Firmware source byte for [`OnboardFirmwareVersionCommand`]: which firmware the `90` poll asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirmwareSource {
+    /// `0x00` - the firmware running the keyboard.
+    Keyboard,
+    /// `0x01` - the LED controller's firmware.
+    Led,
+}
+
+impl From<FirmwareSource> for u8 {
+    fn from(source: FirmwareSource) -> Self {
+        match source {
+            FirmwareSource::Keyboard => 0x00,
+            FirmwareSource::Led => 0x01,
+        }
+    }
+}
+
+impl fmt::Display for FirmwareSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FirmwareSource::Keyboard => write!(f, "keyboard"),
+            FirmwareSource::Led => write!(f, "LED"),
+        }
+    }
+}
+
+/// [EXPERIMENTAL] Legacy Apex firmware-version poll: `90 <source>` in a 64-byte output report
+/// (`SET_REPORT wValue 0x0200`), answered on the interrupt endpoint with the ASCII version string
 /// (`34 2e 31 36 2e 38 00…` = `4.16.8` in the reference capture).
 ///
-/// The argument byte does not matter on hardware: an Apex 7 wired answered `90 00` and `90 01` the same
-/// way (2026-10-17). GG's chain polls with both 11 ms apart; this crate sends the whole chain
-/// ([`ONBOARD_INIT_CHAIN`]) in front of the first pull, which starts with this poll. The chain's other
-/// frames, `f4 00` ([`CommandCode::EngineStatus`]) and `6c 00 01` ([`CommandCode::DriverMode`]), have
-/// unknown meanings and are sent because the read needs them (see [`OnboardInitCommand`]).
-///
-/// The read sends this frame as the first entry of [`ONBOARD_INIT_CHAIN`] (the chain's bytes for frame 1
-/// are identical to this builder's, asserted in `firmware_poll_matches_one_answered_form`); this named
-/// builder stays as the hardware-confirmed `90 00` poll itself.
+/// The source byte picks which firmware answers: [`FirmwareSource::Keyboard`] (`90 00`) the keyboard's,
+/// [`FirmwareSource::Led`] (`90 01`) the LED controller's. Measured: the 2026-10-15 GG capture has both
+/// forms on the wire (`ssgg-capture-1612-20261015-004400/summary.md`: `90 00` answered
+/// `00 53 74 65 65 6c 53 ...` = `SteelSeries ...`), and ssgg read both strings from an Apex 7 on
+/// 2026-10-19. Decode the answer with `parse_firmware_version`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OnboardFirmwareVersionCommand;
+pub struct OnboardFirmwareVersionCommand {
+    /// Which firmware this poll asks for.
+    pub source: FirmwareSource,
+}
 
 impl OnboardFirmwareVersionCommand {
-    /// Argument this crate polls with. GG's chain uses `0x01` as well; both answer.
-    const ARG: u8 = 0x00;
+    /// GG's keyboard-firmware form (`90 00`).
+    pub const KEYBOARD: Self = Self {
+        source: FirmwareSource::Keyboard,
+    };
+    /// The LED-controller form (`90 01`).
+    pub const LED: Self = Self {
+        source: FirmwareSource::Led,
+    };
 }
 
 impl HidCommand for OnboardFirmwareVersionCommand {
@@ -549,118 +565,7 @@ impl HidCommand for OnboardFirmwareVersionCommand {
         let report = &mut buffer[..ONBOARD_OUTPUT_REPORT_SIZE];
         report.fill(0);
         report[1] = CommandCode::FirmwareVersion as u8;
-        report[2] = Self::ARG;
-        Ok(ONBOARD_OUTPUT_REPORT_SIZE)
-    }
-
-    fn validate(&self) -> Result<()> {
-        Ok(())
-    }
-
-    fn description(&self) -> String {
-        "On-board firmware version poll: 90 00".to_string()
-    }
-}
-
-/// Number of frames in GG's legacy Apex opening chain, see [`ONBOARD_INIT_CHAIN`].
-pub const ONBOARD_INIT_FRAME_COUNT: usize = 6;
-
-/// [EXPERIMENTAL] GG's legacy Apex opening chain, sent once in front of the first pull, `[report
-/// number][command][argument bytes][0…]` in 64-byte output reports
-/// (`SET_REPORT wValue 0x0200 wIndex 1 wLength 64`, 8-14 ms apart, median 11 ms, in the reference
-/// capture).
-///
-/// **The chain is required on hardware.** A read that sends only the [`OnboardFirmwareVersionCommand`]
-/// poll is answered on the wire, but the payload replies come back as scrambled bytes; with this chain
-/// sent the same read collects a profile slot (Apex 7, 2026-10-18). Which frame arms the resource buffer
-/// is not known: in the capture `f4 00` ([`CommandCode::EngineStatus`]) answers `00 01 00 …` and `6c 00 01`
-/// ([`CommandCode::DriverMode`]) is answered by nothing, so this crate sends all six frames the way GG does.
-/// `90 00` and `90 01` ([`CommandCode::FirmwareVersion`]) answer with the ASCII firmware version on
-/// hardware (2026-10-17).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OnboardInitCommand {
-    /// Frame command code.
-    pub command: CommandCode,
-    /// The two bytes behind the command, zero padded into the 64-byte report.
-    pub argument: [u8; 2],
-}
-
-/// The chain in GG's order: `90 00`, `90 01`, `f4 00`, `6c 00 01`, `90 00`, `90 01`.
-pub const ONBOARD_INIT_CHAIN: [OnboardInitCommand; ONBOARD_INIT_FRAME_COUNT] = [
-    OnboardInitCommand {
-        command: CommandCode::FirmwareVersion,
-        argument: [0x00, 0x00],
-    },
-    OnboardInitCommand {
-        command: CommandCode::FirmwareVersion,
-        argument: [0x01, 0x00],
-    },
-    OnboardInitCommand {
-        command: CommandCode::EngineStatus,
-        argument: [0x00, 0x00],
-    },
-    OnboardInitCommand {
-        command: CommandCode::DriverMode,
-        argument: [0x00, 0x01],
-    },
-    OnboardInitCommand {
-        command: CommandCode::FirmwareVersion,
-        argument: [0x00, 0x00],
-    },
-    OnboardInitCommand {
-        command: CommandCode::FirmwareVersion,
-        argument: [0x01, 0x00],
-    },
-];
-
-/// Number of frames in the read's closing sequence, see [`onboard_end_sequence`].
-pub const ONBOARD_END_FRAME_COUNT: usize = 4;
-
-/// `[EXPERIMENTAL]` The frames that close a profile session: `69` (Gamesense OLED off), `89 <slot + 1>` (deploy
-/// that slot), `41 00` (the profile is not volatile), `6c 00 00` (close driver mode) - the same 64-byte output
-/// reports as [`ONBOARD_INIT_CHAIN`], built with [`OnboardInitCommand`].
-///
-/// The first three are in the reference capture's frame inventory, one deploy/volatile pair behind each profile
-/// file. **`6c 00 00` is not** - it is the engine's session-closing frame, and the capture's GG was killed
-/// rather than closed, so its closing frames are not on the wire. The read sends it because its own opening
-/// chain put the device into driver mode (`6c 00 01`, [`ONBOARD_INIT_CHAIN`]): the read closes what it opened.
-/// The engine-side detail is in `docs/development/apex-7-onboard-profile-read.md` §Driver mode.
-///
-/// **These frames write to the device.** `89` makes the keyboard run the slot it names.
-#[must_use]
-pub fn onboard_end_sequence(profile: u8) -> [OnboardInitCommand; ONBOARD_END_FRAME_COUNT] {
-    [
-        OnboardInitCommand {
-            command: CommandCode::DisableGamesenseOled,
-            argument: [0x00, 0x00],
-        },
-        OnboardInitCommand {
-            command: CommandCode::LoadProfile,
-            // The engine's `succ index`: slots are 0-based in this crate, 1-based on the wire.
-            argument: [profile.saturating_add(1), 0x00],
-        },
-        OnboardInitCommand {
-            command: CommandCode::SetProfileVolatile,
-            argument: [0x00, 0x00],
-        },
-        OnboardInitCommand {
-            command: CommandCode::DriverMode,
-            argument: [0x00, 0x00],
-        },
-    ]
-}
-
-impl HidCommand for OnboardInitCommand {
-    fn command_code(&self) -> CommandCode {
-        self.command
-    }
-
-    fn serialize(&self, buffer: &mut [u8], _device_type: HidDeviceType) -> Result<usize> {
-        check_report_buffer(buffer, ONBOARD_OUTPUT_REPORT_SIZE)?;
-        let report = &mut buffer[..ONBOARD_OUTPUT_REPORT_SIZE];
-        report.fill(0);
-        report[1] = self.command as u8;
-        report[2..4].copy_from_slice(&self.argument);
+        report[2] = self.source.into();
         Ok(ONBOARD_OUTPUT_REPORT_SIZE)
     }
 
@@ -670,8 +575,116 @@ impl HidCommand for OnboardInitCommand {
 
     fn description(&self) -> String {
         format!(
-            "On-board opening chain frame: {:#04X} {:02X} {:02X}",
-            self.command as u8, self.argument[0], self.argument[1]
+            "Onboard firmware version poll: 90 {:02X} ({} firmware)",
+            u8::from(self.source),
+            self.source
+        )
+    }
+}
+
+/// Which driver mode [`OnboardDriverModeCommand`] asks the keyboard for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverModeState {
+    /// `0x01` - engaged. GG's engine writes it at device init (`6c 00 01`).
+    Engaged,
+    /// `0x00` - released. GG's engine writes it at shutdown (`6c 00 00`).
+    Released,
+}
+
+impl From<DriverModeState> for u8 {
+    fn from(mode: DriverModeState) -> Self {
+        match mode {
+            DriverModeState::Engaged => 0x01,
+            DriverModeState::Released => 0x00,
+        }
+    }
+}
+
+/// [EXPERIMENTAL] Legacy Apex driver mode: `6c 00 <mode>` in a 64-byte output report
+/// (`SET_REPORT wValue 0x0200`). GG's engine writes [`DriverModeState::Engaged`] when it opens a device
+/// and [`DriverModeState::Released`] when it shuts down; only the opening frame is in the 2026-10-15
+/// capture, answered `6c 00 01 00 ...` on the interrupt endpoint.
+///
+/// **Nothing in ssgg sends this command.** The on-board profile read was measured on 2026-10-19 to work
+/// without it. The engine-side detail and the **Apex 3 family split** (Apex 3 uses command `0x03` in a
+/// 33-byte report, Apex 3 TKL uses `0x6C` and opens with driver mode engaged) is in
+/// `docs/development/apex-7-onboard-profile-read.md` §Driver mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OnboardDriverModeCommand {
+    /// Driver mode to set.
+    pub mode: DriverModeState,
+}
+
+impl HidCommand for OnboardDriverModeCommand {
+    fn command_code(&self) -> CommandCode {
+        CommandCode::DriverMode
+    }
+
+    fn serialize(&self, buffer: &mut [u8], _device_type: HidDeviceType) -> Result<usize> {
+        check_report_buffer(buffer, ONBOARD_OUTPUT_REPORT_SIZE)?;
+        let report = &mut buffer[..ONBOARD_OUTPUT_REPORT_SIZE];
+        report.fill(0);
+        report[1] = CommandCode::DriverMode as u8;
+        report[3] = self.mode.into();
+        Ok(ONBOARD_OUTPUT_REPORT_SIZE)
+    }
+
+    fn validate(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn description(&self) -> String {
+        format!("Onboard driver mode: 6c 00 {:02X}", u8::from(self.mode))
+    }
+}
+
+/// Profile slots the engine accepts: `(range 1 5)` on the wire, i.e. 0-based slots 0..=4 here.
+pub const ONBOARD_PROFILE_SLOT_COUNT: u8 = 5;
+
+/// [EXPERIMENTAL] Legacy Apex on-board profile deploy: `89 <1-based profile id>` in a 64-byte output
+/// report - GG's `load_profile`. Seen in the 2026-10-15 capture behind profile-file transfers (rows 83,
+/// 85, 111, 121: slots 0, 1, 2, 4 going out as 1, 2, 3, 5).
+///
+/// **This writes to the device**: it makes the keyboard run the slot it names. **Nothing in ssgg sends
+/// it** - the on-board profile read was measured on 2026-10-19 to work without it, and ssgg never changes
+/// the keyboard's active profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OnboardLoadProfileCommand {
+    /// Profile slot, 0-based as everywhere in this crate; the wire id is `profile + 1`.
+    pub profile: u8,
+}
+
+impl HidCommand for OnboardLoadProfileCommand {
+    fn command_code(&self) -> CommandCode {
+        CommandCode::LoadProfile
+    }
+
+    fn serialize(&self, buffer: &mut [u8], _device_type: HidDeviceType) -> Result<usize> {
+        self.validate()?;
+        check_report_buffer(buffer, ONBOARD_OUTPUT_REPORT_SIZE)?;
+        let report = &mut buffer[..ONBOARD_OUTPUT_REPORT_SIZE];
+        report.fill(0);
+        report[1] = CommandCode::LoadProfile as u8;
+        report[2] = self.profile.saturating_add(1);
+        Ok(ONBOARD_OUTPUT_REPORT_SIZE)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.profile >= ONBOARD_PROFILE_SLOT_COUNT {
+            return Err(Error::InvalidConfig(format!(
+                "profile slot {} out of range (GG accepts 0..{})",
+                self.profile,
+                ONBOARD_PROFILE_SLOT_COUNT - 1
+            )));
+        }
+        Ok(())
+    }
+
+    fn description(&self) -> String {
+        format!(
+            "Onboard profile deploy: 89 {:02X} (slot {})",
+            self.profile.saturating_add(1),
+            self.profile
         )
     }
 }
@@ -1869,114 +1882,69 @@ mod tests {
     use recovery::*;
 
     #[test]
-    fn firmware_poll_matches_one_answered_form() {
-        let mut buffer = [0u8; ONBOARD_OUTPUT_REPORT_SIZE];
-        let size = OnboardFirmwareVersionCommand
-            .serialize(&mut buffer, HidDeviceType::Keyboard)
-            .unwrap();
-        assert_eq!(size, ONBOARD_OUTPUT_REPORT_SIZE);
-        assert_eq!(buffer[0], 0x00, "report number 0, as the capture's wValue 0x0200");
-        assert_eq!(&buffer[1..3], &[0x90, 0x00]);
+    fn firmware_poll_carries_the_source_byte() {
+        for (command, expected) in [
+            (OnboardFirmwareVersionCommand::KEYBOARD, 0x00u8),
+            (OnboardFirmwareVersionCommand::LED, 0x01),
+        ] {
+            let mut buffer = [0u8; ONBOARD_OUTPUT_REPORT_SIZE];
+            let size = command
+                .serialize(&mut buffer, HidDeviceType::Keyboard)
+                .expect("firmware poll fits");
+            assert_eq!(size, ONBOARD_OUTPUT_REPORT_SIZE);
+            assert_eq!(buffer[0], 0x00, "report number 0, as the capture's wValue 0x0200");
+            assert_eq!(&buffer[1..3], &[0x90, expected], "source {}", command.source);
+            assert_eq!(command.command_code(), CommandCode::FirmwareVersion);
+            assert!(
+                buffer[3..].iter().all(|b| *b == 0),
+                "the 64-byte data stage is zero padded like the capture's frames"
+            );
+        }
+    }
+
+    #[test]
+    fn driver_mode_command_is_the_engine_open_and_close_frames() {
+        for (mode, expected) in [(DriverModeState::Engaged, 0x01u8), (DriverModeState::Released, 0x00)] {
+            let command = OnboardDriverModeCommand { mode };
+            let mut buffer = [0u8; ONBOARD_OUTPUT_REPORT_SIZE];
+            assert_eq!(
+                command.serialize(&mut buffer, HidDeviceType::Keyboard).unwrap(),
+                ONBOARD_OUTPUT_REPORT_SIZE
+            );
+            assert_eq!(buffer[0], 0x00, "report number 0, as the capture's wValue 0x0200");
+            assert_eq!(&buffer[1..4], &[0x6c, 0x00, expected], "mode {mode:?}");
+            assert_eq!(command.command_code(), CommandCode::DriverMode);
+            assert!(buffer[4..].iter().all(|b| *b == 0), "zero padded data stage");
+        }
+    }
+
+    #[test]
+    fn load_profile_command_uses_the_1_based_profile_id() {
+        let builder = HidReportBuilder::new(HidDeviceType::Keyboard);
+        for slot in 0..ONBOARD_PROFILE_SLOT_COUNT {
+            let command = OnboardLoadProfileCommand { profile: slot };
+            let wire_id = slot.saturating_add(1);
+            let mut buffer = [0u8; ONBOARD_OUTPUT_REPORT_SIZE];
+            assert_eq!(
+                builder.build_report(command, &mut buffer).unwrap(),
+                ONBOARD_OUTPUT_REPORT_SIZE
+            );
+            assert_eq!(buffer[0], 0x00, "report number 0, as the capture's wValue 0x0200");
+            assert_eq!(
+                &buffer[1..3],
+                &[0x89, wire_id],
+                "slot {slot} goes out as profile {wire_id}"
+            );
+            assert!(buffer[3..].iter().all(|b| *b == 0), "zero padded data stage");
+        }
         assert!(
-            buffer[3..].iter().all(|b| *b == 0),
-            "the 64-byte data stage is zero padded like the capture's frames"
+            OnboardLoadProfileCommand {
+                profile: ONBOARD_PROFILE_SLOT_COUNT
+            }
+            .validate()
+            .is_err(),
+            "the engine accepts five slots"
         );
-        assert_eq!(
-            OnboardFirmwareVersionCommand.command_code(),
-            CommandCode::FirmwareVersion
-        );
-    }
-
-    #[test]
-    fn opening_chain_matches_the_capture_frames() {
-        let builder = HidReportBuilder::new(HidDeviceType::Keyboard);
-        let expected: [(u8, [u8; 2]); ONBOARD_INIT_FRAME_COUNT] = [
-            (0x90, [0x00, 0x00]),
-            (0x90, [0x01, 0x00]),
-            (0xf4, [0x00, 0x00]),
-            (0x6c, [0x00, 0x01]),
-            (0x90, [0x00, 0x00]),
-            (0x90, [0x01, 0x00]),
-        ];
-        assert_eq!(ONBOARD_INIT_CHAIN.len(), ONBOARD_INIT_FRAME_COUNT);
-        for (index, frame) in ONBOARD_INIT_CHAIN.iter().enumerate() {
-            let mut buffer = [0u8; ONBOARD_OUTPUT_REPORT_SIZE];
-            let size = builder
-                .build_report(*frame, &mut buffer)
-                .expect("chain frame builds in a 64-byte report");
-            let (command, argument) = expected[index];
-            assert_eq!(size, ONBOARD_OUTPUT_REPORT_SIZE);
-            assert_eq!(buffer[0], 0x00, "report number 0, as the capture's wValue 0x0200");
-            assert_eq!(
-                &buffer[1..4],
-                &[command, argument[0], argument[1]],
-                "chain frame {} in GG's order",
-                index + 1
-            );
-            assert!(buffer[4..].iter().all(|b| *b == 0), "zero padded data stage");
-        }
-
-        // The chain's first frame is the `90 00` firmware poll, byte for byte.
-        let mut poll = [0u8; ONBOARD_OUTPUT_REPORT_SIZE];
-        let mut chain = [0u8; ONBOARD_OUTPUT_REPORT_SIZE];
-        OnboardFirmwareVersionCommand
-            .serialize(&mut poll, HidDeviceType::Keyboard)
-            .unwrap();
-        ONBOARD_INIT_CHAIN[0]
-            .serialize(&mut chain, HidDeviceType::Keyboard)
-            .unwrap();
-        assert_eq!(poll, chain);
-    }
-
-    #[test]
-    fn end_sequence_matches_the_engine_tail() {
-        let builder = HidReportBuilder::new(HidDeviceType::Keyboard);
-        // The closing sequence behind a slot-2 read: OLED off, deploy with the 1-based profile id, volatile 0,
-        // close driver mode. Only the first three are in the capture's frame inventory - the fourth is the
-        // engine's session-closing frame.
-        let expected: [(u8, [u8; 2]); ONBOARD_END_FRAME_COUNT] = [
-            (0x69, [0x00, 0x00]),
-            (0x89, [0x03, 0x00]),
-            (0x41, [0x00, 0x00]),
-            (0x6c, [0x00, 0x00]),
-        ];
-        for (index, frame) in onboard_end_sequence(2).iter().enumerate() {
-            let mut buffer = [0u8; ONBOARD_OUTPUT_REPORT_SIZE];
-            let size = builder
-                .build_report(*frame, &mut buffer)
-                .expect("tail frame builds in a 64-byte report");
-            let (command, argument) = expected[index];
-            assert_eq!(size, ONBOARD_OUTPUT_REPORT_SIZE);
-            assert_eq!(buffer[0], 0x00, "report number 0, as the capture's wValue 0x0200");
-            assert_eq!(
-                &buffer[1..4],
-                &[command, argument[0], argument[1]],
-                "tail frame {} in GG's order",
-                index + 1
-            );
-            assert!(buffer[4..].iter().all(|b| *b == 0), "zero padded data stage");
-        }
-
-        // The closing frame is the driver-mode close: the chain's own command byte with the last byte cleared -
-        // the read closes the driver mode its opening chain opened.
-        let closing = onboard_end_sequence(0)[ONBOARD_END_FRAME_COUNT - 1];
-        assert_eq!(closing.command, CommandCode::DriverMode);
-        assert_eq!(closing.argument, [0x00, 0x00], "closing driver mode uses 0");
-        assert_eq!(
-            ONBOARD_INIT_CHAIN[3].command, closing.command,
-            "the chain's fourth frame and the closing frame share the command byte"
-        );
-        assert_eq!(
-            ONBOARD_INIT_CHAIN[3].argument,
-            [0x00, 0x01],
-            "the chain's frame opens driver mode (last byte 1)"
-        );
-
-        // The deploy argument is the engine's `succ index`: the five slots go out as 1..=5.
-        for slot in 0..=4u8 {
-            let deployed = onboard_end_sequence(slot)[1].argument[0];
-            assert_eq!(deployed, slot + 1, "slot {slot} deploys as profile {deployed}");
-        }
     }
 
     #[test]
@@ -2015,7 +1983,9 @@ mod tests {
         let builder = HidReportBuilder::new(HidDeviceType::Keyboard);
         let mut chain = [0u8; ONBOARD_OUTPUT_REPORT_SIZE];
         assert_eq!(
-            builder.build_report(OnboardFirmwareVersionCommand, &mut chain).unwrap(),
+            builder
+                .build_report(OnboardFirmwareVersionCommand::KEYBOARD, &mut chain)
+                .unwrap(),
             ONBOARD_OUTPUT_REPORT_SIZE
         );
         let mut pull = [0u8; ONBOARD_OUTPUT_REPORT_SIZE];

@@ -955,8 +955,8 @@ fn require_yes(what: &str) -> Result<()> {
 
 fn print_onboard_banner() {
     println!("[EXPERIMENTAL] legacy Apex on-board profile read");
-    println!("  reverse-engineered from one GG USBPcap capture; it reads, and ends with the engine's");
-    println!("  three tail frames, which make the keyboard run the slot that was read (slot + 1).");
+    println!("  reverse-engineered from one GG USBPcap capture; it only reads - it sends no frames that");
+    println!("  change anything on the keyboard.");
     println!("  slot layout, checksums and the decode are still unverified - compare a read with GG.");
     println!("  watch the keyboard while it runs: if lighting flickers, Ctrl-C stops the read.");
     println!();

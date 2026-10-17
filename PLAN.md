@@ -37,11 +37,13 @@ Code is in place (2026-10-17, `onboard-configs-dev`): `Apex7` in `src/devices/ke
 itself on that handle; `Keyboard::read_onboard_profile` is the device API,
 `discovery::open_keyboard` returns `Apex7` for `0x1612`, `0x1614`, `0x1616`, `0x1618` - the whole read path is
 core code (2026-10-17: the `onboard` feature flag was removed, the device class and the read path are both in
-the default build). `ssgg onboard read` runs on that device. **Status 2026-10-18:** a full profile slot read
-completes on an Apex 7 under Linux, with GG's six-frame opening chain sent (`ONBOARD_INIT_CHAIN`) - a read that
-sends only the `90 00` poll is answered on the wire with scrambled payload bytes. The chain is answered **one
-frame at a time**, so `send_init_chain` reads one input report after every frame (2026-10-18). The read ends with
-the engine's four closing frames (`send_end_sequence`, 2026-10-18 and 2026-10-19, never sent on hardware - item 5). So this section is the
+the default build). `ssgg onboard read` runs on that device. **Status 2026-10-18, updated 2026-10-19:** a full profile slot read
+completes on an Apex 7 under Linux, **with no opening chain and no closing sequence sent** - the 2026-10-18
+finding that a read with only the `90 00` poll answers with scrambled payload bytes is superseded by the
+2026-10-19 runs, which collect a slot with none of GG's chain frames and none of its closing frames on the
+wire. `ONBOARD_INIT_CHAIN`/`send_init_chain` and the four closing frames
+(`send_end_sequence`, 2026-10-18 and 2026-10-19) are out of the code: **the read sends request frames only and
+changes nothing on the keyboard**. So this section is the
 validation backlog: record the model, firmware, slot
 bytes and the checksum line from the run log - that is what promotes any of it to confirmed.
 
@@ -55,7 +57,7 @@ bytes and the checksum line from the run log - that is what promotes any of it t
    needs interface 1 (`wIndex 1` in the capture) and the manager opens another collection, that collection has to be
    discovered as its own device.
 2. **[HW] Reply framing on the device - answered 2026-10-17/18:** framing 0 ([`READ_REPLY_FRAMING_LEN`]) is what the
-   reads collect profile bytes with, matching the capture. The geometry, pacing, opening chain and reply framing are
+   reads collect profile bytes with, matching the capture. The geometry, pacing, single `90 00` poll and reply framing are
    constants (`ReadConfig` and its CLI tunables are gone), so a keyboard that anchors its payload elsewhere is a code
    change measured from a `--debug` capture first; the `90` poll answer in the log confirms the device path.
 3. **[HW] Slots `1..4`, then `--verify`** (slot 0 reads since 2026-10-17/18): `ssgg onboard read --yes --profile N
@@ -64,7 +66,9 @@ bytes and the checksum line from the run log - that is what promotes any of it t
    `ONBOARD.md` "Next hardware steps" describes.
 4. **[HW] Windows:** same read through the hidapi path; confirms the interface choice for the control
    collection.
-5. **[HW] Closing sequence (code 2026-10-18, driver-mode close 2026-10-19):** `Apex7::send_end_sequence` closes
+5. **[HW] Closing sequence - closed 2026-10-19, the read sends none of it:** measured on hardware that the
+   read completes without these frames, so `Apex7::send_end_sequence` and `onboard_end_sequence` are out of the
+   code. What stays open (untested, unmeasured) is what the engine's frames do to a keyboard: `Apex7::send_end_sequence` closes
    every read with `69` (Gamesense OLED off), `89 <slot + 1>` (deploy that slot), `41 00` (profile not volatile)
    and `6c 00 00` (close driver mode). The first three are in the capture's frame inventory; the fourth is the
    counterpart of the opening chain's `6c 00 01` - the read closes the driver mode its own chain opened - and is
@@ -410,6 +414,24 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   and two new Known-facts rows, rules rows for the chain and the closing sequence plus a family row, index row.
   Code comments cite wire facts and point at the doc, because `ONBOARD.md` line 10 keeps the `lisp/` descriptors
   out of code comments.
+- 2026-10-19 (sequences the read does not need, firmware source byte): **measured on hardware, `ssgg onboard
+  read` collects a profile slot with GG's opening chain not sent and with the closing sequence not sent**, so
+  both are out of the code - `ONBOARD_INIT_CHAIN` / `OnboardInitCommand` / `Apex7::send_init_chain`,
+  `onboard_end_sequence` / `ONBOARD_END_FRAME_COUNT` / `Apex7::send_end_sequence`, the 100 ms settle gap behind
+  the chain, and the command codes nothing sends any more (`EngineStatus 0xF4`, `DisableGamesenseOled 0x69`,
+  `SetProfileVolatile 0x41`). This supersedes the entry above (the four-frame closing sequence, never sent on
+  hardware) and the 2026-10-18 chain result: the read now sends request frames only and **changes nothing on the
+  keyboard**; `read --yes` stays required because it is reverse-engineered protocol code writing to a raw device
+  node. `CommandCode::DriverMode` (`0x6C`) and `CommandCode::LoadProfile` (`0x89`, a device write - it makes the
+  keyboard run the slot) stay in `hid_reports` as named builders, sent by nothing. `OnboardFirmwareVersionCommand`
+  is typed with a source byte - `FirmwareSource::Keyboard` (`90 00`) answers the firmware running the keyboard,
+  `FirmwareSource::Led` (`90 01`) the LED controller's; both read on an Apex 7, and the 2026-10-15 capture has both
+  forms (`summary.md` rows 97, 115). The read sends one `90 00` in front of the probe. Measured detail: a payload
+  read needs ~1 ms after its request is written, before reading the reply back - without the wait the read races the
+  device filling its resource buffer and answers with garbage (`Apex7::read_window`). Docs: dev doc §Sequences the
+  read does not need (new), header / transfers table / §Write path / §Driver mode / §Safety / open questions
+  updated, `ONBOARD.md` steps 0, 0b, 8 superseded with a new facts section, rule-file chain and closing rows
+  rewritten as "GG sends it, ssgg does not", index row and item 5 updated.
 
 ## Reference projects
 

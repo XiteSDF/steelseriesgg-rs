@@ -3,9 +3,9 @@
 //!
 //! Frame construction, reply parsing, payload geometry and decoding live in
 //! [`crate::devices::keyboards::apex_legacy_profile`]; every wire fact the read depends on is stated
-//! in that module's doc, once. This module is the transfer machinery: it sends GG's opening chain (which
-//! starts with the firmware poll), the pull frames, the pacing read that follows each pull and the payload
-//! reads, collects the replies and assembles a
+//! in that module's doc, once. This module is the transfer machinery: it sends the firmware poll and the
+//! pull frames, the pacing read that follows each pull and the payload reads, collects the replies and
+//! assembles a
 //! [`ProfileImage`](crate::devices::keyboards::apex_legacy_profile::ProfileImage).
 //!
 //! The transfers run on the handle this device already owns - the collection the device manager opened,
@@ -36,8 +36,8 @@ use super::apex_legacy_profile::{
 };
 use super::{GenericKeyboard, Keyboard};
 use crate::devices::hid_reports::{
-    HidCommand, ONBOARD_END_FRAME_COUNT, ONBOARD_FEATURE_REPORT_SIZE, ONBOARD_INIT_CHAIN, ONBOARD_INIT_FRAME_COUNT,
-    ONBOARD_OUTPUT_REPORT_SIZE, OnboardPullCommand, OnboardReadCommand, onboard_end_sequence,
+    FirmwareSource, HidCommand, ONBOARD_FEATURE_REPORT_SIZE, ONBOARD_OUTPUT_REPORT_SIZE, OnboardFirmwareVersionCommand,
+    OnboardPullCommand, OnboardReadCommand,
 };
 use crate::devices::key_mapping::{KeyId, KeyMapping};
 use crate::devices::product_ids;
@@ -78,23 +78,15 @@ const REPLY_BUDGET_MS: u64 = 2_000;
 const REPLY_INPUT_ATTEMPTS: u32 = 20;
 /// Reads allowed per pull before giving up (the device streams input reports, so one answer is expected).
 const PULL_ACK_ATTEMPTS: u32 = 4;
-/// Bytes to read for one opening-chain answer: GG's input read size, [`GG_INPUT_READ_BYTES`] (a report-ID
-/// slot plus 64 data bytes), which every chain answer fits (`0x6E` with the ASCII version, `0x12` with
-/// `00 01 …`).
-const CHAIN_REPLY_LEN: usize = GG_INPUT_READ_BYTES;
-/// Reads per chain frame. One: the frame that follows must not consume this frame's answer, and a frame
-/// GG leaves unanswered (`6c 00 01`) must not stall the chain.
-const CHAIN_REPLY_ATTEMPTS: u32 = 1;
+/// Bytes to read for the firmware poll's answer: GG's input read size, [`GG_INPUT_READ_BYTES`] (a
+/// report-ID slot plus 64 data bytes), which the answer fits (`0x6E` with the ASCII version).
+const FIRMWARE_REPLY_LEN: usize = GG_INPUT_READ_BYTES;
+/// Reads allowed for the firmware poll's answer. One: the version is informational, so the read must not
+/// spend time waiting on a keyboard that answers nothing.
+const FIRMWARE_REPLY_ATTEMPTS: u32 = 1;
 /// Size of the schema probe pull, in bytes: the 2-byte probe on the profile file of slot 0 the reference
 /// capture shows in front of the file read (`[85][00][0201][0][2]`, answered `03 0b 00`).
 const PROBE_PULL_LEN: u16 = 2;
-/// What the engine sleeps after its profile-deploy frame: 250 ms, documented as a wait for the firmware to
-/// finish deploying. See `docs/development/apex-7-onboard-profile-read.md` §Driver mode.
-const LOAD_PROFILE_SLEEP_MS: u64 = 250;
-/// 1-based position of the deploy frame in [`onboard_end_sequence`], the frame the sleep follows.
-const LOAD_PROFILE_FRAME_INDEX: usize = 2;
-/// No gap is needed after the closing `end_driver_mode` frame - it is the last write of the read.
-const NO_GAP_AFTER_FRAME_INDEX: usize = ONBOARD_END_FRAME_COUNT;
 /// Largest input report a profile collection can return (Apex 7 profile collections report 1024).
 const INPUT_REPORT_MAX_LEN: usize = 1024;
 
@@ -105,16 +97,15 @@ const _: () = assert!(MAX_READ_LEN + READ_REPLY_FRAMING_LEN < READ_REPLY_BUFFER_
 
 // The transfers the profile protocol needs are the packet I/O of the keyboard this device owns:
 // `GenericKeyboard::write_profile_packet` for output frames (not `send_report`: its write goes through
-// `write_padded_report`, whose global hid optimizer drops a report byte-identical to one sent in the last 50 ms,
-// and the opening chain repeats `90 00` and `90 01` - see [`Apex7::write_output_command`]), the keyboard's
-// `send_feature` for the feature-report read request, and `read_profile_feature_packet` /
-// `read_profile_input_packet` for the two reply shapes - all on the handle the device manager opened, open for
-// the whole read.
+// `write_padded_report`, whose global hid optimizer drops a report byte-identical to one sent in the last 50 ms
+// - see [`Apex7::write_output_command`]), the keyboard's `send_feature` for the feature-report read request, and
+// `read_profile_feature_packet` / `read_profile_input_packet` for the two reply shapes - all on the handle the
+// device manager opened, open for the whole read.
 //
-// `[EXPERIMENTAL]`: on hardware the opening chain, the pull, the pacing read and the payload read-back all
-// complete on an Apex 7 (2026-10-17/18); the read request is answered by the `GET_REPORT` control-IN reply
-// the capture shows. The chain is what makes the payload readable: without it the replies come back
-// scrambled.
+// `[EXPERIMENTAL]`: on hardware the firmware poll, the pull, the pacing read and the payload read-back all
+// complete on an Apex 7 (2026-10-17/18), and the read request is answered by the `GET_REPORT` control-IN reply
+// the capture shows. Measured 2026-10-19: GG's opening chain and its closing sequence are **not needed** - the
+// read collects a profile slot without either, so this crate sends neither.
 
 /// Apex 7 and the boards of its platform that take the on-board profile protocol.
 ///
@@ -157,8 +148,7 @@ impl Apex7 {
     ///
     /// The read plan polls the device and sleeps for GG's inter-frame pacing, so it runs on a scoped
     /// thread and blocks this task's thread until the read finishes (about 2 s for a slot on the
-    /// reference capture's cadence). It ends with the closing sequence, which **writes to the keyboard**
-    /// and changes its active profile (see [`Self::send_end_sequence`]).
+    /// reference capture's cadence). Nothing in it changes the keyboard's state.
     ///
     /// # Errors
     ///
@@ -176,10 +166,12 @@ impl Apex7 {
         })
     }
 
-    /// Runs one read: GG's opening chain, the schema probe, then [`PULLS_PER_FILE`] pulls, each with its
-    /// pacing read and payload reads, and the closing sequence once the image is assembled.
+    /// Runs one read: the firmware poll, the schema probe, then [`PULLS_PER_FILE`] pulls, each with its
+    /// pacing read and payload reads.
     ///
-    /// The tail **writes to the device** (see [`Self::send_end_sequence`]).
+    /// The read **changes nothing on the keyboard**: GG's opening chain and closing sequence are not sent -
+    /// measured 2026-10-19, the read works without them (see
+    /// `docs/development/apex-7-onboard-profile-read.md` §Sequences the read does not need).
     fn read_image(&self, profile: u8) -> Result<ProfileImage> {
         validate_profile(profile)?;
         let fs_id = profile_file_id(profile);
@@ -196,9 +188,15 @@ impl Apex7 {
             PROFILE_FILE_BYTES,
         );
 
-        // GG's opening chain runs in front of the first pull, and the firmware version line comes from its
-        // first poll; the read does not produce a clean payload without it (see [`Self::send_init_chain`]).
-        let firmware = self.send_init_chain()?;
+        // GG polls the firmware version in front of a profile session. The version is informational, so a
+        // refused or unanswered poll is recorded and the read continues (see [`Self::firmware_version`]).
+        let firmware = match self.firmware_version(FirmwareSource::Keyboard) {
+            Ok(version) => version,
+            Err(e) => {
+                tracing::debug!("onboard read: firmware poll failed: {e}");
+                None
+            }
+        };
 
         // GG's 2-byte probe follows, and the schema word it answers decides whether this read can decode
         // what it is about to pull (see [`Self::probe_schema`]).
@@ -223,12 +221,8 @@ impl Apex7 {
             });
         }
 
-        let image = ProfileImage::assemble(profile, chunks).map(|image| image.with_firmware(firmware))?;
-
-        // GG's tail lands 11 ms after the last read of the file, so the transferring is done at this point;
-        // decoding the assembled image runs after the keyboard has been put back.
-        self.send_end_sequence(profile)?;
-
+        let mut image = ProfileImage::assemble(profile, chunks)?;
+        image.firmware = firmware;
         Ok(image)
     }
 
@@ -309,102 +303,37 @@ impl Apex7 {
         Ok(parsed)
     }
 
-    /// Sends GG's opening chain: [`ONBOARD_INIT_CHAIN`], six 64-byte output frames
-    /// ([`crate::devices::hid_reports::OnboardInitCommand`]) [`GG_GAP_MS`] apart - `90 00`, `90 01`,
-    /// `f4 00`, `6c 00 01`, `90 00`, `90 01` - draining one interrupt report after **every** frame, and
-    /// returning the firmware version the first `90 00` answers.
+    /// Polls GG's firmware version ([`OnboardFirmwareVersionCommand`]) and decodes its answer.
     ///
-    /// The chain is not optional. On hardware a read that sends only the `90 00` poll
-    /// ([`crate::devices::hid_reports::OnboardFirmwareVersionCommand`]) is answered on the wire and the
-    /// payload replies come back as scrambled bytes; with this chain the same read collects a profile slot
-    /// (Apex 7, 2026-10-18). Which frame arms the resource buffer is unknown - `f4 00` answers `00 01 00 …`
-    /// in the capture and `6c 00 01` answers nothing - so all six frames go, the way GG sends them. A
-    /// refused frame fails the read: a keyboard that drops the chain cannot be read cleanly.
+    /// The source byte selects the answer: [`FirmwareSource::Keyboard`] (`90 00`) is the firmware running
+    /// the keyboard, [`FirmwareSource::Led`] (`90 01`) the LED controller's. Both answer on hardware (Apex
+    /// 7, 2026-10-19; the 2026-10-15 GG capture has both forms on the wire). `[EXPERIMENTAL]`.
     ///
-    /// **Each frame is answered only after the previous answer has been read.** Measured 2026-10-18: a
-    /// chain run that drained just the first answer saw the answers of `90 00` and `90 01` and nothing from
-    /// frame 3 on, with the frames on the wire. GG's session keeps the interrupt stream read throughout (its
-    /// read spec issues a `read-chunk HIDIO 65` per transfer), so a read per frame matches GG's pattern; the
-    /// flow-control reading (the device's command queue keeps one answer pending) is inference, not measured.
-    fn send_init_chain(&self) -> Result<Option<String>> {
+    /// The read calls this with [`FirmwareSource::Keyboard`] for the version line of a
+    /// [`ProfileImage`](crate::devices::keyboards::apex_legacy_profile::ProfileImage); a keyboard that
+    /// accepts the frame and answers nothing is not an error, `None` is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the device refuses the frame.
+    pub fn firmware_version(&self, source: FirmwareSource) -> Result<Option<String>> {
         let path = self.collection_label();
-        let mut firmware = None;
-        for (index, frame) in ONBOARD_INIT_CHAIN.iter().enumerate() {
-            self.write_output_command(*frame).map_err(|e| {
-                Error::DeviceCommunication(format!(
-                    "onboard opening chain frame {} of {ONBOARD_INIT_FRAME_COUNT} ({}) on {path} rejected: {e}",
-                    index + 1,
-                    frame.description()
-                ))
-            })?;
-            if GG_GAP_MS > 0 {
-                // The answer lands 1-3 ms after the frame, and GG's own cadence is one frame per GG_GAP_MS.
-                std::thread::sleep(Duration::from_millis(GG_GAP_MS));
-            }
-            let answer = self.read_interrupt_report(CHAIN_REPLY_LEN, CHAIN_REPLY_ATTEMPTS);
-            match answer.as_deref() {
-                Some(report) if index == 0 => firmware = parse_firmware_version(report),
-                Some(report) => {
-                    tracing::debug!(
-                        "onboard opening chain frame {} on {path} answered {}",
-                        index + 1,
-                        hex_of(&report[..report.len().min(8)])
-                    );
-                }
-                None => {
-                    tracing::debug!("onboard opening chain frame {} on {path} answered nothing", index + 1);
-                }
-            }
+        let frame = OnboardFirmwareVersionCommand { source };
+        self.write_output_command(frame).map_err(|e| {
+            Error::DeviceCommunication(format!(
+                "onboard firmware poll {} on {path} rejected: {e}",
+                frame.description()
+            ))
+        })?;
+        // The answer lands 1-3 ms after the frame; GG's own cadence is one frame per GG_GAP_MS.
+        if GG_GAP_MS > 0 {
+            std::thread::sleep(Duration::from_millis(GG_GAP_MS));
         }
-        if firmware.is_none() {
-            tracing::debug!("onboard opening chain on {path} answered no firmware version");
+        let answer = self.read_interrupt_report(FIRMWARE_REPLY_LEN, FIRMWARE_REPLY_ATTEMPTS);
+        if answer.is_none() {
+            tracing::debug!("onboard firmware poll on {path} answered nothing");
         }
-        Ok(firmware)
-    }
-
-    /// Closes the read: [`onboard_end_sequence`], the four 64-byte output frames the engine writes at the end
-    /// of a profile session - `69` (Gamesense OLED off), `89 <slot + 1>` (deploy that slot), `41 00` (the
-    /// profile is not volatile), `6c 00 00` (`end_driver_mode`).
-    ///
-    /// Frames go at the chain's pacing ([`GG_GAP_MS`]), with [`LOAD_PROFILE_SLEEP_MS`] after the deploy frame,
-    /// which is what the engine itself waits. The closing frame is the counterpart of the chain's `6c 00 01`:
-    /// the read opened driver mode, so it closes it, the way the engine closes its own session.
-    ///
-    /// **This is a write path.** `89` makes the keyboard run the slot named, and `41 00` goes with it for every
-    /// real slot index, so the keyboard's active profile changes as the read ends. Nothing is drained after
-    /// these frames: the read needs no answer from them. A refused frame fails the read - the image is assembled
-    /// by then, so the failure is reported as the read failing.
-    ///
-    /// `[EXPERIMENTAL]`: the first three frames are in the 2026-10-15 capture's frame inventory; `6c 00 00` is
-    /// not, because GG was killed rather than closed in the capture. None of the four has been sent from this
-    /// crate on hardware. See `docs/development/apex-7-onboard-profile-read.md` §Driver mode.
-    fn send_end_sequence(&self, profile: u8) -> Result<()> {
-        let path = self.collection_label();
-        let frames = onboard_end_sequence(profile);
-        for (index, frame) in frames.iter().enumerate() {
-            self.write_output_command(*frame).map_err(|e| {
-                Error::DeviceCommunication(format!(
-                    "onboard tail frame {} of {} ({}) on {path} rejected: {e}",
-                    index + 1,
-                    frames.len(),
-                    frame.description()
-                ))
-            })?;
-            // The deploy frame carries the engine's own sleep, the last frame needs no gap, and the rest keep
-            // the chain's pacing.
-            let gap = if index + 1 == LOAD_PROFILE_FRAME_INDEX {
-                LOAD_PROFILE_SLEEP_MS
-            } else if index + 1 == NO_GAP_AFTER_FRAME_INDEX {
-                0
-            } else {
-                GG_GAP_MS
-            };
-            if gap > 0 {
-                std::thread::sleep(Duration::from_millis(gap));
-            }
-        }
-        tracing::debug!("onboard tail: {} frames sent on {path}", frames.len());
-        Ok(())
+        Ok(answer.as_deref().and_then(parse_firmware_version))
     }
 
     /// Collects one payload reply: the feature-report reply the capture shows, then the interrupt
@@ -511,11 +440,9 @@ impl Apex7 {
     ///
     /// This is [`GenericKeyboard::write_profile_packet`], deliberately not [`GenericKeyboard::send_report`]:
     /// `send_report` writes through [`crate::devices::write_padded_report`], whose global
-    /// [`crate::devices::HidOptimizer`] skips any report byte-identical to one sent in the last 50 ms, and the
-    /// opening chain contains such frames - `90 00` and `90 01` each appear twice, 20 ms apart on the read's
-    /// 5 ms cadence - so on `send_report` frames 5 and 6 never reach the device and the keyboard sees a
-    /// four-frame chain. The 2026-10-18 measurement that made the chain load-bearing had all six frames on the
-    /// wire, and `ONBOARD.md` step 0 is open on which frames the keyboard needs.
+    /// [`crate::devices::HidOptimizer`] skips any report byte-identical to one sent in the last 50 ms, and
+    /// profile-protocol transfers repeat identical frames (GG's session polls `90 00` and `90 01` over and
+    /// over, 5 ms apart), which that optimizer would swallow.
     fn write_output_command<C: HidCommand>(&self, command: C) -> Result<()> {
         let mut buffer = [0u8; ONBOARD_OUTPUT_REPORT_SIZE];
         let len = self.inner.report_builder.build_report(command, &mut buffer)?;

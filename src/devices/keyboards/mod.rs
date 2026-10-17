@@ -478,8 +478,8 @@ impl GenericKeyboard {
     ///
     /// Use this for profile protocol transfers, not [`GenericKeyboard::send_report`]: `send_report` writes
     /// through [`crate::devices::write_padded_report`], whose global [`crate::devices::HidOptimizer`] skips any
-    /// report byte-identical to one sent in the last 50 ms, and the on-board read sends such frames - the
-    /// opening chain repeats `90 00` and `90 01`.
+    /// report byte-identical to one sent in the last 50 ms, and profile-protocol transfers repeat identical
+    /// frames (`90 00` and `90 01` polls).
     pub(crate) fn write_profile_packet(&self, data: &[u8]) -> Result<()> {
         let device = self.connected_device()?.lock();
         let written = device

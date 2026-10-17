@@ -21,12 +21,10 @@
 //! accepted a pull and a payload-read request on its interface-4 vendor collection and answered a pull
 //! on the interrupt endpoint; the payload read timed out there, which is why the reply is read on the
 //! control endpoint first. Since the read-back fix of 2026-10-17 a full slot read completes on an Apex 7
-//! under Linux (reported 2026-10-18, with GG's opening chain sent; the read without it answered on the
-//! wire with scrambled payload bytes). Nothing here writes a profile, and the payload struct offsets stay
-//! unverified until a read is compared with what GG shows for that slot. The four frames GG sends after a
-//! profile transfer are named in `hid_reports::onboard_end_sequence` and sent by
-//! [`crate::devices::keyboards::apex7::Apex7::send_end_sequence`], at the end of the read: `89 <slot + 1>`
-//! makes the keyboard run the slot that was read, so this read is not write-free.
+//! under Linux (reported 2026-10-18). Measured 2026-10-19: GG's opening chain and its closing sequence are
+//! **not needed** - the read collects a profile slot without either, so this crate sends neither, and the
+//! read **changes nothing on the keyboard**. Nothing here writes a profile, and the payload struct offsets
+//! stay unverified until a read is compared with what GG shows for that slot.
 //!
 //! # Wire format
 //!
@@ -37,15 +35,12 @@
 //! is the report ID.
 //!
 //! * firmware poll (output report ID `0x00`, 64 data bytes on the wire, `SET_REPORT wValue 0x0200 wIndex
-//!   1 wLength 64`): `90 00`, answered on the interrupt endpoint with the ASCII firmware version
-//!   (`34 2e 31 36 2e 38 00…` = `4.16.8`, see [`parse_firmware_version]). An Apex 7 wired answered `90 00`
-//!   and `90 01` identically on 2026-10-17. This crate sends it inside GG's opening chain - `90 00`,
-//!   `90 01`, `f4 00`, `6c 00 01`, then `90 00` and `90 01` again, 11 ms apart
-//!   ([`crate::devices::hid_reports::ONBOARD_INIT_CHAIN`]), which is what a read needs on hardware: with
-//!   only the poll the replies come back scrambled (2026-10-18). The meanings of `f4 00` (answered
-//!   `00 01 00…`) and `6c 00 01` (never answered in the capture) are unknown. The capture contains no
-//!   13-byte transfer anywhere, so the pacing frame earlier versions of this module sent is not part of
-//!   GG's read.
+//!   1 wLength 64): `90 <source>`, answered on the interrupt endpoint with the ASCII firmware version
+//!   (`34 2e 31 36 2e 38 00…` = `4.16.8`, see [`parse_firmware_version]). The source byte selects which
+//!   firmware answers: `90 00` the keyboard's, `90 01` the LED controller's (both read from an Apex 7 on
+//!   2026-10-19, and both forms are in the reference capture). The read sends `90 00` in front of the probe
+//!   for the image's firmware line; GG's own session polls both. The capture contains no 13-byte transfer
+//!   anywhere, so the pacing frame earlier versions of this module sent is not part of GG's read.
 //! * pull (`HIDIO`, output report ID `0x00`, 64 bytes on the wire, `SET_REPORT wValue 0x0200 wIndex 1`):
 //!   `85 | 00 | file_id u16 LE | offset u32 LE | size u16 LE | 00…` (10 frame bytes, 11-byte report buffer)
 //!   — copies `size` bytes of the profile file into the device's resource buffer at buffer offset 0.
@@ -68,11 +63,16 @@
 //!   `03 | 0b 00 43 6f 6e 66 69 67 20 31 …`, i.e. the schema word at payload offset 0 and the profile
 //!   name at payload offset 2. Some firmware echoes the request header instead, with the payload from
 //!   byte 6; [`parse_read_reply`] accepts both.
-//! * closing sequence (`HIDIO`, output report ID `0x00`, 64 bytes on the wire, `SET_REPORT wValue 0x0200
-//!   wIndex 1 wLength 64`): `69 00…`, `89 <slot + 1> 00…`, `41 00 00…`, `6c 00 00…` - OLED off, deploy that
-//!   slot, profile not volatile, close driver mode, the frame that closes what the opening chain's `6c 00 01`
-//!   opened. With the engine's 250 ms sleep after the deploy frame (`ONBOARD.md` step 8, and
-//!   `docs/development/apex-7-onboard-profile-read.md` §Driver mode). They are writes: `89` deploys the slot.
+//! * GG's closing sequence (output report ID `0x00`, 64 bytes on the wire, `SET_REPORT wValue 0x0200 wIndex
+//!   1 wLength 64`): `69 00…`, `89 <slot + 1> 00…`, `41 00 00…`, `6c 00 00…` - OLED off, deploy that slot,
+//!   profile not volatile, close driver mode, with the engine's 250 ms sleep behind the deploy frame.
+//!   **This crate sends none of them**: measured 2026-10-19, the read works without them. They matter as a
+//!   set because `89` **writes** - the keyboard runs the slot named - so a tool that sends them changes the
+//!   keyboard's active profile. The named builders
+//!   [`OnboardLoadProfileCommand`](crate::devices::hid_reports::OnboardLoadProfileCommand) and
+//!   [`OnboardDriverModeCommand`](crate::devices::hid_reports::OnboardDriverModeCommand) exist for that
+//!   work and nothing in ssgg sends them
+//!   (`docs/development/apex-7-onboard-profile-read.md` §Driver mode).
 //!
 //! The read geometry is not tunable: a profile file is read as [`PULLS_PER_FILE`] resource-buffer fills
 //! ([`DEVICE_RESOURCE_BUFFER_LEN`] each); every fill is drained with two [`PAYLOAD_READ_LEN`]-byte payload
@@ -149,8 +149,8 @@ pub const READ_REPORT_LEN: usize = ONBOARD_GET_WIRE_BYTES;
 /// is not part of it.
 pub const OUTPUT_REPORT_DATA_LEN: usize = ONBOARD_OUTPUT_REPORT_SIZE - 1;
 /// Input-report size GG reads on the interrupt endpoint: its `read-chunk HIDIO 65` is a report-ID slot
-/// plus 64 data bytes. The same read serves the pacing packet after a pull and the answers of the opening
-/// chain (`0x6E` with the ASCII firmware version, `0x12` with `00 01 …`), so this is the length the read
+/// plus 64 data bytes. The same read serves the pacing packet after a pull and the firmware poll's answer
+/// (`0x6E` with the ASCII version), so this is the length the read
 /// loop asks hidapi for. A 64-byte ask works but truncates the last byte of a full 65-byte answer.
 pub const GG_INPUT_READ_BYTES: usize = OUTPUT_REPORT_DATA_LEN + 1;
 /// Header of a header-echoing payload-read reply, report ID byte excluded: `reserved, offset u16, size u16`.
@@ -396,8 +396,8 @@ pub struct ProfileImage {
     pub data: Vec<u8>,
     /// Aggregated reply statistics.
     pub stats: ReadStats,
-    /// Firmware version the opening chain answered with (`None` when the chain was skipped or the
-    /// keyboard did not answer the `0x90` poll).
+    /// Firmware version the read's `90 00` poll answered with (`None` when the poll was refused or the
+    /// keyboard answered nothing: the version is informational, the read does not depend on it).
     pub firmware: Option<String>,
 }
 
@@ -493,7 +493,7 @@ impl ProfileImage {
         })
     }
 
-    /// Record the firmware version the opening chain answered with.
+    /// Record the firmware version the read's `90 00` poll answered with.
     #[must_use]
     pub fn with_firmware(mut self, firmware: Option<String>) -> Self {
         self.firmware = firmware;
