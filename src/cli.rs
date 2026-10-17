@@ -196,12 +196,12 @@ pub(crate) enum Commands {
 /// [EXPERIMENTAL] Read the on-board profile of a legacy Apex keyboard.
 ///
 /// `decode` works on a saved profile image only and never touches a device. `read` talks to a keyboard
-/// and needs `--yes`: it ends with the engine's four closing frames, which make the keyboard run the slot
-/// that was read (`ONBOARD.md` step 8).
+/// and needs `--yes`: it is reverse-engineered protocol code that writes request frames to a raw device
+/// node. It changes nothing on the keyboard (measured 2026-10-19: the read works without GG's opening
+/// chain and closing sequence, so neither is sent).
 #[derive(Subcommand)]
 pub(crate) enum OnboardAction {
-    /// Read one profile from a legacy Apex keyboard, then send the engine's closing frames (deploy the slot,
-    /// close driver mode). Requires --yes.
+    /// Read one profile from a legacy Apex keyboard. Requires --yes.
     Read(OnboardReadArgs),
 
     /// Decode a profile image saved by an earlier read (no device, no hardware).
@@ -209,8 +209,8 @@ pub(crate) enum OnboardAction {
 }
 
 /// One on-board profile read. The flags pick the slot, the keyboard and what to do with the result;
-/// nothing on the wire is a flag. The geometry is fixed in `apex_legacy_profile`: 12 pulls of the
-/// device's 1024-byte resource buffer, drained by two 512-byte payload windows per fill, paced like GG
+/// nothing on the wire is a flag. The geometry is fixed in `apex_legacy_profile`: 25 pulls of the
+/// device's 1024-byte resource buffer, drained by five 636-byte payload windows per fill, paced like GG
 /// (5 ms) and read with the reply framing the reference capture shows.
 #[derive(clap::Args)]
 pub(crate) struct OnboardReadArgs {

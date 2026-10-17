@@ -5,14 +5,14 @@ Apex 7, PID `0x1612`, 2026-10-15, firmware `4.16.8`). Every item below is `[EXPE
 2026-10-18: `ssgg onboard read` completes a full slot read on an Apex 7 under Linux (operator-reported;
 model, firmware and the decoded bytes are not recorded here), so the **read** is replayed on hardware —
 what is not verified is the decode (slot layout, checksum words, the per-slot compare against GG). The read
-sends GG's six-frame opening chain (`ONBOARD_INIT_CHAIN`): with only the `90 00` poll the device answers and
-the payload replies come back scrambled (2026-10-18). Nothing in this protocol writes to the device. Code: `src/devices/hid_reports.rs` (the command codes
-and every report buffer: `OnboardFirmwareVersionCommand`, `OnboardInitCommand` / `ONBOARD_INIT_CHAIN`,
-`OnboardPullCommand`,
-`OnboardReadCommand`), `src/devices/keyboards/apex_legacy_profile.rs` (reply framing, payload geometry, reply parsing, decode - the module moved there on 2026-10-17, from `src/onboard_profile.rs`, because everything in it is specific to this legacy platform),
+sends no frames that change anything on the keyboard: GG's opening chain and its closing sequence turned out
+not to be needed (2026-10-19, §Sequences the read does not need). Code: `src/devices/hid_reports.rs` (the command codes
+and every report buffer: `OnboardFirmwareVersionCommand`
+with its `FirmwareSource` byte, `OnboardDriverModeCommand`, `OnboardLoadProfileCommand`,
+`OnboardPullCommand`, `OnboardReadCommand`), `src/devices/keyboards/apex_legacy_profile.rs` (reply framing, payload geometry, reply parsing, decode - the module moved there on 2026-10-17, from `src/onboard_profile.rs`, because everything in it is specific to this legacy platform),
 `src/devices/keyboards/apex7.rs` (`Apex7`: the keyboard device of the legacy Apex family, which wraps
 `GenericKeyboard`, and the read plan, reply assembly and polling - its own `read_profile` /
-`read_image` / `send_init_chain` / `probe_schema` / `pull_window` / `read_window` methods; the
+`read_image` / `firmware_version` / `probe_schema` / `pull_window` / `read_window` methods; the
 `apex_legacy_onboard` module these lived in was folded into `Apex7` on 2026-10-19) - the packet I/O is
 `GenericKeyboard`'s own profile transfers on the handle it owns
 (`write_profile_packet` for output frames - not `send_report`, whose write dedups: see "Write path" below -
@@ -43,7 +43,7 @@ discovered as its own device; the old path-based probe that tried interface 1 fi
 
 | Transfer | Control setup (from the capture) | Frame bytes (data stage) |
 |----------|------------------------------|------------------------|
-| firmware poll (1 frame, once) | `SET_REPORT`, `bmRequestType 0x21`, `wValue 0x0200`, `wIndex 1`, `wLength 64` | `90 00 …` zero-padded to 64, answered on the interrupt endpoint with the ASCII firmware version (`34 2e 31 …` = `4.16.8`). **This poll is the first frame of GG's opening chain, 11 ms apart: `90 00`, `90 01`, `f4 00`, `6c 00 01`, `90 00`, `90 01`, and the read sends all six** (`ONBOARD_INIT_CHAIN`). `90 00` and `90 01` answer identically — measured on an Apex 7 wired on 2026-10-17 — `f4 00` answers `00 01 00…`, `6c 00 01` answers nothing, and the meanings of both are unknown. The chain is not decoration: without it the payload replies come back scrambled (Apex 7, 2026-10-18), which is why `OnboardInitCommand`/`ONBOARD_INIT_CHAIN` were restored on 2026-10-18 after being removed on 2026-10-17. **Every frame is followed by one input read**: a chain run that drained only the first answer collected the `90 00` and `90 01` answers and nothing from frame 3 on (Apex 7, 2026-10-18) |
+| firmware poll (1 frame, once) | `SET_REPORT`, `bmRequestType 0x21`, `wValue 0x0200`, `wIndex 1`, `wLength 64` | `90 <source>` zero-padded to 64, answered on the interrupt endpoint with the ASCII firmware version (`34 2e 31 …` = `4.16.8`). The source byte selects which firmware answers: `90 00` the keyboard's, `90 01` the LED controller's — both read from an Apex 7 on 2026-10-19, both forms in the capture. `ssgg onboard read` sends one `90 00` in front of the probe for the image's firmware line; GG's own session polls both forms, and in the reference capture 8 of them are chain frames, 11 ms apart with `f4 00` and `6c 00 01` (see "Opening chain" and §Sequences the read does not need — neither sequence is sent). `f4 00` answers `00 01 00…`, `6c 00 01` answers nothing, meanings unknown |
 | pull | `SET_REPORT`, `wValue 0x0200`, `wIndex 1`, `wLength 64` | `85 00 <file selector u16 LE> <file offset u32 LE> <size u16 LE>`, then zeros to 64 — answered by an ordinary input report (`0x01`, all-zero on an idle keyboard), see "What a pull is answered by" |
 | payload read | `SET_REPORT`, `wValue 0x0300`, `wIndex 1`, `wLength 642` | `83 00 <resource-buffer offset u16 LE> <size u16 LE>`, then zeros to 642 |
 | payload write | `SET_REPORT`, `wValue 0x0300`, `wIndex 1`, `wLength 642` | `03 00 <buffer offset u16 LE> <size u16 LE> <payload…>` — GG's write direction, 144 transfers, not sent by `ssgg` |
@@ -70,10 +70,9 @@ frames zero-padded to 64 bytes.
 
 The engine's tail after a profile transfer is three output reports: `69` (Gamesense OLED off), `89 <profile>`
 (deploy that profile) and `41 00` (profile not volatile); the engine sleeps 250 ms behind the deploy frame.
-`ssgg onboard read` sends four frames at the end of a read (see "Procedure", `Apex7::send_end_sequence`): those
-three plus `6c 00 00`, which closes driver mode - the read's opening chain opened it with `6c 00 01`, and
-closing it is what the engine does at the end of a session. §Driver mode is the engine-side reading of all of
-this, including the `ff` frame the frame inventory above lists exactly once (recorded by the kit under the
+**`ssgg onboard read` sends none of them** (2026-10-19, §Sequences the read does not need); earlier builds sent
+those three plus `6c 00 00` (close driver mode). §Driver mode is the engine-side reading of all of this,
+including the `ff` frame the frame inventory above lists exactly once (recorded by the kit under the
 capture's "idle, do nothing" step, capture summary): no engine-side name for it in this family, direction not
 settled, not sent by this crate.
 
@@ -130,8 +129,8 @@ not a device fact).
 per chunk from the typed commands, nothing materialises a transfer list (`Step`, `StepKind`,
 `ReadConfig::steps()`, `init_steps()`, `plan_json` and the `onboard plan` subcommand were removed
 2026-10-17).
-The profile slot is the only run-time choice. The geometry (12 pulls of 1024, 2 reads of 512), the pacing
-([`GG_GAP_MS`]), the firmware poll (one `90 00`; GG's chain is not sent) and the reply framing
+The profile slot is the only run-time choice. The geometry (25 pulls of 1024, 5 reads of 636), the pacing
+([`GG_GAP_MS`]), the firmware poll (one `90 00`) and the reply framing
 ([`READ_REPLY_FRAMING_LEN`], 0 = the offset the capture's replies show) are constants:
 `ReadConfig` and its CLI tunables (`--resource-len`, `--read-len`, `--chunks`, `--payload-len`,
 `--fs-base`, `--gap-ms`, `--no-init-chain`, `--reply-header`) were removed 2026-10-17. A keyboard that
@@ -273,12 +272,40 @@ cache. It is not the keyboard's usual output write: `GenericKeyboard::send_repor
 `--debug`). Both writes put the same `SET_REPORT wValue 0x0200`, 64-byte frame on the wire for a frame the
 device has not seen recently.
 
-The difference shows up in one place, the opening chain: `90 00` and `90 01` each appear twice in
-`ONBOARD_INIT_CHAIN`, 20 ms apart on our 5 ms cadence, inside the 50 ms window. On `send_report` the device
-would receive a **four-frame** chain; the measurement that made the chain load-bearing (section
-"Opening chain") had all six frames on the wire, as the capture shows GG sending them. `send_report` was tried
-here on 2026-10-18 and reverted the same day for that reason. Pulls and payload reads never repeat (their file
-and buffer offsets differ), so nothing after the chain is affected by the choice.
+The difference mattered while the read sent GG's opening chain: `90 00` and `90 01` each appear twice in it,
+20 ms apart on the 5 ms cadence, inside the 50 ms window, so on `send_report` the device received a
+**four-frame** chain. `send_report` was tried here on 2026-10-18 and reverted the same day for that reason;
+the chain itself went out of the code on 2026-10-19 (§Sequences the read does not need), and the choice of
+`write_profile_packet` stands for the same reason - the firmware polls repeat.
+
+## Sequences the read does not need (2026-10-19)
+
+**Measured on hardware: the read works with neither sequence, so ssgg sends neither.** Operator runs of
+`ssgg onboard read` on an Apex 7 collected a profile slot with GG's opening chain not sent and with the
+closing sequence not sent. Code: `Apex7::send_init_chain` and `Apex7::send_end_sequence` were removed, with
+`ONBOARD_INIT_CHAIN` / `OnboardInitCommand`, `onboard_end_sequence` / `ONBOARD_END_FRAME_COUNT`, and the
+command codes nothing sends any more (`EngineStatus 0xF4`, `DisableGamesenseOled 0x69`,
+`SetProfileVolatile 0x41`). What the read sends is one firmware poll, the 2-byte schema probe, then 25 pulls
+of 1024 bytes each drained by five 636-byte payload reads (125 reads per slot).
+
+**What that settles:** `OnboardFirmwareVersionCommand` is now a typed command with a source byte
+(`FirmwareSource::Keyboard` = `90 00`, `FirmwareSource::Led` = `90 01`), and both forms were read on
+hardware on 2026-10-19: `90 00` answers the firmware running the keyboard, `90 01` the LED controller's. The
+capture already had both forms on the wire (capture summary rows 97 and 115 show `90 01`).
+
+`DriverMode` (`0x6C`) and `LoadProfile` (`0x89`) stay in `hid_reports` as named commands
+(`OnboardDriverModeCommand`, `OnboardLoadProfileCommand`); **nothing in ssgg sends them** - the frames are
+kept as the typed way to do the driver-mode and deploy work later, per hard constraint 1 (no hand-built byte
+arrays). `LoadProfile` is a device write: it makes the keyboard run the slot named.
+
+One transfer detail measured on the same pass: a payload read needs a short wait (~1 ms) after its request
+is written, before reading the reply back - without it the read races the device filling its buffer and
+answers with garbage. See `Apex7::read_window`.
+
+**Not measured:** whether the keyboard needs *any* of GG's chain frames for a read (2026-10-18 said yes for
+the whole chain, 2026-10-19 says no for all of it - the 2026-10-18 "scrambled replies" result is what an
+undrained answer, not the missing frames, produced: inference, not settled), which of the closing frames
+have any keyboard effect, and whether other legacy models behave the same.
 
 ## Driver mode (engine side)
 
@@ -294,15 +321,17 @@ Driver mode is one command per family, and its **shape is not the same across fa
 | Apex 3 | **`0x03`** | **33** | `apex_3.lisp:23`, `:32` - report 0, command `0x03`, `reserved 0`, `profile_button_driver_mode 0`, `macro_button_driver_mode 1`, and the opening and closing structs are **byte-identical**, so on this family opening and closing are the same frame on the wire |
 | Apex 3 TKL | `0x6C` | 65 | `apex_3_tkl.lisp:100`, `:109` - opens with `profile_driver_mode 1`, `macro_driver_mode 1` (the legacy family opens with 0), closes with both 0. `apex_3_tkl.lisp:99` states what the mode is for: "software driver mode must be enabled for SSKey combos to be included in the keyboard report" |
 
-The read path is implemented for the legacy family only, and its two driver-mode frames are that family's: the opening
-chain's fourth frame `6c 00 01` and the closing sequence's last frame `6c 00 00`. A port of the read to the Apex 3
-family cannot reuse the closing frame: on Apex 3 the command byte is `0x03`, in a 33-byte report, and the closing
-frame is byte-identical to the opening frame.
+The read path is implemented for the legacy family only, and its driver-mode frames are that family's: the opening
+frame `6c 00 01` (GG's device init) and the closing frame `6c 00 00` (GG's shutdown). **Neither is sent by
+`ssgg`** - the read needs neither (2026-10-19, §Sequences the read does not need);
+`OnboardDriverModeCommand` is the named builder for a tool that wants them. A port of the read to the Apex 3
+family cannot reuse them: on Apex 3 the command byte is `0x03`, in a 33-byte report, and the closing frame is
+byte-identical to the opening frame.
 
 The engine's session close in the legacy family writes three frames (`base_apex_legacy.lisp:299-304`):
 `reset_all_illumination` (command `0x3B`, `:692`), `disable_gamesense_oled` (command `0x69`, `:724`) and
-`end_driver_mode` (`0x6C` with the last byte 0, `:570`). The read's closing sequence writes the last two, not the
-lighting reset.
+`end_driver_mode` (`0x6C` with the last byte 0, `:570`). The read sends none of
+them (`OnboardLoadProfileCommand` is the named builder for `89 <profile + 1>`, and nothing in ssgg sends it).
 
 The deploy pair behind every profile file in the capture is `load_profile` (command `0x89`, `profile_id` typed
 `(range 1 5)`, sent as `succ index` by `switch_to_onboard_config`, `:2280`, `:2300`) with the engine's own sleep
@@ -317,14 +346,15 @@ crate does not send it. A version of this code sent it as a closing frame on 202
 
 ## Safety
 
-The read's transfers are reads, and it ends with the engine's closing sequence - four frames that make the
-keyboard **run** the slot that was read (`89 <slot + 1>`) and close the driver mode its own opening chain opened
-(`6c 00 00`), see `Apex7::send_end_sequence`, "Procedure" and §Driver mode. Nothing else in the protocol's write
-direction is sent: the push command (`0x05`) is named in
-`src/devices/keyboards/apex_legacy_profile.rs` for completeness and nothing sends it, and no profile payload is
-written. Do not add profile writes: the profile blob contains blocks this layout does not explain, and writing a
-synthetic blob can put the keyboard in a state GG itself cannot repair. `read` requires `--yes`; `decode` never
-touches a device.
+The read's transfers are reads: it sends the firmware poll, the pulls and the payload-read requests, and
+**nothing that changes anything on the keyboard** - GG's opening chain and closing sequence are not sent
+(2026-10-19, §Sequences the read does not need). The closing sequence is where the read's only device
+*writes* used to live, and `89 <slot + 1>` in it is the frame that makes the keyboard run the slot read;
+`OnboardLoadProfileCommand` names it and nothing in ssgg sends it. No profile payload is written either:
+do not add profile writes - the profile blob contains blocks this layout does not explain, and writing a
+synthetic blob can put the keyboard in a state GG itself cannot repair. `read` requires `--yes` because it is
+reverse-engineered protocol code writing request frames to a raw device node; `decode` never touches a
+device.
 
 ## What is not settled
 
@@ -334,118 +364,19 @@ touches a device.
   [apex-pro-tkl-2023-gg-capture.md](apex-pro-tkl-2023-gg-capture.md)); nothing in this capture says the
   legacy family does the same.
 - What `f4 00` and `6c 00 01` do. GG sends them in its opening chain, `f4 00` answers `00 01 00 …` and
-  `6c 00 01` is not answered at all. **The chain as a whole is required on hardware**: a read that sends only
-  the `90 00` poll is answered on the wire and its payload replies come back as scrambled bytes, with the
-  chain sent the same read collects a profile slot (Apex 7, 2026-10-18), so `ssgg onboard read` sends all six
-  frames (`ONBOARD_INIT_CHAIN`, `Apex7::send_init_chain`, restored 2026-10-18 after being
-  removed 2026-10-17). **Which of the six frames the keyboard needs is open** - that is the question to answer
-  by dropping them one at a time on a run that reads a known slot. The answers are produced **one frame at a
-  time**: a chain run that drained only the first answer saw `90 00` and `90 01` answered and nothing from
-  frame 3 on, with all six frames on the wire (Apex 7, 2026-10-18), so `send_init_chain` reads one input
-  report after every frame (GG's `read-chunk HIDIO 65`). Why an undrained answer silences the frames after it
-  is not measured - the command-queue flow-control reading is inference.
+  `6c 00 01` is not answered at all; meanings still unknown. **The chain is not needed: measured 2026-10-19,
+  `ssgg onboard read` collects a profile slot without any of the six frames** (§Sequences the read does not
+  need), so the code no longer sends them and `ONBOARD_INIT_CHAIN` / `Apex7::send_init_chain` are out of the
+  code. The measurements stay on record in §Opening chain (including the
+  "only the `90 00` poll → scrambled replies" result, which the run contradicts).
+  The one-frame-at-a-time answer draining (`read-chunk HIDIO 65` per frame) is likewise moot.
 - GG's write direction (`03 00 <offset> <size> <payload>`, 144 transfers in the capture): not used
   here, and there is no read-back command known for this family, so `ssgg onboard` writes no profile payload.
-  The only writes the read sends are the four closing frames (`onboard_end_sequence`).
-- What the closing sequence does on hardware. The first three frames are named on the engine side, and none of
-  the four has been sent from this crate on hardware: does `89` switch the keyboard to the slot (the engine's
-  config-switching function is what sends it), what does disabling the Gamesense OLED look like on an Apex 7, and
-  what changes when driver mode is closed? `ONBOARD.md` step 8 is the test. The capture's single `ff` frame
-  (recorded in the kit's "idle" step, capture summary) is unaccounted for: no engine-side name for it in this family
-  and its direction is not settled, so it is not sent (§Driver mode).
-- The other `wValue 0x0200` frames of the capture (`0x6e` x10, `0x68` x6, `0x6a` x6 = idle in/out, Gamesense
-  OLED enable, restart graphics) and the 57-byte lighting block layout, which is copied from the engine decoder
-  and unverified.
-- Whether the read-back can carry a window at all. Every answer in the capture is the file head plus
-  zeros; no capture in this repo shows a payload-read reply that changes with the requested offset.
-- The Linux framing of the read-back. GG asks report number 0 on interface 1 in both directions; the run
-  of 2026-10-15 asked the command byte as the report number on interfaces 0-4 (`wValue 0x0290`, `0x0285`,
-  `0x0383`) and its interface-1 read-back went out at `wLength 641`, one byte short of GG's 642 (the
-  raw-ioctl code subtracted the report-ID byte; hidapi does not). The report number is fixed in code since
-  2026-10-17 (every buffer now starts with report number 0, `READ_REPLY_ID = 0x00`) and the length since
-  2026-10-18 (`READ_REPORT_LEN = 642`, asserted against `ONBOARD_MAX_READ_LEN`); what remains unmeasured is
-  asking the read-back of the collection that declares it - interface 1, `0xFFC0` - with `wLength 642` and
-  seeing a control-IN data stage come back (the `--debug` log distinguishes "the request failed" from "the
-  transfer answered with the wrong length").
-
-## Windows GG vs Linux `ssgg onboard read`, same keyboard (measured 2026-10-15)
-
-Both sides re-derived from raw URBs: the engine's own read (engine session capture
-and engine capture 2, the same session, 13:44:21-13:46:21, USBPcap linktype 152) and `ssgg onboard read`
-(Linux run capture, 22:03:17.904 -> 22:03:18.930, 1.026 s, 1428 URBs, usbmon linktype 220, bus 1
-device 24 = the `0x1612` control interface, 612 control submits and 612 completes, 204 interrupt URBs).
-
-| Item | Windows GG | Linux `ssgg onboard read` |
-|------|------------|---------------------------|
-| Opening chain | six 64-byte output reports on interface 1 (`90 00`, `90 01`, `f4 00`, `6c 00 01`, `90 00`, `90 01`), 8-14 ms apart, median 11 ms | same six frames, 5-6 ms apart, **sprayed over interfaces 0-4** (340 `90*` writes = 68 per interface, 17 `f4 00` and 17 `6c 00 01` on each) |
-| Report ID / lengths | report ID 0 everywhere: `wValue 0x0200` wLength 64 for output frames, `wValue 0x0300` wLength 642 for the 642-byte frames | report ID = command byte: `wValue 0x0290`/`0x02f4`/`0x026c` wLength 101, `0x0285` wLength 102, `0x0383` wLength 1603 (the report-ID byte is counted twice, so every frame declares one byte more than GG's and carries 100/101/1602 payload bytes) |
-| Pull `85` | 121 transfers, header `85 00 01 02` with a u32 at bytes 4-7 stepping 0, 4, 8, ... 44 | 85 transfers (17 x 5 interfaces), 7 distinct payloads, that word stays 0 |
-| Read `83` | 241 requests in three shapes: `83 00 00 …`, `83 00 00 …`, `83 00 00 …` (121/120: file 1 window 2 and file 2 window 2, read over and over) | 17 requests, **all byte-identical** `83 00 00 …` — the file and window words never change |
-| **Read-back** | **241 GET_REPORT control-IN transfers `a1 01 wValue 0x0300 wIndex 1 wLength 642`**, one per read request, each answered by a 643-byte control-IN data stage (report-ID byte `03` + 642 payload bytes; 1..513 non-zero bytes per reply, 89% of its u32 words are zero). The name-bearing reply is `03 0b 00 …` = schema word `0x000B` + `Config 1` | GET transfers **did** appear: 24 setup blocks `a1 01 wValue 0x0300 wLength 641` - one byte short of GG's 642, because the raw-ioctl code subtracted the report-ID byte from the length it passed to the kernel. No complete carries a data stage, so no payload arrived; the 64-byte interrupt reports `ssgg` collected were `34 2e 31 …` ("4.16.8") x 68, `00 01` x 17, `85 01` x 17 |
-| Chain answers | `90 00`/`90 01` -> "4.16.8", `f4 00` -> `00 01 00 …`, `6c 00 01` -> nothing | identical, byte for byte |
-| Other traffic in the window | 144 `03` 642-byte profile writes, 72 `05` lighting frames | none (read-only run) |
-| Write path (2026-10-18, code, not this capture) | GG's engine writes each frame once | `ssgg` writes with `write_profile_packet`, no cache, so all six chain frames reach the device; the keyboard's ordinary output write `send_report` would not, because the hid optimizer drops a report byte-identical to one sent in the last 50 ms - that is chain frames 5 and 6. See "Write path" below |
-
-The point that decides everything: **the window is fetched with a GET_REPORT of the feature report**
-(`bmRequestType 0xa1`, `bRequest 0x01`, `wValue 0x0300`, `wIndex 1`, `wLength 642`) issued right after
-the `83` request, on the same interface. `ssgg onboard read` never issues it, so its capture has nothing
-to reassemble: the request is accepted, the answers it collects are the 64-byte interrupt status reports,
-and no control transfer in its own capture carries data.
-
-The kernel strips the report-ID byte from a feature-report **write** (the report number in the buffer's byte 0 is
-removed and `wLength` is the remaining byte count), which is why a 643-byte write buffer goes out as
-`wLength 642`. On the **read** side the kernel forwards the requested length verbatim: hidapi hands the slice
-length straight to `HIDIOCGFEATURE` (hidapi 2.6.7 `src/linux_native/ioctl.rs:26`). So the ask equals the wire
-number, the device's report-ID byte arrives in buffer[0], and a 642-byte ask delivers `[report ID][641 bytes]`.
-The length to ask for is **642**: 642 answers, 643 makes the control transfer never complete (measured
-2026-10-15, `Connection timed out`), and the 2026-10-15 `ssgg` run asked 641 - its raw-ioctl code subtracted
-the report-ID byte itself, one byte short of GG's number. See the collection map below.
-
-What is a blocker: GG works on **interface 1 only** (the `0xFFC0` control collection), and that is exactly
-where our writes failed - the collection map records `EPIPE` on interface 1's chain write, while GG's
-identical interface-1 frames are accepted. The difference is the report number: GG uses **report number 0**
-for everything (`wValue 0x0200` for the 64-byte output frames, `wValue 0x0300` for the 642-byte frames);
-the 2026-10-15 frames carried the command byte as the report number (`wValue 0x0290`, `0x0285`, `0x0383`).
-The kernel builds `wValue` from the first byte of the `HIDIOCSFEATURE`/`HIDIOCGFEATURE` buffer, and validates
-a GET_REPORT against the report descriptor of the interface being asked, so report number 0 on interface 1 is
-the frame that reproduces GG's transfer. Fixed in code 2026-10-17: the report buffers are built in
-`src/devices/hid_reports.rs` with report number 0 as byte 0 of every buffer, so a transfer is
-`wValue 0x0200 wLength 64` / `wValue 0x0300 wLength 642`, and the read-back asks report number 0. Not a blocker: the interface spray (interfaces 0-4 accept our
-frames and answer the chain there, GG never touches them) - the answers are identical, so the spray is only
-wasted traffic.
-
-Our run's read-back did reach the wire, one byte short: this file's setup blocks include
-`GET_REPORT wValue 0x0300 wLength 641` (24 of them, on interface 1) beside the 24
-`SET_REPORT wValue 0x0300 wLength 642` writes and the 18 `GET_DESCRIPTOR`s; the raw-ioctl code subtracted the
-report-ID byte from the length it handed the kernel, and every control complete carries a 0-byte data stage,
-so no reply payload arrived. hidapi sends the buffer length to `HIDIOCGFEATURE` verbatim
-(`src/linux_native/ioctl.rs:26`), so today's ask is `READ_REPORT_LEN = 642` and that decodes as
-`wLength 642`, GG's number. The size history, recorded before `--debug` existed: on 2026-10-15 a
-643-byte request produced a 5-second `ETIMEDOUT`, which means a transfer was submitted then. The 22:03 run
-asked 641 and its completes carry no data stage: the request went out, the keyboard answered nothing.
-
-## Linux collection map (measured 2026-10-15)
-
-From the kernel's hidraw `uevent` files for a wired Apex 7 (firmware `2.4.3`). Each USB interface is
-its own hidraw node, and the profile-capable collection is the vendor page `0xFFC1`:
-
-| Node | Interface | Usage page | Max feature | Max input | Max output | Frames accepted |
-|------|-----------|------------|-------------|-----------|------------|---------------|
-| `hidraw3` | 4 | `0xFFC1` | 644 | 1024 | 64 | opening-chain frame, pull, 643-byte read request |
-| `hidraw2` | 1 | `0xFFC0` | not captured | — | — | `EPIPE` on the chain write |
-| `hidraw4`, `hidraw5` | 2, 3 | `0x0001`, `0x000C` | — | — | — | `EPIPE` on the chain write |
-
-The reply is read as a feature report on the same node, with a buffer of **642** bytes: on the read side the
-kernel forwards that number to the device as `wLength` verbatim, and the device's report is 642 bytes. Asking
-for 643 (the report-ID byte counted twice) makes the control transfer never complete, which is the
-`Connection timed out (os error 110)` recorded on 2026-10-15 after the read request was accepted. The
-64-byte input reports this collection carries are poll and status reports (report IDs `0x0B`, `0x12`);
-the collector skips them and keeps the interrupt endpoint as a fallback reply channel, read on the node
-(see "Input reports: the node must be open when the report arrives").
-
-## Input reports: the node must be open when the report arrives (measured 2026-10-16)
-
-`usbhid` polls a hidraw collection's interrupt endpoint only while a descriptor on that minor is open. In
+  The read sends no writes at all (2026-10-19): the closing sequence is out of the code.
+- What the closing sequence does on hardware. The first three frames are named on the engine side, and **the
+  read no longer sends any of them** (2026-10-19, §Sequences the read does not need): does `89` switch the
+  keyboard to the slot (the engine's config-switching function is what sends it), what does disabling the Gamesense OLED look like on an Apex 7, and
+  does `6c 00 00` put a device back to polling? The frames are named, never replayed, and the keyboard-effect question is open. In
 Linux run capture (the 1428-packet Linux run capture; measurements below are from that file - only a 66-packet
 excerpt of a related run, sha256 <digest recorded outside the repo>, was still in the
 tree on 2026-10-17, so re-verification needs the capture taken again) - every frame was answered 1.0-3.4 ms after it was
