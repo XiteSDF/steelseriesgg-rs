@@ -36,8 +36,8 @@ use super::apex_legacy_profile::{
 };
 use super::{GenericKeyboard, Keyboard};
 use crate::devices::hid_reports::{
-    HidCommand, ONBOARD_FEATURE_REPORT_SIZE, ONBOARD_INIT_CHAIN, ONBOARD_INIT_FRAME_COUNT, ONBOARD_OUTPUT_REPORT_SIZE,
-    OnboardPullCommand, OnboardReadCommand,
+    HidCommand, ONBOARD_END_FRAME_COUNT, ONBOARD_FEATURE_REPORT_SIZE, ONBOARD_INIT_CHAIN, ONBOARD_INIT_FRAME_COUNT,
+    ONBOARD_OUTPUT_REPORT_SIZE, OnboardPullCommand, OnboardReadCommand, onboard_end_sequence,
 };
 use crate::devices::key_mapping::{KeyId, KeyMapping};
 use crate::devices::product_ids;
@@ -59,7 +59,7 @@ const READ_REPLY_ID: u8 = 0x00;
 /// device as `wLength` verbatim, so 643 is the ask that never completes (`Connection timed out`, measured
 /// 2026-10-15). The device's report-ID byte lands in buffer[0], so a full answer is `[report ID][641 bytes]`.
 /// `[EXPERIMENTAL]` The 642-byte ask answered on hardware (Apex 7, 2026-10-16 and 2026-10-18).
-const READ_REPLY_BUFFER_LEN: usize = READ_REPORT_LEN;
+const READ_REPLY_BUFFER_LEN: usize = READ_REPORT_LEN + 1;
 /// Poll acknowledges and status reports the reply collector skips.
 const ACK_REPORT_IDS: [u8; 2] = [0x0B, 0x12];
 /// Bytes to read for the pacing packet that follows a pull. The pull has no answer of its own: the device
@@ -88,6 +88,13 @@ const CHAIN_REPLY_ATTEMPTS: u32 = 1;
 /// Size of the schema probe pull, in bytes: the 2-byte probe on the profile file of slot 0 the reference
 /// capture shows in front of the file read (`[85][00][0201][0][2]`, answered `03 0b 00`).
 const PROBE_PULL_LEN: u16 = 2;
+/// What the engine sleeps after its profile-deploy frame: 250 ms, documented as a wait for the firmware to
+/// finish deploying. See `docs/development/apex-7-onboard-profile-read.md` §Driver mode.
+const LOAD_PROFILE_SLEEP_MS: u64 = 250;
+/// 1-based position of the deploy frame in [`onboard_end_sequence`], the frame the sleep follows.
+const LOAD_PROFILE_FRAME_INDEX: usize = 2;
+/// No gap is needed after the closing `end_driver_mode` frame - it is the last write of the read.
+const NO_GAP_AFTER_FRAME_INDEX: usize = ONBOARD_END_FRAME_COUNT;
 /// Largest input report a profile collection can return (Apex 7 profile collections report 1024).
 const INPUT_REPORT_MAX_LEN: usize = 1024;
 
@@ -150,7 +157,8 @@ impl Apex7 {
     ///
     /// The read plan polls the device and sleeps for GG's inter-frame pacing, so it runs on a scoped
     /// thread and blocks this task's thread until the read finishes (about 2 s for a slot on the
-    /// reference capture's cadence).
+    /// reference capture's cadence). It ends with the closing sequence, which **writes to the keyboard**
+    /// and changes its active profile (see [`Self::send_end_sequence`]).
     ///
     /// # Errors
     ///
@@ -169,7 +177,9 @@ impl Apex7 {
     }
 
     /// Runs one read: GG's opening chain, the schema probe, then [`PULLS_PER_FILE`] pulls, each with its
-    /// pacing read and payload reads.
+    /// pacing read and payload reads, and the closing sequence once the image is assembled.
+    ///
+    /// The tail **writes to the device** (see [`Self::send_end_sequence`]).
     fn read_image(&self, profile: u8) -> Result<ProfileImage> {
         validate_profile(profile)?;
         let fs_id = profile_file_id(profile);
@@ -213,7 +223,13 @@ impl Apex7 {
             });
         }
 
-        ProfileImage::assemble(profile, chunks).map(|image| image.with_firmware(firmware))
+        let image = ProfileImage::assemble(profile, chunks).map(|image| image.with_firmware(firmware))?;
+
+        // GG's tail lands 11 ms after the last read of the file, so the transferring is done at this point;
+        // decoding the assembled image runs after the keyboard has been put back.
+        self.send_end_sequence(profile)?;
+
+        Ok(image)
     }
 
     /// Runs GG's 2-byte probe in front of the file read and checks the schema word it answers.
@@ -341,6 +357,51 @@ impl Apex7 {
             tracing::debug!("onboard opening chain on {path} answered no firmware version");
         }
         Ok(firmware)
+    }
+
+    /// Closes the read: [`onboard_end_sequence`], the four 64-byte output frames the engine writes at the end
+    /// of a profile session - `69` (Gamesense OLED off), `89 <slot + 1>` (deploy that slot), `41 00` (the
+    /// profile is not volatile), `6c 00 00` (`end_driver_mode`).
+    ///
+    /// Frames go at the chain's pacing ([`GG_GAP_MS`]), with [`LOAD_PROFILE_SLEEP_MS`] after the deploy frame,
+    /// which is what the engine itself waits. The closing frame is the counterpart of the chain's `6c 00 01`:
+    /// the read opened driver mode, so it closes it, the way the engine closes its own session.
+    ///
+    /// **This is a write path.** `89` makes the keyboard run the slot named, and `41 00` goes with it for every
+    /// real slot index, so the keyboard's active profile changes as the read ends. Nothing is drained after
+    /// these frames: the read needs no answer from them. A refused frame fails the read - the image is assembled
+    /// by then, so the failure is reported as the read failing.
+    ///
+    /// `[EXPERIMENTAL]`: the first three frames are in the capture's frame inventory; `6c 00 00` is
+    /// not, because GG was killed rather than closed in the capture. None of the four has been sent from this
+    /// crate on hardware. See `docs/development/apex-7-onboard-profile-read.md` §Driver mode.
+    fn send_end_sequence(&self, profile: u8) -> Result<()> {
+        let path = self.collection_label();
+        let frames = onboard_end_sequence(profile);
+        for (index, frame) in frames.iter().enumerate() {
+            self.write_output_command(*frame).map_err(|e| {
+                Error::DeviceCommunication(format!(
+                    "onboard tail frame {} of {} ({}) on {path} rejected: {e}",
+                    index + 1,
+                    frames.len(),
+                    frame.description()
+                ))
+            })?;
+            // The deploy frame carries the engine's own sleep, the last frame needs no gap, and the rest keep
+            // the chain's pacing.
+            let gap = if index + 1 == LOAD_PROFILE_FRAME_INDEX {
+                LOAD_PROFILE_SLEEP_MS
+            } else if index + 1 == NO_GAP_AFTER_FRAME_INDEX {
+                0
+            } else {
+                GG_GAP_MS
+            };
+            if gap > 0 {
+                std::thread::sleep(Duration::from_millis(gap));
+            }
+        }
+        tracing::debug!("onboard tail: {} frames sent on {path}", frames.len());
+        Ok(())
     }
 
     /// Collects one payload reply: the feature-report reply the capture shows, then the interrupt

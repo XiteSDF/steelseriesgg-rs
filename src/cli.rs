@@ -196,10 +196,12 @@ pub(crate) enum Commands {
 /// [EXPERIMENTAL] Read the on-board profile of a legacy Apex keyboard.
 ///
 /// `decode` works on a saved profile image only and never touches a device. `read` talks to a keyboard
-/// and needs `--yes`.
+/// and needs `--yes`: it ends with the engine's four closing frames, which make the keyboard run the slot
+/// that was read (`ONBOARD.md` step 8).
 #[derive(Subcommand)]
 pub(crate) enum OnboardAction {
-    /// Read one profile from a legacy Apex keyboard. Requires --yes.
+    /// Read one profile from a legacy Apex keyboard, then send the engine's closing frames (deploy the slot,
+    /// close driver mode). Requires --yes.
     Read(OnboardReadArgs),
 
     /// Decode a profile image saved by an earlier read (no device, no hardware).

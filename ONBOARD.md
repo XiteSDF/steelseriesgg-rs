@@ -25,8 +25,10 @@ versions sent is not in the capture and was removed. GG's six-frame opening chai
 polls were known to answer) and **restored on 2026-10-18: the read sends all six (`ONBOARD_INIT_CHAIN`),
 because a read that sends only the `90 00` poll is answered on the wire and its payload replies come back as
 scrambled bytes.** `f4 00` and `6c 00 01` have no known meaning, and which frame of the six the keyboard
-needs is open. Every protocol byte in it is `[EXPERIMENTAL]`. Read-only by design: the push
-command is named and never sent. Wire format, layout table and open questions:
+needs is open. Every protocol byte in it is `[EXPERIMENTAL]`. The read is read-only except for GG's closing
+sequence - four frames it sends at the end (step 8), one of which deploys the slot that was read and the last of
+which closes the driver mode the read's own chain opened; the push command is named and never sent. Wire format, layout table and
+open questions:
 `docs/development/apex-7-onboard-profile-read.md`.
 
 **Read status (2026-10-18):** `ssgg onboard read --yes --profile N` completes a full slot read on an Apex 7
@@ -36,7 +38,8 @@ here before anything is promoted to confirmed - the label stays until then. The 
 finding: the read only produces readable payload bytes with `ONBOARD_INIT_CHAIN` sent, and it opens with GG's
 2-byte file-head probe as a schema gate (`Apex7::probe_schema`, step 0c). Steps 3-5 (slot by
 slot, the double read, the layout compare with GG) and the chain question (which frame arms the resource
-buffer) are what is left.
+buffer) are what is left. The read ends with the engine's four closing frames (step 8: the capture's three plus
+the driver-mode close; code since 2026-10-18, never sent on hardware).
 
 0. **[HW] Opening chain and firmware poll:** `ssgg onboard read --yes --profile 0` starts with GG's six-frame
    chain (`90 00`, `90 01`, `f4 00`, `6c 00 01`, `90 00`, `90 01`, 11 ms apart) and prints the firmware version
@@ -147,6 +150,27 @@ capture's replies show - `--reply-header` and the short-read framing sweep are g
    the control collection.
 7. Only after 1-4: extend to the lighting files (`0x0301`-`0x0305`, reply report ID `0x03`), then promote what
    worked to confirmed in `.claude/rules/experimental-protocol.md` with device model and date.
+8. **[HW] Closing sequence (code 2026-10-18, driver-mode close 2026-10-19, never sent on hardware):** the read ends with four frames
+   (`onboard_end_sequence` in `hid_reports.rs`, sent by `Apex7::send_end_sequence`): `69` (Gamesense OLED off),
+   `89 <slot + 1>` (deploy that profile - the engine's deploy id is 1-based, so slot 3 goes out as `89 04`),
+   `41 00` (profile not volatile, sent as 0 for every real slot) and `6c 00 00` (**close driver mode**). The
+   first three are in the capture's frame inventory (one deploy/volatile pair behind each profile file, two `69`);
+   the engine sleeps 250 ms behind the deploy frame and the rest goes at the chain's 11 ms pacing. The fourth
+   frame is **in no capture**: the engine writes it when it closes a session and GG was killed in the capture, so
+   its closing frames never hit the wire. It is sent because the read's own opening chain opened driver mode with
+   `6c 00 01` - the read closes what it opened. The engine's own session close also writes a lighting-reset frame
+   (`0x3B`); the read deliberately does not. The capture's frame inventory has one `ff` frame, recorded by the kit
+   under the "idle, do nothing" step (capture summary): driver mode in this family is `0x6C` (on Apex 3 it is
+   `0x03`), so `ff` is not driver mode, no engine-side name covers it, its direction is not settled, and the read
+   does not send it. **These frames write:** `89` makes the keyboard run the slot. Test on hardware, watching the
+   keyboard - does the active profile change to the slot that was read, does the OLED go dark, does the keyboard still type
+   normally after the read (driver mode is what puts some key combos into the keyboard report), and does the read
+   complete with the frames sent (they are the last
+   transfers, so a keyboard that refuses one fails a read whose image is already assembled).
+   Engine-side detail, including the fact that **the driver-mode frame is a different frame in the Apex 3 family**
+   (`0x03` in a 33-byte report on Apex 3, `0x6C` with a different opening byte on Apex 3 TKL), is in
+   `docs/development/apex-7-onboard-profile-read.md` §Driver mode. The read path exists for the legacy Apex family
+   only, and a port to the Apex 3 family cannot reuse these frames.
 
 ---
 
@@ -154,9 +178,9 @@ capture's replies show - `--reply-header` and the short-read framing sweep are g
 
 | Piece | Where |
 |-------|-------|
-| Wire types: `0x85` pull, `0x83` read, `0x90` firmware poll, the opening chain, the 643-byte read buffer | `src/devices/hid_reports.rs` (`OnboardPullCommand`, `OnboardReadCommand`, `OnboardFirmwareVersionCommand`, `OnboardInitCommand` + `ONBOARD_INIT_CHAIN`) — not feature-gated, no raw byte arrays outside it. The chain is `90 00`, `90 01`, `f4 00`, `6c 00 01`, `90 00`, `90 01` and the read sends all of it: a read with only the `90 00` poll answers with scrambled payload bytes (Apex 7, 2026-10-18). `CommandCode::EngineStatus` (`f4 00`) and `CommandCode::OpenFiles` (`6c 00 01`) name the chain's two unexplained frames; they were removed 2026-10-17 and restored 2026-10-18 |
+| Wire types: `0x85` pull, `0x83` read, `0x90` firmware poll, the opening chain, the 643-byte read buffer | `src/devices/hid_reports.rs` (`OnboardPullCommand`, `OnboardReadCommand`, `OnboardFirmwareVersionCommand`, `OnboardInitCommand` + `ONBOARD_INIT_CHAIN`) — not feature-gated, no raw byte arrays outside it. The chain is `90 00`, `90 01`, `f4 00`, `6c 00 01`, `90 00`, `90 01` and the read sends all of it: a read with only the `90 00` poll answers with scrambled payload bytes (Apex 7, 2026-10-18). `CommandCode::EngineStatus` (`f4 00`) names the chain's one unexplained frame; `CommandCode::DriverMode` (`6c 00 01`) names the fourth, which opens driver mode, and the same command byte closes it with `6c 00 00`. The chain frames were removed 2026-10-17 and restored 2026-10-18. The closing sequence of step 8 is built by `onboard_end_sequence` (`ONBOARD_END_FRAME_COUNT` = 4) on the same `OnboardInitCommand` builder: `CommandCode::DisableGamesenseOled` (`69`), `CommandCode::LoadProfile` (`89`), `CommandCode::SetProfileVolatile` (`41`), `CommandCode::DriverMode` (`6c 00 00`). Driver mode is a different frame in the Apex 3 family - `docs/development/apex-7-onboard-profile-read.md` §Driver mode |
 | Read geometry, reply parsing, assembly, decode | `src/devices/keyboards/apex_legacy_profile.rs` (`PULLS_PER_FILE`, `DEVICE_RESOURCE_BUFFER_LEN`, `PAYLOAD_READ_LEN`, `PROFILE_FILE_BYTES`, `READS_PER_PULL`, `profile_file_id`, `validate_profile`, `parse_read_reply`, `ProfileImage`, `decode`), core code. It was `src/onboard_profile.rs` until 2026-10-17, when it moved into the legacy Apex namespace: its constants are all `apexui.dll` facts of the legacy ("macho") platform - reply framing, resource-buffer size, payload sizes, schema words, struct offsets - and there is nothing there another family can share. The only knob is the profile slot: pull count, buffer size, window size, pacing and reply framing are constants, the read loop builds every frame from the typed commands, and it is also what logs the geometry - the CLI prints none, so no legacy constant appears in `src/main.rs`. Renamed 2026-10-18 so the names say **fact**, not **default**: `DEFAULT_CHUNKS` → `PULLS_PER_FILE`, `READ_LEN` → `PAYLOAD_READ_LEN`, `RESOURCE_BUFFER_LEN` → `DEVICE_RESOURCE_BUFFER_LEN`, `PROFILE_FILE_LEN` → `PROFILE_FILE_BYTES`, `SCHEMA_B_FIRMWARE` → `SCHEMA_B_FIRMWARE_VERSION` (documentation only - the read takes its schema from the word it reads). Deleted as unused: `PROFILE_FS_LEN` (the 0xA000 flash region), `PULL_REPORT_LEN`, `INIT_REPORT_LEN`, `LIGHTING_FS_SHARED` |
-| Packet I/O | `src/devices/keyboards/mod.rs`: `GenericKeyboard` does the profile packet I/O on the `device` handle it already owns - `connected_device` (the one handle accessor, shared with the lighting sends, same "Device not connected" message), `write_profile_packet` (the write the read uses: no cache, so the chain's repeated frames go out; `send_report` runs the hid optimizer, which drops a report identical to one sent in the last 50 ms - see the write-path note in step 0), `send_feature`, `read_profile_feature_packet`, `read_profile_input_packet`, core code; `Apex7` runs the read plan - `read_image`, `send_init_chain`, `probe_schema`, `pull_window`, `read_window` - on its own handle on a scoped thread (`std::thread::scope`, 2026-10-18, which replaced `spawn_blocking` fed by an `unsafe` transmute to `&'static` - the scoped borrow is checked, and the read blocks the task's thread for its ~2 s). The plan takes the slot only: `strict` (no flag fed it) and the `deadline` reply-budget plumbing (always `None`) are gone, one payload read has one fixed `REPLY_BUDGET_MS`. No transport type: `OnboardTransport` with its `HandleTransport` and `PathTransport`, and the per-call path-open helpers (`send_feature_report_raw`, `read_feature_report_raw`, `write_output_report_raw`, `read_input_report_raw`) were all removed on 2026-10-17; Apex 7 wired works through hidapi |
+| Packet I/O | `src/devices/keyboards/mod.rs`: `GenericKeyboard` does the profile packet I/O on the `device` handle it already owns - `connected_device` (the one handle accessor, shared with the lighting sends, same "Device not connected" message), `write_profile_packet` (the write the read uses: no cache, so the chain's repeated frames go out; `send_report` runs the hid optimizer, which drops a report identical to one sent in the last 50 ms - see the write-path note in step 0), `send_feature`, `read_profile_feature_packet`, `read_profile_input_packet`, core code; `Apex7` runs the read plan - `read_image`, `send_init_chain`, `probe_schema`, `pull_window`, `read_window`, `send_end_sequence` - on its own handle on a scoped thread (`std::thread::scope`, 2026-10-18, which replaced `spawn_blocking` fed by an `unsafe` transmute to `&'static` - the scoped borrow is checked, and the read blocks the task's thread for its ~2 s). The plan takes the slot only: `strict` (no flag fed it) and the `deadline` reply-budget plumbing (always `None`) are gone, one payload read has one fixed `REPLY_BUDGET_MS`. No transport type: `OnboardTransport` with its `HandleTransport` and `PathTransport`, and the per-call path-open helpers (`send_feature_report_raw`, `read_feature_report_raw`, `write_output_report_raw`, `read_input_report_raw`) were all removed on 2026-10-17; Apex 7 wired works through hidapi |
 | Keyboard device | `src/devices/keyboards/apex7.rs`: `Apex7` wraps `GenericKeyboard` (its `HidReportBuilder` and the open `HidDevice`) and runs the read on its own handle; `onboard_family(pid)` selects `0x1612`, `0x1614`, `0x1616`, `0x1618` and `discovery::open_keyboard` wraps those PIDs in it - the read path is core code, labelled `[EXPERIMENTAL]`, so a family board keeps standard lighting in every build |
 | Device API | `Keyboard::supports_onboard_profile`, `Keyboard::read_onboard_profile` (`[EXPERIMENTAL]`, core code); every other keyboard answers "not supported" |
 | CLI | `ssgg onboard read / decode` (`src/cli.rs`, `src/main.rs`); `read --profile 0..4` runs on the `Apex7` device (its own handle, `--device vid:pid` selects the keyboard) and takes `--out`, `--json`, `--hex`, `--verify`, `--yes` - every other number of the read is a protocol constant, not a flag, and the CLI prints none of them; the geometry - slot, file id, pulls, payload reads - is logged by the read loop at `info` level, so `ssgg --debug onboard read` shows it before the first transfer; `decode` works on a saved image and touches no device |
@@ -170,3 +194,22 @@ Two facts from the first Linux run (2026-10-15, Apex 7 `the hidraw node`) that s
   per-report open (`/dev/hidrawN` opened for one report) has nowhere to deliver the firmware-poll and
   pull answers, so `read_interrupt_report` saw none. The read avoids that: `Apex7` does its own packet
   I/O on the handle the device manager opened, and that handle stays open for the whole read.
+
+## Known facts (2026-10-19, driver mode)
+
+- **The read closes the driver mode its own chain opened** - engine-side reading in
+  `docs/development/apex-7-onboard-profile-read.md` §Driver mode. Driver mode is report 0, command `0x6C`, last
+  byte 1 to open and 0 to close; the engine writes the opening frame at device init and the closing frame when it
+  closes a session, and the capture shows only the opening frame (`6c 00 01`, the chain's fourth frame) because GG
+  was killed in the capture. The engine's session close also writes a lighting-reset frame (`0x3B`) and the
+  OLED-off frame (`0x69`); the read sends the OLED-off and driver-mode frames, not the lighting reset. **Not
+  tested on hardware**, and what the close changes on the device is not measured.
+- **Driver mode is not one frame across families** - engine-side descriptors (`apex_3.lisp:23`, `:32`,
+  `apex_3_tkl.lisp:99`, `:100`, `:109`, `base_apex_legacy.lisp:562`, `:570`; `ONBOARD.md` line 10 keeps those
+  descriptors out of code comments). Legacy Apex family (this read, the `0x1612` devices): command `0x6C`, opening
+  `profile_driver_mode 0` + `macro_driver_mode 1`, closing both 0. **Apex 3: command `0x03` in a 33-byte report**,
+  with a `reserved` byte, and its opening and closing frames are byte-identical (both `profile_button_driver_mode
+  0`, `macro_button_driver_mode 1`). **Apex 3 TKL: command `0x6C` in a 65-byte report, opening with
+  `profile_driver_mode 1` + `macro_driver_mode 1`**, closing both 0; its descriptor states the purpose - the mode
+  is what makes SSKey combos appear in the keyboard report. **A port of the read to the Apex 3 family cannot
+  reuse the closing frame.**

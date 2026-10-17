@@ -23,7 +23,10 @@
 //! control endpoint first. Since the read-back fix of 2026-10-17 a full slot read completes on an Apex 7
 //! under Linux (reported 2026-10-18, with GG's opening chain sent; the read without it answered on the
 //! wire with scrambled payload bytes). Nothing here writes a profile, and the payload struct offsets stay
-//! unverified until a read is compared with what GG shows for that slot.
+//! unverified until a read is compared with what GG shows for that slot. The four frames GG sends after a
+//! profile transfer are named in `hid_reports::onboard_end_sequence` and sent by
+//! [`crate::devices::keyboards::apex7::Apex7::send_end_sequence`], at the end of the read: `89 <slot + 1>`
+//! makes the keyboard run the slot that was read, so this read is not write-free.
 //!
 //! # Wire format
 //!
@@ -65,6 +68,11 @@
 //!   `03 | 0b 00 43 6f 6e 66 69 67 20 31 …`, i.e. the schema word at payload offset 0 and the profile
 //!   name at payload offset 2. Some firmware echoes the request header instead, with the payload from
 //!   byte 6; [`parse_read_reply`] accepts both.
+//! * closing sequence (`HIDIO`, output report ID `0x00`, 64 bytes on the wire, `SET_REPORT wValue 0x0200
+//!   wIndex 1 wLength 64`): `69 00…`, `89 <slot + 1> 00…`, `41 00 00…`, `6c 00 00…` - OLED off, deploy that
+//!   slot, profile not volatile, close driver mode, the frame that closes what the opening chain's `6c 00 01`
+//!   opened. With the engine's 250 ms sleep after the deploy frame (`ONBOARD.md` step 8, and
+//!   `docs/development/apex-7-onboard-profile-read.md` §Driver mode). They are writes: `89` deploys the slot.
 //!
 //! The read geometry is not tunable: a profile file is read as [`PULLS_PER_FILE`] resource-buffer fills
 //! ([`DEVICE_RESOURCE_BUFFER_LEN`] each); every fill is drained with two [`PAYLOAD_READ_LEN`]-byte payload
