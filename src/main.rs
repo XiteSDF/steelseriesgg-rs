@@ -872,18 +872,18 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
                 }
                 match codec.diff(&first, &second) {
                     Some(offset) => {
-                        println!("the two reads differ at byte {offset}: treat this pairing as unverified")
+                        println!("the two reads differ at profile byte {offset}: treat this pairing as unverified")
                     }
-                    None => println!("the two reads agree on all {} bytes", first.data.len()),
+                    None => println!("the two reads agree on all {} profile bytes", first.data.len()),
                 }
                 let json = onboard_json_path(codec, args.out.as_deref(), &first.data, args.profile);
                 secure_write_async(json.clone(), codec.profile_json(&codec.decode(&first.data)?)?).await?;
                 println!("JSON decode report of the first read written to {}", json.display());
                 write_onboard_report(codec, args.report.as_ref(), &first).await?;
                 if let Some(bin) = args.bin.as_ref() {
-                    secure_write_async(bin.clone(), onboard_payload(&first)).await?;
+                    secure_write_async(bin.clone(), first.data.clone()).await?;
                     let second_path = bin.with_extension("second.bin");
-                    secure_write_async(second_path.clone(), onboard_payload(&second)).await?;
+                    secure_write_async(second_path.clone(), second.data.clone()).await?;
                     println!(
                         "both profile images written: {} and {}",
                         bin.display(),
@@ -903,20 +903,8 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
                 println!("JSON decode report written to {}", json.display());
                 write_onboard_report(codec, args.report.as_ref(), &image).await?;
                 if let Some(bin) = args.bin.as_ref() {
-                    let payload = onboard_payload(&image);
-                    secure_write_async(bin.clone(), payload.clone()).await?;
+                    secure_write_async(bin.clone(), image.data.clone()).await?;
                     println!("profile image written to {}", bin.display());
-                    if let Some(extra) = onboard_extra(&image) {
-                        let extra_path = bin.with_extension("extra.bin");
-                        secure_write_async(extra_path.clone(), extra).await?;
-                        println!(
-                            "extra region written to {} ({} bytes behind the {}-byte payload, fnv1a {}, not decoded)",
-                            extra_path.display(),
-                            image.stats.extra_len,
-                            image.stats.payload_len,
-                            image.stats.extra_fnv1a_64
-                        );
-                    }
                 }
             }
         }
@@ -1010,27 +998,6 @@ fn onboard_json_path(
         || std::path::PathBuf::from(codec.dump_name(data, config)),
         std::path::PathBuf::from,
     )
-}
-
-/// The profile bytes a read's `--bin` file gets: the payload prefix the schema word describes. The
-/// pulls also cover the region GG's transfers reach behind it (see
-/// [`steelseries_gg::devices::keyboards::onboard::ReadStats::extra_len`]); that stays in the read record,
-/// so a `--bin` file stays the payload the decoder and the GUI take.
-fn onboard_payload(image: &steelseries_gg::devices::keyboards::onboard::ProfileImage) -> Vec<u8> {
-    if image.stats.payload_len == 0 {
-        return image.data.clone();
-    }
-    image.data[..image.stats.payload_len].to_vec()
-}
-
-/// The bytes a read collected behind the payload, when there are any and they are not all zero: the
-/// region GG's own transfers reach (see
-/// [`steelseries_gg::devices::keyboards::onboard::ReadStats::extra_len`]). The `.bin` file stays the
-/// payload, so the decoder, the GUI and the `lisp/` scripts keep working on it unchanged; this side file
-/// is what a new read learns about the rest of the on-board file.
-fn onboard_extra(image: &steelseries_gg::devices::keyboards::onboard::ProfileImage) -> Option<Vec<u8>> {
-    let extra = image.data.get(image.stats.payload_len..)?;
-    (!extra.is_empty() && !extra.iter().all(|b| *b == 0)).then(|| extra.to_vec())
 }
 
 /// The per-pull read record as the family codec writes it: chunk headers, framing stats, the image hash.

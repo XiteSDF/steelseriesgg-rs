@@ -17,11 +17,7 @@
 //! 4.16.8, 2026-10-15, capture notes, decoded from the engine capture 2 frame by frame):
 //! 120 pulls of 1024 bytes at file offsets 0..11264, each drained by reads at buffer offsets 0 and 512,
 //! 100 of them on file `0x0201` (profile slot 0) plus one schema probe; 241 payload reads, every one of
-//! them answering with the first payload byte `0x0B`, i.e. schema [`SCHEMA_B`]. The write capture of
-//! 2026-10-19 (capture notes: GG writing `Config 1` in 250 pushes) shows GG's own
-//! transfers running **past** that range, with a long tail of pushes from file offset `0x3000` (12288)
-//! on - the on-board file is bigger than the decoded payload, so this read pulls the whole range GG
-//! reaches (see [`PULLS_PER_FILE`]). On 2026-10-15 an Apex 7
+//! them answering with the first payload byte `0x0B`, i.e. schema [`SCHEMA_B`]. On 2026-10-15 an Apex 7
 //! accepted a pull and a payload-read request on its interface-4 vendor collection and answered a pull
 //! on the interrupt endpoint; the payload read timed out there, which is why the reply is read on the
 //! control endpoint first. Since the read-back fix of 2026-10-17 a full slot read completes on an Apex 7
@@ -120,18 +116,9 @@ pub const DEVICE_RESOURCE_BUFFER_LEN: usize = 1024;
 /// read specifiers use. A protocol fact, not a read length to tune.
 pub const PAYLOAD_READ_LEN: usize = 512;
 /// Pulls per profile file, the fixed pull count of the read: [`PULLS_PER_FILE`] fills of
-/// [`DEVICE_RESOURCE_BUFFER_LEN`] bytes, so the last pull starts at file offset
-/// `(PULLS_PER_FILE - 1) * 1024 = 0x9C00`, the offset GG's own transfers reach. The read loop runs
-/// exactly this many pulls; there is no chunk-count option.
-///
-/// GG's read capture pulls `0..=11264` (12 fills), which is all the decoded payload needs.
-/// The write capture shows GG pushing `Config 1` in 250 pushes whose offsets run into the
-/// `0x9C00` range: the payload fills, a 192-byte tail push, then a long run of identical pushes from
-/// file offset 12288 on - the region behind the payload. The read pulls all 40 fills: the payload decodes
-/// as before and the bytes behind it are recorded with a hash ([`ReadStats::payload_len`],
-/// [`ReadStats::extra_len`], [`ReadStats::extra_fnv1a_64`]). **[EXPERIMENTAL]**: the 28 pulls past the
-/// old 12-fill range have never run on hardware.
-pub const PULLS_PER_FILE: usize = 40;
+/// [`DEVICE_RESOURCE_BUFFER_LEN`] bytes cover both payload lengths. The read loop runs exactly this many
+/// pulls; there is no chunk-count option.
+pub const PULLS_PER_FILE: usize = 12;
 /// File id of profile slot 0; slot `n` is this plus `n`.
 pub const PROFILE_FS_BASE: u16 = 0x0201;
 /// Highest profile slot the device offers (`0..=4`), a fixed slot count of the platform. GG names the
@@ -143,14 +130,8 @@ pub const LIGHTING_FS_BASE: u16 = 0x0301;
 /// Macro data block inside a profile payload, in bytes.
 pub const MACRO_DATA_LEN: usize = 9600;
 
-/// Command byte of the push (profile write). Measured 2026-10-19 from the write capture
-/// (capture notes, GG writing `Config 1` in 250 pushes): the push frame is **the
-/// pull frame with the direction bit swapped** - `0x85` becomes `0x05`, and the same 10 frame bytes
-/// `05 | 00 | file_id u16 LE | offset u32 LE | size u16 LE | 00…` go out in the same 64-byte output
-/// report (`SET_REPORT wValue 0x0200 wIndex 1`). GG's write of slot 0 pushes the payload fills
-/// (`0..=11264`), a 192-byte tail push, then a long run of identical pushes from file offset 12288 on -
-/// the offsets the read now pulls. **Nothing in ssgg sends it**: there is no write path. The read path
-/// has no command bytes of its own: they are
+/// Command byte of the push (profile write); defined for completeness, nothing here sends it. The
+/// read path has no command bytes of its own: they are
 /// [`crate::devices::hid_reports::CommandCode`] variants and every frame is built by a typed command in
 /// [`crate::devices::hid_reports`] (see [`crate::devices::hid_reports::OnboardPullCommand`]).
 pub const CMD_PUSH_PAYLOAD: u8 = 0x05;
@@ -223,14 +204,10 @@ pub const MAX_READ_LEN: usize = READ_REPORT_LEN - 1 - READ_REPLY_HEADER_LEN;
 const _: () = assert!(MAX_READ_LEN == ONBOARD_MAX_READ_LEN);
 
 /// File bytes one read covers: [`PULLS_PER_FILE`] pulls of [`DEVICE_RESOURCE_BUFFER_LEN`] bytes, which
-/// covers both payload lengths ([`PAYLOAD_LEN_A`] and [`PAYLOAD_LEN_B`]) and the region GG's own
-/// transfers reach. The read always covers exactly this many bytes; the payload is the prefix
-/// [`ReadStats::payload_len`] describes and everything behind it is the recorded extra region.
+/// covers both payload lengths ([`PAYLOAD_LEN_A`] and [`PAYLOAD_LEN_B`]). The read always covers exactly
+/// this many bytes: the shorter image would be a partial profile, the longer one would need slots that
+/// do not exist.
 pub const PROFILE_FILE_BYTES: usize = PULLS_PER_FILE * DEVICE_RESOURCE_BUFFER_LEN;
-
-/// The pulled region is longer than the payload it contains, so a full read pulls bytes the decoder
-/// records and does not decode.
-const _: () = assert!(PROFILE_FILE_BYTES > PAYLOAD_LEN_B);
 
 /// Payload reads per pull: one pull fills [`DEVICE_RESOURCE_BUFFER_LEN`], each read drains
 /// [`PAYLOAD_READ_LEN`] of it.
@@ -412,16 +389,6 @@ pub struct ReadStats {
     pub garbage_reads: usize,
     /// File bytes covered by the pulls.
     pub covered_len: usize,
-    /// Payload bytes the schema word at offset 0 describes ([`PAYLOAD_LEN_A`] / [`PAYLOAD_LEN_B`]): the
-    /// prefix [`decode`] understands. `0` for a schema word this code does not know.
-    pub payload_len: usize,
-    /// Bytes collected past [`Self::payload_len`]: GG's transfers run past the payload
-    /// (see [`PULLS_PER_FILE`]) and nothing decodes them.
-    pub extra_len: usize,
-    /// FNV-1a-64 of the bytes past [`Self::payload_len`], as hex (the whole image when the schema is
-    /// unknown, of nothing when the image is payload-only). The record's `sha_like_fnv1a_64` marker is
-    /// the same function: there is no SHA implementation in the tree.
-    pub extra_fnv1a_64: String,
 }
 
 /// Assembled profile data with its per-pull records.
@@ -513,16 +480,6 @@ impl ProfileImage {
             .max()
             .unwrap_or(0);
 
-        // The schema word at the head says how far the decoded payload reaches; everything behind it is
-        // the region GG's transfers cover, recorded with a hash and never decoded.
-        let payload_len = match schema_of(&data) {
-            SCHEMA_A => PAYLOAD_LEN_A,
-            SCHEMA_B => PAYLOAD_LEN_B,
-            _ => 0,
-        }
-        .min(data.len());
-        let extra = &data[payload_len..];
-
         Ok(Self {
             profile_slot,
             stats: ReadStats {
@@ -535,9 +492,6 @@ impl ProfileImage {
                 short_reads,
                 garbage_reads,
                 covered_len,
-                payload_len,
-                extra_len: extra.len(),
-                extra_fnv1a_64: fnv1a_64(extra),
             },
             chunks,
             data,
@@ -972,18 +926,6 @@ pub struct OnboardProfile {
     pub crc_ok: bool,
     /// Length of the checksummed prefix.
     pub crc_region_len: usize,
-    /// Payload bytes this schema describes ([`PAYLOAD_LEN_A`] / [`PAYLOAD_LEN_B`]).
-    #[serde(default)]
-    pub payload_len: usize,
-    /// Bytes the read collected behind the payload: GG's transfers reach that far
-    /// (see [`PULLS_PER_FILE`]) and nothing decodes them.
-    #[serde(default)]
-    pub extra_len: usize,
-    /// FNV-1a-64 of those extra bytes, as hex: a marker for comparing two reads of the same slot. The
-    /// bytes themselves stay out of the JSON (`ssgg onboard read --bin` writes them to a side file);
-    /// there is no base64 in the tree.
-    #[serde(default)]
-    pub extra_fnv1a_64: String,
 }
 
 /// Layout of the decoded blocks.
@@ -1317,9 +1259,6 @@ pub fn decode(data: &[u8]) -> Result<OnboardProfile> {
         crc_computed: computed,
         crc_ok: stored == computed,
         crc_region_len: crc_offset,
-        payload_len: expected,
-        extra_len: data.len() - expected,
-        extra_fnv1a_64: fnv1a_64(&data[expected..]),
     })
 }
 
@@ -1397,9 +1336,6 @@ pub fn to_json(image: &ProfileImage) -> Result<String> {
         "firmware": image.firmware,
         "data_len": payload.len(),
         "sha_like_fnv1a_64": fnv1a_64(payload),
-        "payload_len": image.stats.payload_len,
-        "extra_len": image.stats.extra_len,
-        "extra_fnv1a_64": image.stats.extra_fnv1a_64,
         "stats": image.stats,
         "chunks": image.chunks,
         "head_hex": hex_of(&payload[..payload.len().min(64)]),
@@ -1876,12 +1812,6 @@ fn image_lines(image: &ProfileImage, label: &str) -> Vec<String> {
             image.stats.header_mismatches, image.stats.zero_reads, image.stats.zero_chunks, image.stats.garbage_reads
         ),
     ];
-    if image.stats.extra_len > 0 {
-        lines.push(format!(
-            "region:  {} payload bytes behind the schema word, {} more pulled past it (fnv1a {}, not decoded)",
-            image.stats.payload_len, image.stats.extra_len, image.stats.extra_fnv1a_64
-        ));
-    }
     match decode(&image.data) {
         Ok(profile) => lines.extend(profile_lines(&profile)),
         Err(e) => lines.push(format!("decode: {e}")),
@@ -2391,56 +2321,6 @@ mod tests {
     }
 
     #[test]
-    fn the_pull_range_reaches_where_gg_writes() {
-        assert_eq!(
-            (PULLS_PER_FILE - 1) * DEVICE_RESOURCE_BUFFER_LEN,
-            0x9C00,
-            "the last pull starts at the file offset the write capture reaches"
-        );
-        assert_eq!(PROFILE_FILE_BYTES, 40_960);
-    }
-
-    #[test]
-    fn bytes_behind_the_payload_are_recorded_with_a_hash() {
-        let records = (0..PULLS_PER_FILE)
-            .map(|chunk| {
-                record(chunk, |read| {
-                    let mut data = vec![(chunk * READS_PER_PULL + read + 1) as u8; PAYLOAD_READ_LEN];
-                    if chunk == 0 && read == 0 {
-                        data[..2].copy_from_slice(&SCHEMA_B.to_le_bytes());
-                    }
-                    data
-                })
-            })
-            .collect::<Vec<_>>();
-        let image = ProfileImage::assemble(0, records).unwrap();
-        assert_eq!(image.stats.payload_len, PAYLOAD_LEN_B);
-        assert_eq!(image.stats.extra_len, PROFILE_FILE_BYTES - PAYLOAD_LEN_B);
-        assert_eq!(
-            image.stats.extra_fnv1a_64,
-            fnv1a_64(&image.data[PAYLOAD_LEN_B..]),
-            "the marker is the extra region's own hash, not the image's"
-        );
-        let json = to_json(&image).unwrap();
-        assert!(json.contains(&format!("\"extra_len\": {}", image.stats.extra_len)));
-        assert!(json.contains("\"payload_len\": 11696"));
-    }
-
-    #[test]
-    fn a_payload_only_image_has_no_extra_region() {
-        let data = synthetic_payload(SCHEMA_B);
-        let profile = decode(&data).unwrap();
-        assert_eq!(profile.payload_len, PAYLOAD_LEN_B);
-        assert_eq!(profile.extra_len, 0);
-        assert_eq!(profile.extra_fnv1a_64, fnv1a_64(&[]));
-        let mut with_extra = data.clone();
-        with_extra.extend_from_slice(&[0xA5; 256]);
-        let profile = decode(&with_extra).unwrap();
-        assert_eq!(profile.extra_len, 256);
-        assert_eq!(profile.extra_fnv1a_64, fnv1a_64(&[0xA5u8; 256]));
-    }
-
-    #[test]
     fn short_reply_is_a_short_read() {
         let reply = reply_report([0x83, 0, 0, 0, 0, 0x02], 7, 10);
         let parsed = parse_read_reply(&reply, 512).unwrap();
@@ -2801,9 +2681,6 @@ mod tests {
                 "crc_computed",
                 "crc_ok",
                 "crc_region_len",
-                "payload_len",
-                "extra_len",
-                "extra_fnv1a_64",
             ]
         );
 

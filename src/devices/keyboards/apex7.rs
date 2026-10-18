@@ -572,20 +572,12 @@ mod tests {
     }
 
     #[test]
-    fn the_read_geometry_covers_the_region_gg_writes_to() {
+    fn the_read_geometry_is_the_captured_one() {
         assert_eq!(profile_file_id(0), PROFILE_FS_BASE);
         assert_eq!(
-            PULLS_PER_FILE, 40,
-            "the read pulls to file offset 0x9C00, where GG's own transfers reach"
-        );
-        assert_eq!(
-            (PULLS_PER_FILE - 1) * DEVICE_RESOURCE_BUFFER_LEN,
-            0x9C00,
-            "the last pull starts at the offset the write capture shows"
-        );
-        assert_eq!(
-            PROFILE_FILE_BYTES, 40_960,
-            "the pulled region runs past the 11696-byte payload of the reference capture"
+            PULLS_PER_FILE * DEVICE_RESOURCE_BUFFER_LEN,
+            12_288,
+            "the fixed read covers the payload of the reference capture"
         );
         assert_eq!(
             READS_PER_PULL,
