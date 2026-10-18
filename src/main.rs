@@ -19,6 +19,7 @@ use tracing_subscriber::FmtSubscriber;
 use steelseries_gg::config::Config;
 use steelseries_gg::device_state::{DeviceId, DeviceStateStore, KeyboardState};
 use steelseries_gg::devices::keyboards::Keyboard;
+use steelseries_gg::devices::keyboards::onboard::OnboardProfileCodec;
 use steelseries_gg::devices::{
     DeviceInfo, DeviceManager, DeviceType, KeyAddress, KeyId,
     diagnostics::{init_global_diagnostics, with_global_diagnostics},
@@ -48,8 +49,6 @@ use crate::cli::normalize_volume;
 use crate::cli::{SonarAction, StreamerAction, parse_sonar_channel};
 
 use crate::cli::OnboardAction;
-
-use steelseries_gg::devices::keyboards::apex_legacy_profile::decode;
 
 #[cfg(feature = "audio")]
 use steelseries_gg::audio::AudioMixer;
@@ -805,60 +804,82 @@ async fn cmd_profile(action: ProfileAction) -> Result<()> {
     Ok(())
 }
 
-/// [EXPERIMENTAL] Read the on-board profile of a legacy Apex keyboard.
+/// [EXPERIMENTAL] On-board profile commands of a keyboard's on-board protocol. The read collects a
+/// profile, `decode` and `encode` work on files: all of it runs through the interfaces in
+/// src/devices/keyboards/onboard.rs and names no keyboard family - which family a device speaks is what
+/// `Keyboard::onboard_codec` answers, and which one a file belongs to is what the codec registry answers.
 ///
-/// Reads only. The protocol is reverse-engineered from the GG USBPcap capture written up in
-/// docs/development/apex-7-onboard-profile-read.md; a full slot read has completed on an Apex 7 and
+/// The protocol of the family registered today is reverse-engineered from the GG USBPcap capture written
+/// up in docs/development/apex-7-onboard-profile-read.md; a full slot read has completed on an Apex 7 and
 /// the decoded layout and checksum now match GG's payload struct and a hardware read of the factory
-/// profile. Field meanings inside the OLED and macro blocks are still reverse-engineered.
+/// profile. Field meanings inside the OLED and macro blocks are still reverse-engineered. Nothing here
+/// writes to a keyboard.
 async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAction) -> Result<()> {
-    use steelseries_gg::devices::keyboards::apex_legacy_profile::{hex_dump, profile_json, schema_of, summary_line};
+    use steelseries_gg::devices::keyboards::onboard::{self as onboard, codec_for_bytes, codec_for_json};
 
     match action {
         OnboardAction::Read(args) => {
-            // GG names its configs 1-5; the read addresses the 0-based slot behind that number.
-            let Some(slot) = args.profile.checked_sub(1) else {
-                return Err(Error::InvalidConfig(format!(
-                    "config {} is not a config number: use 1-5 (GG's Config 1 .. Config 5)",
-                    args.profile
-                )));
-            };
             let Some(manager) = manager.as_mut() else {
                 return Err(Error::Other("the on-board profile read needs a device".to_string()));
             };
-            let Some(keyboard) = onboard_keyboard(manager, &args.device).await else {
-                return Err(Error::DeviceNotFound(
-                    "no Apex 7-family keyboard found: the on-board profile read runs on the keyboard's own handle, selected with --device vid:pid"
-                        .to_string(),
+            let keyboard = match manager
+                .open_onboard_keyboard(args.device)
+                .map_err(|e| Error::Other(format!("select the on-board profile keyboard: {e}")))?
+            {
+                steelseries_gg::devices::discovery::OnboardKeyboard::Keyboard(keyboard) => keyboard,
+                steelseries_gg::devices::discovery::OnboardKeyboard::NotFound { product_id } => {
+                    return Err(Error::DeviceNotFound(match product_id {
+                        Some(pid) => format!(
+                            "no keyboard with product ID {pid:04X} answers the on-board profile protocol: the read runs on a keyboard's own handle, and only keyboards are candidates"
+                        ),
+                        None => "no connected keyboard answers the on-board profile protocol: the read runs on a keyboard's own handle, and only keyboards are candidates (a mouse or a headset is not)".to_string(),
+                    }));
+                }
+                steelseries_gg::devices::discovery::OnboardKeyboard::Ambiguous { keyboards } => {
+                    let listed = keyboards
+                        .iter()
+                        .map(|(pid, name)| format!("{name} ({pid:04X})"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(Error::InvalidConfig(format!(
+                        "more than one connected keyboard answers the on-board profile protocol: {listed} - name one with --device <pid>"
+                    )));
+                }
+            };
+            // The selection above picked a keyboard whose codec answers, so asking again cannot fail.
+            let Some(codec) = keyboard.onboard_codec() else {
+                return Err(Error::DeviceCommunication(
+                    "the selected keyboard answers no on-board profile codec".to_string(),
                 ));
             };
+            // GG names its configs 1-5; the family codec maps that number to the slot it stores.
+            let slot = codec.slot_for_config(args.profile)?;
             let label = onboard_device_label(keyboard.as_ref());
-            print_onboard_banner();
+            for line in codec.banner_lines() {
+                println!("{line}");
+            }
             println!("reading on the {label}");
             println!();
 
             if args.verify {
                 let first = keyboard.read_onboard_profile(slot).await?;
                 let second = keyboard.read_onboard_profile(slot).await?;
-                let diff = first
-                    .data
-                    .iter()
-                    .zip(second.data.iter())
-                    .enumerate()
-                    .find(|(_, (a, b))| a != b)
-                    .map(|(offset, _)| offset);
-                print_onboard_image(&first, &label);
-                print_onboard_image(&second, &label);
-                match diff {
+                for line in codec.image_lines(&first, &label) {
+                    println!("{line}");
+                }
+                for line in codec.image_lines(&second, &label) {
+                    println!("{line}");
+                }
+                match codec.diff(&first, &second) {
                     Some(offset) => {
                         println!("the two reads differ at profile byte {offset}: treat this pairing as unverified")
                     }
                     None => println!("the two reads agree on all {} profile bytes", first.data.len()),
                 }
-                let json = onboard_json_path(args.out.as_deref(), &first.data, args.profile);
-                secure_write_async(json.clone(), profile_json(&decode(&first.data)?)?).await?;
+                let json = onboard_json_path(codec, args.out.as_deref(), &first.data, args.profile);
+                secure_write_async(json.clone(), codec.profile_json(&codec.decode(&first.data)?)?).await?;
                 println!("JSON decode report of the first read written to {}", json.display());
-                write_onboard_report(args.report.as_ref(), &first).await?;
+                write_onboard_report(codec, args.report.as_ref(), &first).await?;
                 if let Some(bin) = args.bin.as_ref() {
                     secure_write_async(bin.clone(), first.data.clone()).await?;
                     let second_path = bin.with_extension("second.bin");
@@ -871,14 +892,16 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
                 }
             } else {
                 let image = keyboard.read_onboard_profile(slot).await?;
-                print_onboard_image(&image, &label);
-                if args.hex {
-                    print!("{}", hex_dump(&image.data, 0, image.data.len()));
+                for line in codec.image_lines(&image, &label) {
+                    println!("{line}");
                 }
-                let json = onboard_json_path(args.out.as_deref(), &image.data, args.profile);
-                secure_write_async(json.clone(), profile_json(&decode(&image.data)?)?).await?;
+                if args.hex {
+                    print!("{}", codec.hex(&image.data, 0, image.data.len()));
+                }
+                let json = onboard_json_path(codec, args.out.as_deref(), &image.data, args.profile);
+                secure_write_async(json.clone(), codec.profile_json(&codec.decode(&image.data)?)?).await?;
                 println!("JSON decode report written to {}", json.display());
-                write_onboard_report(args.report.as_ref(), &image).await?;
+                write_onboard_report(codec, args.report.as_ref(), &image).await?;
                 if let Some(bin) = args.bin.as_ref() {
                     secure_write_async(bin.clone(), image.data.clone()).await?;
                     println!("profile image written to {}", bin.display());
@@ -887,27 +910,32 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
         }
 
         OnboardAction::Decode(args) => {
-            let data = tokio::fs::read(&args.file)
-                .await
-                .map_err(|e| Error::Other(format!("read {}: {e}", args.file.display())))?;
-            println!("schema word: {:04X}", schema_of(&data));
-            let profile = decode(&data)?;
-            print_onboard_profile(&profile);
+            let data = read_file(&args.file).await?;
+            let codec = codec_for_bytes(&data).ok_or_else(no_family)?;
+            println!("schema word: {:04X}", onboard::schema_of(&data));
+            let profile = codec.decode(&data)?;
+            for line in codec.profile_lines(&profile) {
+                println!("{line}");
+            }
             if args.hex {
                 let from = args.hex_from;
                 let to = (from + args.hex_len).min(data.len());
-                print!("{}", hex_dump(&data, from, to));
+                print!("{}", codec.hex(&data, from, to));
             }
-            let json = onboard_json_path(args.out.as_deref(), &data, 1);
-            secure_write_async(json.clone(), profile_json(&profile)?).await?;
+            let json = onboard_json_path(codec, args.out.as_deref(), &data, 1);
+            secure_write_async(json.clone(), codec.profile_json(&profile)?).await?;
             println!("JSON decode report written to {}", json.display());
         }
         OnboardAction::Encode(args) => {
-            let data = encode_profile_json(&args.file).await?;
-            // Read the bytes back through the decoder, so what is printed is what the file says,
+            let text = read_text(&args.file).await?;
+            let codec = codec_for_json(&text).ok_or_else(no_family)?;
+            let data = codec
+                .encode_json(&text)
+                .map_err(|e| Error::Other(format!("encode {}: {e}", args.file.display())))?;
+            // Read the bytes back through the codec's decoder, so what is printed is what the file says,
             // not what the JSON claimed.
-            let profile = decode(&data)?;
-            println!("{}", summary_line(&profile));
+            let profile = codec.decode(&data)?;
+            println!("{}", codec.summary_line(&profile));
             let out = args.out.unwrap_or_else(|| args.file.with_extension("bin"));
             secure_write_async(out.clone(), data.clone()).await?;
             println!(
@@ -916,13 +944,16 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
                 data.len(),
                 profile.crc_computed
             );
-            if let Some(reference) = args.check {
-                check_encoded_bytes(&data, &reference).await?;
+            if let Some(reference) = args.check.as_ref() {
+                let wanted = read_file(reference).await?;
+                for line in codec.check_lines(&data, &wanted, &reference.display().to_string()) {
+                    println!("{line}");
+                }
             }
             if args.hex {
                 let from = args.hex_from;
                 let to = (from + args.hex_len).min(data.len());
-                print!("{}", hex_dump(&data, from, to));
+                print!("{}", codec.hex(&data, from, to));
             }
         }
     }
@@ -930,76 +961,23 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
     Ok(())
 }
 
-/// A profile JSON, as written by `onboard decode`, encoded back into payload bytes.
-async fn encode_profile_json(path: &std::path::Path) -> Result<Vec<u8>> {
-    use steelseries_gg::devices::keyboards::apex_legacy_profile::encode_json;
-
-    let text = tokio::fs::read_to_string(path)
-        .await
-        .map_err(|e| Error::Other(format!("read {}: {e}", path.display())))?;
-    let data = encode_json(&text).map_err(|e| Error::Other(format!("encode {}: {e}", path.display())))?;
-    Ok(data)
+/// The error every file-only on-board command answers when the build has no family codec registered.
+fn no_family() -> Error {
+    Error::Other("no on-board profile family is registered: decode and encode have nothing to read with".to_string())
 }
 
-/// Compare encoded bytes with a profile file from a read: the check a write path will do before it
-/// sends, run here on the files. A read image is longer than the payload it carries (the pulls fill
-/// whole 1024-byte buffers), so the comparison runs over the payload and the bytes behind it are
-/// reported as what they are: device buffer content, not profile bytes. In the read of
-/// slot 3 those 592 bytes behind the 11,696-byte payload are 80 bytes of `FF` and then zeros.
-async fn check_encoded_bytes(data: &[u8], path: &std::path::Path) -> Result<()> {
-    let wanted = tokio::fs::read(path)
+/// Bytes of a profile file: `onboard decode`'s input, `onboard encode --check`'s target.
+async fn read_file(path: &std::path::Path) -> Result<Vec<u8>> {
+    tokio::fs::read(path)
         .await
-        .map_err(|e| Error::Other(format!("read {}: {e}", path.display())))?;
-    let common = data.len().min(wanted.len());
-    match data[..common].iter().zip(&wanted[..common]).position(|(a, b)| a != b) {
-        Some(at) => println!(
-            "check {}: first difference at byte {at} ({} bytes encoded, {} bytes in the file)",
-            path.display(),
-            data.len(),
-            wanted.len()
-        ),
-        None if data.len() == wanted.len() => {
-            println!("check {}: byte identical, {} bytes", path.display(), data.len());
-        }
-        None => {
-            let behind = &wanted[common..];
-            println!(
-                "check {}: byte identical over the {common} profile bytes; the file is a {}-byte read image,                  carrying {} bytes behind the payload ({} of them non-zero: device buffer content, not profile bytes)",
-                path.display(),
-                wanted.len(),
-                behind.len(),
-                behind.iter().filter(|b| **b != 0).count()
-            );
-        }
-    }
-    Ok(())
+        .map_err(|e| Error::Other(format!("read {}: {e}", path.display())))
 }
 
-/// The Apex 7 as a keyboard device, when the target carries the `[EXPERIMENTAL]` on-board profile
-/// protocol. The read then runs on the handle the device manager opened, which is what `usbhid` needs
-/// for the firmware-poll answer and the pacing packet after every pull: it polls an interrupt endpoint only
-/// while a descriptor on the node is open.
-///
-/// `None` when no matching keyboard is openable, and when the target is not on the platform the
-/// protocol was reverse-engineered from (`Apex7::onboard_family`).
-async fn onboard_keyboard(manager: &mut DeviceManager, device: &Option<String>) -> Option<Box<dyn Keyboard>> {
-    use steelseries_gg::STEELSERIES_VENDOR_ID;
-    use steelseries_gg::devices::keyboards::apex7::onboard_family;
-    use steelseries_gg::devices::product_ids::APEX_7;
-
-    manager.refresh().ok()?;
-    let (vendor, product) = match device.as_ref() {
-        Some(spec) => parse_vid_pid(spec).unwrap_or((STEELSERIES_VENDOR_ID, APEX_7)),
-        None => (STEELSERIES_VENDOR_ID, APEX_7),
-    };
-    let info = manager.devices().into_iter().find(|d| {
-        d.vendor_id == vendor
-            && d.product_id == product
-            && onboard_family(d.product_id)
-            && matches!(d.device_type, steelseries_gg::devices::DeviceType::Keyboard)
-    })?;
-    let keyboard = manager.open_keyboard(info).ok()?;
-    keyboard.supports_onboard_profile().then_some(keyboard)
+/// Text of a profile JSON: `onboard encode`'s input.
+async fn read_text(path: &std::path::Path) -> Result<String> {
+    tokio::fs::read_to_string(path)
+        .await
+        .map_err(|e| Error::Other(format!("read {}: {e}", path.display())))
 }
 
 /// Where a device-driven read ran: the keyboard's name and the collection the manager opened.
@@ -1007,225 +985,34 @@ fn onboard_device_label(keyboard: &dyn Keyboard) -> String {
     format!("{} ({})", keyboard.info().name, keyboard.info().path)
 }
 
-/// `vendor:pid` as used by `ssgg --device`.
-fn parse_vid_pid(spec: &str) -> Option<(u16, u16)> {
-    let (vendor, product) = spec.split_once(':')?;
-    Some((
-        u16::from_str_radix(vendor.trim_start_matches("0x"), 16).ok()?,
-        u16::from_str_radix(product.trim_start_matches("0x"), 16).ok()?,
-    ))
-}
-
-/// Where an on-board dump is written: `--out` when given, otherwise the file name the profile name
-/// yields (`Config 1` -> `config_1.json`), read out of the image itself. `config` is GG's config number
-/// (1-5), used only when the image carries no name to build a file name from.
-fn onboard_json_path(given: Option<&std::path::Path>, data: &[u8], config: u8) -> std::path::PathBuf {
-    use steelseries_gg::devices::keyboards::apex_legacy_profile::{profile_dump_name, profile_name};
-
+/// Where an on-board dump is written: `--out` when given, otherwise the file name the family's codec
+/// yields from the profile name inside the payload (`Config 1` -> `config_1.json`). `config` is GG's
+/// config number, used only when the payload carries no name to build a file name from.
+fn onboard_json_path(
+    codec: &dyn OnboardProfileCodec,
+    given: Option<&std::path::Path>,
+    data: &[u8],
+    config: u8,
+) -> std::path::PathBuf {
     given.map_or_else(
-        || std::path::PathBuf::from(profile_dump_name(&profile_name(data), config)),
-        |path| path.to_path_buf(),
+        || std::path::PathBuf::from(codec.dump_name(data, config)),
+        std::path::PathBuf::from,
     )
 }
 
-/// The per-pull read record as JSON: chunk headers, framing stats, the image hash. Capture diagnostics
-/// for comparing a read with GG's capture; the decoded profile is what `--out` writes.
+/// The per-pull read record as the family codec writes it: chunk headers, framing stats, the image hash.
+/// Capture diagnostics for comparing a read with GG's capture; the decoded profile is what `--out` writes.
 async fn write_onboard_report(
+    codec: &dyn OnboardProfileCodec,
     path: Option<&std::path::PathBuf>,
-    image: &steelseries_gg::devices::keyboards::apex_legacy_profile::ProfileImage,
+    image: &steelseries_gg::devices::keyboards::onboard::ProfileImage,
 ) -> Result<()> {
-    use steelseries_gg::devices::keyboards::apex_legacy_profile::to_json;
-
     let Some(path) = path else {
         return Ok(());
     };
-    secure_write_async(path.to_path_buf(), to_json(image)?).await?;
+    secure_write_async(path.to_path_buf(), codec.image_json(image)?).await?;
     println!("read record written to {}", path.display());
     Ok(())
-}
-
-fn print_onboard_banner() {
-    println!("[EXPERIMENTAL] legacy Apex on-board profile read");
-    println!("  reverse-engineered from one GG USBPcap capture; it only reads - it sends no frames that");
-    println!("  change anything on the keyboard.");
-    println!("  the slot layout and checksum match GG's payload struct and a hardware read of the factory");
-    println!("  profile (CRC verified); the field meanings inside the OLED and macro blocks are still");
-    println!("  reverse-engineered - compare a read with GG.");
-    println!("  watch the keyboard while it runs: if lighting flickers, Ctrl-C stops the read.");
-    println!();
-}
-
-fn print_onboard_image(image: &steelseries_gg::devices::keyboards::apex_legacy_profile::ProfileImage, path: &str) {
-    use steelseries_gg::devices::keyboards::apex_legacy_profile::decode;
-
-    println!("read {} profile bytes from {path}", image.data.len());
-    match image.firmware.as_deref() {
-        Some(firmware) => println!("firmware:  {firmware} (answered the 0x90 firmware poll)"),
-        None => println!("firmware:  no answer to the 0x90 firmware poll"),
-    }
-    println!(
-        "transfers: {} payload reads over {} pulls; {} bytes covered, {} short read(s)",
-        image.stats.reads_read, image.stats.chunks_read, image.stats.covered_len, image.stats.short_reads
-    );
-    println!(
-        "replies: {} header mismatch(es), {} all-zero read(s), {} all-zero pull(s), {} garbage page(s)",
-        image.stats.header_mismatches, image.stats.zero_reads, image.stats.zero_chunks, image.stats.garbage_reads
-    );
-    match decode(&image.data) {
-        Ok(profile) => print_onboard_profile(&profile),
-        Err(e) => println!("decode: {e}"),
-    }
-    println!();
-}
-
-fn print_onboard_profile(profile: &steelseries_gg::devices::keyboards::apex_legacy_profile::OnboardProfile) {
-    use steelseries_gg::devices::keyboards::apex_legacy_profile::Color;
-
-    fn color(c: &Color) -> String {
-        format!("#{:02X}{:02X}{:02X}", c.r, c.g, c.b)
-    }
-
-    println!("schema: {} (0x{:04X})", profile.schema_name, profile.schema);
-    println!(
-        "checksum: stored {:08X}, computed {:08X} over the {}-byte payload (offsets 0..{}), match: {}",
-        profile.crc_stored, profile.crc_computed, profile.crc_region_len, profile.crc_region_len, profile.crc_ok
-    );
-    println!("name: {:?} (raw bytes {})", profile.name, profile.name_hex);
-    println!(
-        "guid: {:?} ({} padding after the GUID{})",
-        profile.guid,
-        profile.guid_padding,
-        if profile.guid_padding.is_empty() {
-            ": schema B has none"
-        } else {
-            ""
-        }
-    );
-    println!("META toggle HID code: 0x{:02X}", profile.meta_toggle_hid);
-    println!(
-        "mappings: {} buttons, {} wheels, {} button META, {} wheel META, {} bytes per entry",
-        profile.button_mappings.len(),
-        profile.wheel_mappings.len(),
-        profile.button_meta_mappings.len(),
-        profile.wheel_meta_mappings.len(),
-        steelseries_gg::devices::keyboards::apex_legacy_profile::KEY_MAPPING_LEN
-    );
-    println!(
-        "bindings: {} custom on the base layer, {} on the META layer (GG's factory default - a key bound to itself - and empty slots are not counted)",
-        profile.button_mappings.iter().filter(|m| m.binding == "custom").count(),
-        profile
-            .button_meta_mappings
-            .iter()
-            .filter(|m| m.binding == "custom")
-            .count()
-    );
-
-    let l = &profile.lighting;
-    println!(
-        "lighting [EXPERIMENTAL layout]: lock {} meta {} disabled win {}",
-        color(&l.lock_key_color),
-        color(&l.meta_key_color),
-        color(&l.disabled_win_key_color)
-    );
-    println!(
-        "  dimmers: META {}, idle mode {}; idle timeout {} ms; win HID 0x{:02X}; lock HID codes {}",
-        l.meta_key_background_dimmer, l.idle_mode_dimmer, l.idle_timeout_ms, l.win_key_hid_code, l.lock_key_hid_codes
-    );
-    println!("  OLED illumination options {}", l.oled_illumination_options);
-    println!("  META mapping mask {}", l.meta_mapped_elements);
-
-    match &profile.rapid_tap {
-        Some(rt) => println!(
-            "rapid tap [EXPERIMENTAL]: enable 0x{:02X}, {} key pairs",
-            rt.enable,
-            rt.pairs.len()
-        ),
-        None => println!("rapid tap: absent (schema A has no rapid-tap block)"),
-    }
-
-    for (label, block) in [("OLED", &profile.oled), ("macro", &profile.macro_data)] {
-        println!(
-            "{label}: {} bytes at offset {}, {} non-zero, FNV-1a {}, head {}",
-            block.len, block.offset, block.nonzero, block.fnv1a_64, block.head
-        );
-    }
-
-    print_macro_records(profile);
-}
-
-/// The macro block as GG shows it: the records the block packs, and what each `0x71` binding points
-/// at. The record index is the third code byte of the binding, so an index past the record list is a
-/// macro that was deleted with its binding left behind on the keyboard.
-fn print_macro_records(profile: &steelseries_gg::devices::keyboards::apex_legacy_profile::OnboardProfile) {
-    use steelseries_gg::devices::keyboards::apex_legacy_profile::MacroAction;
-
-    fn actions_line(actions: &[MacroAction]) -> String {
-        actions
-            .iter()
-            .map(|action| match action.kind {
-                "press" => format!(
-                    "press {} for {} ms",
-                    action
-                        .key
-                        .map_or_else(|| "key ?".to_string(), |key| format!("key 0x{key:02X}")),
-                    action.ms.unwrap_or(0)
-                ),
-                "release" => format!(
-                    "release {}",
-                    action
-                        .key
-                        .map_or_else(|| "key ?".to_string(), |key| format!("key 0x{key:02X}"))
-                ),
-                _ => format!("delay {} ms", action.ms.unwrap_or(0)),
-            })
-            .collect::<Vec<_>>()
-            .join(" > ")
-    }
-
-    if profile.macros.is_empty() {
-        match &profile.macro_note {
-            Some(note) => println!("  macro records [EXPERIMENTAL]: {note}"),
-            None => println!(
-                "  macro records: the block is empty ({} non-zero bytes in {} at {})",
-                profile.macro_data.nonzero, profile.macro_data.len, profile.macro_data.offset
-            ),
-        }
-        return;
-    }
-
-    let content_end = profile.macros.iter().map(|rec| rec.record_bytes).sum::<usize>() + profile.macro_data.offset;
-    println!(
-        "  macro records [EXPERIMENTAL]: {} record(s) packed from {} - {} bytes, content ends at {} (the block has no length word: a record is its header plus its actions and the next record starts at the next 0x77)",
-        profile.macros.len(),
-        profile.macro_data.offset,
-        content_end - profile.macro_data.offset,
-        content_end
-    );
-    for rec in &profile.macros {
-        println!(
-            "    record {}: {} (mode 0x{:02X}), id {}, interval {} ms, {} action(s), {} bytes at {}",
-            rec.index, rec.mode_name, rec.mode, rec.id, rec.interval_ms, rec.action_count, rec.record_bytes, rec.offset
-        );
-        println!("      keys: {}", actions_line(&rec.actions));
-        println!("      raw:  {}", rec.raw);
-    }
-    for (offset, entry) in profile.button_meta_mappings.iter().enumerate() {
-        let Some(index) = entry.macro_index else { continue };
-        match profile.macros.iter().find(|rec| rec.index == usize::from(index)) {
-            Some(rec) => println!(
-                "    bound at META mapping {}: record {} - {} every {} ms: {}",
-                offset,
-                rec.index,
-                rec.mode_name,
-                rec.interval_ms,
-                actions_line(&rec.actions)
-            ),
-            None => println!(
-                "    bound at META mapping {}: record {} - deleted macro, the record is gone and the binding is left behind",
-                offset, index
-            ),
-        }
-    }
 }
 
 async fn cmd_pollrate(action: PollrateAction) -> Result<()> {

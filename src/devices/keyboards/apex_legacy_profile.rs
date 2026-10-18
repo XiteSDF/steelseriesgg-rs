@@ -89,6 +89,10 @@
 
 use crate::devices::hid_reports::{ONBOARD_GET_WIRE_BYTES, ONBOARD_MAX_READ_LEN, ONBOARD_OUTPUT_REPORT_SIZE};
 use crate::devices::keyboards::apex_pro_tkl_2023_profile::profile_checksum;
+use crate::devices::keyboards::onboard::OnboardProfileCodec;
+// Generic payload helpers live in the interface module since 2026-10-19; re-exported here because this
+// family's decode, encode and read path, and `src/main.rs`'s older call sites, name them through it.
+pub use crate::devices::keyboards::onboard::{hex_dump, hex_of, image_diff, payload_diff, schema_of};
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -511,14 +515,6 @@ impl ProfileImage {
     pub fn diff(&self, other: &Self) -> Option<usize> {
         image_diff(self, other)
     }
-}
-
-/// Schema word of a profile payload (`0` when the payload is shorter than the word).
-pub fn schema_of(data: &[u8]) -> u16 {
-    if data.len() < 2 {
-        return 0;
-    }
-    u16::from_le_bytes([data[0], data[1]])
 }
 
 /// Payload length for a schema word; unknown schemas report the length they cannot be decoded at.
@@ -1099,18 +1095,6 @@ fn summary_of_bytes(data: &[u8], offset: usize, len: usize) -> MacroSummary {
     summary
 }
 
-/// Hex of a byte slice, space separated.
-pub fn hex_of(data: &[u8]) -> String {
-    let mut out = String::with_capacity(data.len() * 3);
-    for (i, byte) in data.iter().enumerate() {
-        if i > 0 {
-            out.push(' ');
-        }
-        out.push_str(&format!("{byte:02X}"));
-    }
-    out
-}
-
 /// Decode one `key_mapping` entry and classify it against the slot's own key.
 fn key_mapping(data: &[u8], at: usize, offset: usize) -> Result<KeyMapping> {
     if at + KEY_MAPPING_LEN > data.len() {
@@ -1257,22 +1241,6 @@ pub fn decode(data: &[u8]) -> Result<OnboardProfile> {
         crc_ok: stored == computed,
         crc_region_len: crc_offset,
     })
-}
-
-/// Offset of the first byte that differs between two images, `None` when they are equal.
-pub fn image_diff(a: &ProfileImage, b: &ProfileImage) -> Option<usize> {
-    a.data.iter().zip(b.data.iter()).position(|(x, y)| x != y)
-}
-
-/// Multi-line hex dump of `data[from..to]`, 16 bytes per line with an offset column.
-pub fn hex_dump(data: &[u8], from: usize, to: usize) -> String {
-    let from = from.min(data.len());
-    let to = to.max(from).min(data.len());
-    let mut out = String::new();
-    for (i, chunk) in data[from..to].chunks(16).enumerate() {
-        out.push_str(&format!("{:06X}  {}\n", from + i * 16, hex_of(chunk)));
-    }
-    out
 }
 
 /// One-line human summary of a decoded profile.
@@ -1697,13 +1665,319 @@ pub fn encode_json(text: &str) -> Result<Vec<u8>> {
     Ok(data)
 }
 
-/// Bytes where two payload images start to differ, `None` when they are equal.
-#[must_use]
-pub fn payload_diff(a: &[u8], b: &[u8]) -> Option<usize> {
-    if a.len() != b.len() {
-        return Some(a.len().min(b.len()));
+/// The legacy Apex family's on-board profile codec: what `ssgg onboard` does with the bytes of this
+/// family's payload layout, with no device involved. `apex7.rs` is what moves them on a keyboard.
+///
+/// Registered in [`onboard::codecs`](crate::devices::keyboards::onboard::codecs) and handed out by
+/// [`Apex7::onboard_codec`](crate::devices::keyboards::apex7::Apex7). The report shape this codec carries
+/// is this family's payload layout as data; `onboard.rs` says how the next keyboard plugs in.
+///
+/// `[EXPERIMENTAL]`: the layout is reverse-engineered from one GG capture and has only ever been read
+/// from keyboards. The text builders below are this family's words for a read and a decode - they moved
+/// out of `src/main.rs` on 2026-10-19, when the CLI stopped naming keyboard families.
+pub struct LegacyApexOnboard;
+
+impl OnboardProfileCodec for LegacyApexOnboard {
+    fn family_name(&self) -> &'static str {
+        "legacy Apex (Apex 7, Apex Raw, Apex 2014)"
     }
-    a.iter().zip(b).position(|(x, y)| x != y)
+
+    fn config_count(&self) -> u8 {
+        MAX_PROFILE_INDEX + 1
+    }
+
+    /// GG's config number to the slot behind it; the family owns the numbering because the slots it
+    /// numbers are the family's.
+    fn slot_for_config(&self, config: u8) -> Result<u8> {
+        let Some(slot) = config.checked_sub(1) else {
+            return Err(Error::InvalidConfig(format!(
+                "config {config} is not a config number: use 1-{} (GG's Config 1 .. Config {})",
+                self.config_count(),
+                self.config_count()
+            )));
+        };
+        validate_profile(slot)?;
+        Ok(slot)
+    }
+
+    fn knows_schema(&self, schema: u16) -> bool {
+        matches!(schema, SCHEMA_A | SCHEMA_B)
+    }
+
+    fn mapping_len(&self) -> usize {
+        KEY_MAPPING_LEN
+    }
+
+    fn decode(&self, data: &[u8]) -> Result<OnboardProfile> {
+        decode(data)
+    }
+
+    fn encode_json(&self, text: &str) -> Result<Vec<u8>> {
+        encode_json(text)
+    }
+
+    fn profile_json(&self, profile: &OnboardProfile) -> Result<String> {
+        profile_json(profile)
+    }
+
+    fn image_json(&self, image: &ProfileImage) -> Result<String> {
+        to_json(image)
+    }
+
+    fn dump_name(&self, data: &[u8], config: u8) -> String {
+        profile_dump_name(&profile_name(data), config)
+    }
+
+    fn summary_line(&self, profile: &OnboardProfile) -> String {
+        summary_line(profile)
+    }
+
+    fn hex(&self, data: &[u8], from: usize, to: usize) -> String {
+        hex_dump(data, from, to)
+    }
+
+    fn diff(&self, a: &ProfileImage, b: &ProfileImage) -> Option<usize> {
+        image_diff(a, b)
+    }
+
+    fn banner_lines(&self) -> Vec<String> {
+        banner_lines()
+    }
+
+    fn image_lines(&self, image: &ProfileImage, label: &str) -> Vec<String> {
+        image_lines(image, label)
+    }
+
+    fn profile_lines(&self, profile: &OnboardProfile) -> Vec<String> {
+        profile_lines(profile)
+    }
+
+    fn check_lines(&self, encoded: &[u8], reference: &[u8], path: &str) -> Vec<String> {
+        check_lines(encoded, reference, path)
+    }
+}
+
+/// The `[EXPERIMENTAL]` notes printed before a device read: what the protocol is, what it has been
+/// verified against, and what to watch while it runs.
+fn banner_lines() -> Vec<String> {
+    vec![
+        format!(
+            "[EXPERIMENTAL] {} on-board profile read",
+            LegacyApexOnboard.family_name()
+        ),
+        "  reverse-engineered from one GG USBPcap capture; it only reads - it sends no frames that".to_string(),
+        "  change anything on the keyboard.".to_string(),
+        "  the slot layout and checksum match GG's payload struct and a hardware read of the factory".to_string(),
+        "  profile (CRC verified); the field meanings inside the OLED and macro blocks are still".to_string(),
+        "  reverse-engineered - compare a read with GG.".to_string(),
+        "  watch the keyboard while it runs: if lighting flickers, Ctrl-C stops the read.".to_string(),
+        String::new(),
+    ]
+}
+
+/// One read image as the lines the CLI prints: the bytes it collected, the firmware poll answer, the
+/// transfer record, then the decoded profile (or the decode's own failure).
+fn image_lines(image: &ProfileImage, label: &str) -> Vec<String> {
+    let mut lines = vec![
+        format!("read {} profile bytes from {label}", image.data.len()),
+        match image.firmware.as_deref() {
+            Some(firmware) => format!("firmware:  {firmware} (answered the 0x90 firmware poll)"),
+            None => "firmware:  no answer to the 0x90 firmware poll".to_string(),
+        },
+        format!(
+            "transfers: {} payload reads over {} pulls; {} bytes covered, {} short read(s)",
+            image.stats.reads_read, image.stats.chunks_read, image.stats.covered_len, image.stats.short_reads
+        ),
+        format!(
+            "replies: {} header mismatch(es), {} all-zero read(s), {} all-zero pull(s), {} garbage page(s)",
+            image.stats.header_mismatches, image.stats.zero_reads, image.stats.zero_chunks, image.stats.garbage_reads
+        ),
+    ];
+    match decode(&image.data) {
+        Ok(profile) => lines.extend(profile_lines(&profile)),
+        Err(e) => lines.push(format!("decode: {e}")),
+    }
+    lines.push(String::new());
+    lines
+}
+
+/// A decoded profile as the lines the CLI prints. The `[EXPERIMENTAL]` labels are on the blocks whose
+/// field meanings are read out of GG's struct and not off a keyboard.
+fn profile_lines(profile: &OnboardProfile) -> Vec<String> {
+    fn color(c: &Color) -> String {
+        format!("#{:02X}{:02X}{:02X}", c.r, c.g, c.b)
+    }
+
+    let mut lines = vec![
+        format!("schema: {} (0x{:04X})", profile.schema_name, profile.schema),
+        format!(
+            "checksum: stored {:08X}, computed {:08X} over the {}-byte payload (offsets 0..{}), match: {}",
+            profile.crc_stored, profile.crc_computed, profile.crc_region_len, profile.crc_region_len, profile.crc_ok
+        ),
+        format!("name: {:?} (raw bytes {})", profile.name, profile.name_hex),
+        format!(
+            "guid: {:?} ({} padding after the GUID{})",
+            profile.guid,
+            profile.guid_padding,
+            if profile.guid_padding.is_empty() {
+                ": schema B has none"
+            } else {
+                ""
+            }
+        ),
+        format!("META toggle HID code: 0x{:02X}", profile.meta_toggle_hid),
+        format!(
+            "mappings: {} buttons, {} wheels, {} button META, {} wheel META, {} bytes per entry",
+            profile.button_mappings.len(),
+            profile.wheel_mappings.len(),
+            profile.button_meta_mappings.len(),
+            profile.wheel_meta_mappings.len(),
+            KEY_MAPPING_LEN
+        ),
+        format!(
+            "bindings: {} custom on the base layer, {} on the META layer (GG's factory default - a key bound to itself - and empty slots are not counted)",
+            profile.button_mappings.iter().filter(|m| m.binding == "custom").count(),
+            profile
+                .button_meta_mappings
+                .iter()
+                .filter(|m| m.binding == "custom")
+                .count()
+        ),
+    ];
+
+    let l = &profile.lighting;
+    lines.push(format!(
+        "lighting [EXPERIMENTAL layout]: lock {} meta {} disabled win {}",
+        color(&l.lock_key_color),
+        color(&l.meta_key_color),
+        color(&l.disabled_win_key_color)
+    ));
+    lines.push(format!(
+        "  dimmers: META {}, idle mode {}; idle timeout {} ms; win HID 0x{:02X}; lock HID codes {}",
+        l.meta_key_background_dimmer, l.idle_mode_dimmer, l.idle_timeout_ms, l.win_key_hid_code, l.lock_key_hid_codes
+    ));
+    lines.push(format!("  OLED illumination options {}", l.oled_illumination_options));
+    lines.push(format!("  META mapping mask {}", l.meta_mapped_elements));
+
+    lines.push(match &profile.rapid_tap {
+        Some(rt) => format!(
+            "rapid tap [EXPERIMENTAL]: enable 0x{:02X}, {} key pairs",
+            rt.enable,
+            rt.pairs.len()
+        ),
+        None => "rapid tap: absent (schema A has no rapid-tap block)".to_string(),
+    });
+
+    for (label, block) in [("OLED", &profile.oled), ("macro", &profile.macro_data)] {
+        lines.push(format!(
+            "{label}: {} bytes at offset {}, {} non-zero, FNV-1a {}, head {}",
+            block.len, block.offset, block.nonzero, block.fnv1a_64, block.head
+        ));
+    }
+
+    lines.extend(macro_lines(profile));
+    lines
+}
+
+/// The macro block as GG shows it: the records the block packs, and what each `0x71` binding points at.
+/// The record index is the third code byte of the binding, so an index past the record list is a macro
+/// that was deleted with its binding left behind on the keyboard.
+fn macro_lines(profile: &OnboardProfile) -> Vec<String> {
+    fn actions_line(actions: &[MacroAction]) -> String {
+        actions
+            .iter()
+            .map(|action| match action.kind {
+                "press" => format!(
+                    "press {} for {} ms",
+                    action
+                        .key
+                        .map_or_else(|| "key ?".to_string(), |key| format!("key 0x{key:02X}")),
+                    action.ms.unwrap_or(0)
+                ),
+                "release" => format!(
+                    "release {}",
+                    action
+                        .key
+                        .map_or_else(|| "key ?".to_string(), |key| format!("key 0x{key:02X}"))
+                ),
+                _ => format!("delay {} ms", action.ms.unwrap_or(0)),
+            })
+            .collect::<Vec<_>>()
+            .join(" > ")
+    }
+
+    if profile.macros.is_empty() {
+        return match &profile.macro_note {
+            Some(note) => vec![format!("  macro records [EXPERIMENTAL]: {note}")],
+            None => vec![format!(
+                "  macro records: the block is empty ({} non-zero bytes in {} at {})",
+                profile.macro_data.nonzero, profile.macro_data.len, profile.macro_data.offset
+            )],
+        };
+    }
+
+    let content_end = profile.macros.iter().map(|rec| rec.record_bytes).sum::<usize>() + profile.macro_data.offset;
+    let mut lines = vec![format!(
+        "  macro records [EXPERIMENTAL]: {} record(s) packed from {} - {} bytes, content ends at {} (the block has no length word: a record is its header plus its actions and the next record starts at the next 0x77)",
+        profile.macros.len(),
+        profile.macro_data.offset,
+        content_end - profile.macro_data.offset,
+        content_end
+    )];
+    for rec in &profile.macros {
+        lines.push(format!(
+            "    record {}: {} (mode 0x{:02X}), id {}, interval {} ms, {} action(s), {} bytes at {}",
+            rec.index, rec.mode_name, rec.mode, rec.id, rec.interval_ms, rec.action_count, rec.record_bytes, rec.offset
+        ));
+        lines.push(format!("      keys: {}", actions_line(&rec.actions)));
+        lines.push(format!("      raw:  {}", rec.raw));
+    }
+    for (offset, entry) in profile.button_meta_mappings.iter().enumerate() {
+        let Some(index) = entry.macro_index else { continue };
+        match profile.macros.iter().find(|rec| rec.index == usize::from(index)) {
+            Some(rec) => lines.push(format!(
+                "    bound at META mapping {}: record {} - {} every {} ms: {}",
+                offset,
+                rec.index,
+                rec.mode_name,
+                rec.interval_ms,
+                actions_line(&rec.actions)
+            )),
+            None => lines.push(format!(
+                "    bound at META mapping {}: record {} - deleted macro, the record is gone and the binding is left behind",
+                offset, index
+            )),
+        }
+    }
+    lines
+}
+
+/// What `ssgg onboard encode --check` says about encoded bytes against a profile file. A read image is
+/// longer than the payload it carries (the pulls fill whole 1024-byte buffers), so the comparison runs
+/// over the payload and the bytes behind it are reported as what they are: device buffer content, not
+/// profile bytes. In the read of slot 3 those 592 bytes behind the 11,696-byte payload are 80
+/// bytes of `FF` and then zeros.
+fn check_lines(encoded: &[u8], reference: &[u8], path: &str) -> Vec<String> {
+    let common = encoded.len().min(reference.len());
+    match payload_diff(&encoded[..common], &reference[..common]) {
+        Some(at) => vec![format!(
+            "check {path}: first difference at byte {at} ({} bytes encoded, {} bytes in the file)",
+            encoded.len(),
+            reference.len()
+        )],
+        None if encoded.len() == reference.len() => {
+            vec![format!("check {path}: byte identical, {} bytes", encoded.len())]
+        }
+        None => {
+            let behind = &reference[common..];
+            vec![format!(
+                "check {path}: byte identical over the {common} profile bytes; the file is a {}-byte read image, carrying {} bytes behind the payload ({} of them non-zero: device buffer content, not profile bytes)",
+                reference.len(),
+                behind.len(),
+                behind.iter().filter(|b| **b != 0).count()
+            )]
+        }
+    }
 }
 
 #[cfg(test)]

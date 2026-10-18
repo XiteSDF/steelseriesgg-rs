@@ -484,6 +484,58 @@ impl DeviceManager {
         }
     }
 
+    /// Open a keyboard to run an on-board profile read on, answering [`OnboardKeyboard`] for the selection.
+    ///
+    /// `product_id` is `ssgg onboard read --device`: the device's `idProduct` (every SteelSeries device
+    /// answers the same vendor ID, so the product ID identifies it). With it, only keyboards carrying that
+    /// product ID are candidates. Without it, every keyboard that answers [`Keyboard::onboard_codec`] is a
+    /// candidate, and the read runs on it when exactly one keyboard - not a mouse, not a headset - qualifies;
+    /// more than one answers [`OnboardKeyboard::Ambiguous`], which is what asks the caller for `--device`.
+    ///
+    /// Candidates are opened to ask them, which sends nothing: answering the protocol is a product-ID check
+    /// on the keyboard class discovery built. The read runs on the handle returned here, which is what
+    /// `usbhid` needs for the firmware-poll answer and the pacing read after every pull: it polls an
+    /// interrupt endpoint only while a descriptor on the node is open.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a refresh failure or a candidate that cannot be opened.
+    pub fn open_onboard_keyboard(&mut self, product_id: Option<u16>) -> Result<OnboardKeyboard> {
+        self.refresh()?;
+        let mut candidates: Vec<(u16, String, Box<dyn Keyboard>)> = Vec::new();
+        for info in self.keyboards() {
+            if product_id.is_some_and(|pid| info.product_id != pid) {
+                continue;
+            }
+            // A named keyboard has to answer for its own open failure; a keyboard the caller never named is
+            // skipped when it cannot be opened, the same way discovery skips a device it cannot open.
+            let keyboard = match self.open_keyboard(info) {
+                Ok(keyboard) => keyboard,
+                Err(e) if product_id.is_some() => return Err(e),
+                Err(e) => {
+                    tracing::debug!("onboard: skipping {} ({:04X}): {e}", info.name, info.product_id);
+                    continue;
+                }
+            };
+            if !keyboard.supports_onboard_profile() {
+                continue;
+            }
+            candidates.push((info.product_id, info.name.to_string(), keyboard));
+        }
+        let listed: Vec<(u16, String)> = candidates
+            .iter()
+            .map(|(product_id, name, _)| (*product_id, name.clone()))
+            .collect();
+        match onboard_choice(&listed, product_id) {
+            OnboardChoice::NotFound => Ok(OnboardKeyboard::NotFound { product_id }),
+            OnboardChoice::Ambiguous => Ok(OnboardKeyboard::Ambiguous { keyboards: listed }),
+            OnboardChoice::Use(index) => {
+                let (_, _, keyboard) = candidates.swap_remove(index);
+                Ok(OnboardKeyboard::Keyboard(keyboard))
+            }
+        }
+    }
+
     /// Open a headset device and return a boxed Headset trait object.
     pub fn open_headset(&self, info: &DeviceInfo) -> Result<Box<dyn Headset>> {
         if info.device_type != DeviceType::Headset {
@@ -894,6 +946,53 @@ pub fn print_device_summary(manager: &DeviceManager) {
     }
 }
 
+/// Which candidate an on-board profile read runs on. The decision is split out from
+/// [`DeviceManager::open_onboard_keyboard`] so the rule is testable without hardware.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OnboardChoice {
+    /// Use this candidate (index into the candidate list).
+    Use(usize),
+    /// No candidate: no keyboard of the selection answers the on-board profile protocol.
+    NotFound,
+    /// No product ID was given and more than one keyboard answers the protocol: the caller has to name one.
+    Ambiguous,
+}
+
+/// The selection rule, over the candidate list in the order the manager lists it. Several collections of
+/// the same keyboard (same product ID) are one keyboard, so they are not ambiguous; distinct product IDs
+/// are distinct keyboards, and only a product ID picks between them.
+#[must_use]
+pub fn onboard_choice(candidates: &[(u16, String)], product_id: Option<u16>) -> OnboardChoice {
+    match candidates {
+        [] => OnboardChoice::NotFound,
+        [_] => OnboardChoice::Use(0),
+        many => {
+            let distinct: std::collections::HashSet<u16> = many.iter().map(|(pid, _)| *pid).collect();
+            if product_id.is_some() {
+                // The selection already filtered by product ID: the first collection of it is the keyboard.
+                OnboardChoice::Use(0)
+            } else if distinct.len() > 1 {
+                OnboardChoice::Ambiguous
+            } else {
+                OnboardChoice::Use(0)
+            }
+        }
+    }
+}
+
+/// What a keyboard selection for an on-board profile read answered. No `Debug`: the keyboard it carries
+/// is a trait object.
+pub enum OnboardKeyboard {
+    /// The keyboard to read on.
+    Keyboard(Box<dyn Keyboard>),
+    /// No keyboard of the selection answers the on-board profile protocol. `product_id` is what was asked
+    /// for; `None` when the caller asked for "the connected on-board keyboard".
+    NotFound { product_id: Option<u16> },
+    /// No product ID was given and more than one keyboard answers the protocol: `keyboards` lists them
+    /// (`product_id`, name) and the caller has to name one.
+    Ambiguous { keyboards: Vec<(u16, String)> },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1197,5 +1296,48 @@ mod tests {
             manager.open_headset(&info),
             Err(Error::DeviceCommunication(msg)) if msg.contains("not a headset")
         ));
+    }
+
+    #[test]
+    fn onboard_choice_needs_a_candidate() {
+        assert_eq!(onboard_choice(&[], Some(0x1612)), OnboardChoice::NotFound);
+        assert_eq!(onboard_choice(&[], None), OnboardChoice::NotFound);
+    }
+
+    #[test]
+    fn onboard_choice_accepts_the_only_keyboard_without_a_product_id() {
+        let listed = vec![(0x1612, "Apex 7".to_string())];
+        assert_eq!(onboard_choice(&listed, None), OnboardChoice::Use(0));
+    }
+
+    #[test]
+    fn onboard_choice_reads_several_collections_of_one_keyboard_as_one_keyboard() {
+        let listed = vec![
+            (0x1612, "Apex 7".to_string()),
+            (0x1612, "Apex 7".to_string()),
+            (0x1612, "Apex 7".to_string()),
+        ];
+        assert_eq!(onboard_choice(&listed, None), OnboardChoice::Use(0));
+    }
+
+    #[test]
+    fn onboard_choice_asks_for_a_product_id_between_two_keyboards() {
+        let listed = vec![(0x1612, "Apex 7".to_string()), (0x1616, "Apex 7 TKL".to_string())];
+        assert_eq!(onboard_choice(&listed, None), OnboardChoice::Ambiguous);
+        assert_eq!(onboard_choice(&listed, Some(0x1616)), OnboardChoice::Use(0));
+    }
+
+    #[test]
+    fn open_onboard_keyboard_answers_notfound_for_a_product_id_with_no_keyboard() {
+        let Ok(mut manager) = DeviceManager::new() else { return };
+        // A product ID no SteelSeries device uses: no candidate, and the read names no family to fall back on.
+        match manager.open_onboard_keyboard(Some(0xFEFF)) {
+            Ok(OnboardKeyboard::NotFound { product_id }) => assert_eq!(product_id, Some(0xFEFF)),
+            Ok(OnboardKeyboard::Keyboard(_)) => panic!("a product ID no device uses answered a keyboard"),
+            Ok(OnboardKeyboard::Ambiguous { keyboards }) => {
+                panic!("a product ID no device uses answered an ambiguous selection: {keyboards:?}")
+            }
+            Err(e) => panic!("selection should answer NotFound, not an error: {e}"),
+        }
     }
 }

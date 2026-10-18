@@ -29,11 +29,12 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 
 use super::apex_legacy_profile::{
-    ChunkRecord, DEVICE_RESOURCE_BUFFER_LEN, GG_GAP_MS, GG_INPUT_READ_BYTES, MAX_READ_LEN, PAYLOAD_READ_LEN,
-    PROFILE_FILE_BYTES, PULLS_PER_FILE, ProfileImage, READ_REPLY_FRAMING_LEN, READ_REPORT_LEN, READS_PER_PULL,
-    ReadReply, SCHEMA_B, hex_of, parse_firmware_version, parse_read_reply_at, profile_file_id, reply_mismatch,
-    schema_of, validate_profile,
+    ChunkRecord, DEVICE_RESOURCE_BUFFER_LEN, GG_GAP_MS, GG_INPUT_READ_BYTES, LegacyApexOnboard, MAX_READ_LEN,
+    PAYLOAD_READ_LEN, PROFILE_FILE_BYTES, PULLS_PER_FILE, ProfileImage, READ_REPLY_FRAMING_LEN, READ_REPORT_LEN,
+    READS_PER_PULL, ReadReply, SCHEMA_B, hex_of, parse_firmware_version, parse_read_reply_at, profile_file_id,
+    reply_mismatch, schema_of, validate_profile,
 };
+use super::onboard::OnboardProfileCodec;
 use super::{GenericKeyboard, Keyboard};
 use crate::devices::hid_reports::{
     FirmwareSource, HidCommand, ONBOARD_FEATURE_REPORT_SIZE, ONBOARD_OUTPUT_REPORT_SIZE, OnboardFirmwareVersionCommand,
@@ -521,8 +522,8 @@ impl Device for Apex7 {
 
 // Delegate Keyboard trait; the on-board profile methods are this device's own.
 crate::impl_keyboard_with_delegation!(Apex7, {
-    fn supports_onboard_profile(&self) -> bool {
-        self.supports_onboard()
+    fn onboard_codec(&self) -> Option<&'static dyn OnboardProfileCodec> {
+        self.supports_onboard().then_some(&LegacyApexOnboard)
     }
 
     async fn read_onboard_profile(&self, profile: u8) -> Result<ProfileImage> {

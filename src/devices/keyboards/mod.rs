@@ -5,6 +5,7 @@ pub mod apex7;
 pub mod apex_legacy_profile;
 pub mod apex_pro_tkl_2023;
 pub mod apex_pro_tkl_2023_profile;
+pub mod onboard;
 
 use super::diagnostics::{HidOperation, with_global_diagnostics};
 use super::hid_reports::{
@@ -213,19 +214,27 @@ pub trait Keyboard: Device {
 
     // === On-board profiles (`[EXPERIMENTAL]`) ===
 
-    /// Whether this keyboard answers the legacy on-board profile protocol.
-    fn supports_onboard_profile(&self) -> bool {
-        false
+    /// The on-board profile protocol this keyboard speaks, as the family codec that can read and write
+    /// its bytes. `None` (the default) says this keyboard has no on-board profile protocol.
+    ///
+    /// The codec is a family-wide, device-free value: it decodes, encodes and reports payloads, and names
+    /// the slots. A keyboard that carries a protocol overrides this with its family's codec, which
+    /// [`onboard::codecs`](crate::devices::keyboards::onboard::codecs) also lists for file-only commands.
+    fn onboard_codec(&self) -> Option<&'static dyn crate::devices::keyboards::onboard::OnboardProfileCodec> {
+        None
     }
 
-    /// Read one on-board profile slot. Keyboards that do not carry the protocol return an error.
+    /// Whether this keyboard answers the on-board profile protocol: whether [`Self::onboard_codec`] answers.
+    fn supports_onboard_profile(&self) -> bool {
+        self.onboard_codec().is_some()
+    }
+
+    /// Read one on-board profile slot (0-based; [`OnboardProfileCodec::slot_for_config`](crate::devices::keyboards::onboard::OnboardProfileCodec::slot_for_config)
+    /// is what maps GG's config number to it). Keyboards that do not carry the protocol return an error.
     ///
     /// `[EXPERIMENTAL]`: the protocol is reverse-engineered from a capture of official GG. A full
     /// slot read completes on an Apex 7 under Linux (2026-10-18); the decode is not verified.
-    async fn read_onboard_profile(
-        &self,
-        _profile: u8,
-    ) -> Result<crate::devices::keyboards::apex_legacy_profile::ProfileImage> {
+    async fn read_onboard_profile(&self, _profile: u8) -> Result<crate::devices::keyboards::onboard::ProfileImage> {
         Err(Error::DeviceCommunication(
             "on-board profile read is not supported by this keyboard".to_string(),
         ))

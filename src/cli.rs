@@ -69,7 +69,8 @@ pub(crate) enum Commands {
         action: PollrateAction,
     },
 
-    /// Read the on-board profile of a legacy Apex keyboard (experimental, reads only)
+    /// Read a keyboard's on-board profile, decode a saved one, encode a decode report back to bytes
+    /// (experimental, reads only: nothing here writes to a keyboard)
     Onboard {
         #[command(subcommand)]
         action: OnboardAction,
@@ -195,13 +196,15 @@ pub(crate) enum Commands {
 
 /// [EXPERIMENTAL] Read the on-board profile of a legacy Apex keyboard.
 ///
-/// `decode` works on a saved profile image only and never touches a device. `read` talks to a keyboard
-/// and needs `--yes`: it is reverse-engineered protocol code that writes request frames to a raw device
-/// node. It changes nothing on the keyboard (measured 2026-10-19: the read works without GG's opening
-/// chain and closing sequence, so neither is sent).
+/// `decode` and `encode` work on files only and never touch a device. `read` talks to a keyboard: it is
+/// reverse-engineered protocol code that writes request frames to a raw device node, and it changes nothing
+/// on the keyboard (measured 2026-10-19: the read works without GG's opening chain and closing sequence, so
+/// neither is sent). There is no `--yes` gate for the same reason.
 #[derive(Subcommand)]
 pub(crate) enum OnboardAction {
-    /// Read one profile from a legacy Apex keyboard. Read-only: it writes no profile.
+    /// Read one profile from a keyboard that answers the on-board profile protocol. Read-only: it writes
+    /// no profile, and the CLI names no keyboard family: `--device <pid>` names the keyboard, and is needed
+    /// whenever more than one connected keyboard qualifies.
     Read(OnboardReadArgs),
 
     /// Decode a profile image saved by an earlier read (no device, no hardware).
@@ -212,22 +215,28 @@ pub(crate) enum OnboardAction {
     Encode(OnboardEncodeArgs),
 }
 
-/// One on-board profile read. The flags pick the slot, the keyboard and what to do with the result;
-/// nothing on the wire is a flag. The geometry is fixed in `apex_legacy_profile`: 25 pulls of the
-/// device's 1024-byte resource buffer, drained by five 636-byte payload windows per fill, paced like GG
-/// (5 ms) and read with the reply framing the reference capture shows.
+/// One on-board profile read. The flags pick the keyboard, the config number and what to do with the
+/// result; nothing on the wire is a flag. The geometry is a protocol constant of the keyboard's family (for
+/// the legacy family, `apex_legacy_profile`: 12 pulls of the device's 1024-byte resource buffer, each
+/// drained by two 512-byte payload reads), paced like GG and read with the reply framing the reference
+/// capture shows.
 #[derive(clap::Args)]
 pub(crate) struct OnboardReadArgs {
-    /// GG's config number, 1-5 (`Config 1` .. `Config 5`). The read addresses slot `N - 1`, which is
-    /// the file GG pulls as `0x020N`. The pull count, buffer size, window size, pacing and reply
-    /// framing are protocol constants, not options.
-    #[arg(short, long, default_value = "1", value_parser = clap::value_parser!(u8).range(1..=5))]
+    /// GG's config number (`Config 1` is `1`). How many configs the keyboard has, and which slot is behind
+    /// the number, is what the keyboard's family answers - so an out-of-range number is refused there, in
+    /// the family's own wording, not by a limit the CLI hard-codes. The pull count, buffer size, window
+    /// size, pacing and reply framing are protocol constants, not options.
+    #[arg(short, long, default_value = "1", value_parser = clap::value_parser!(u8))]
     pub(crate) profile: u8,
 
-    /// Device as `vid:pid` (default: the first Apex 7-family keyboard found). The read runs on that
-    /// keyboard's own handle, the collection the device manager opened
-    #[arg(short, long)]
-    pub(crate) device: Option<String>,
+    /// Product ID of the keyboard to read, as hex: `1612`. Optional **only** when exactly one connected
+    /// keyboard answers the on-board profile protocol - a mouse or a headset is not a candidate, and several
+    /// collections of one keyboard count as one. More than one keyboard and the read asks for this flag; the
+    /// CLI has no default product ID and names no keyboard family. Every SteelSeries device answers the same
+    /// vendor ID, so the product ID identifies the device. The read runs on that keyboard's own handle - the
+    /// collection the device manager opened.
+    #[arg(short, long, value_name = "PID", value_parser = parse_product_id)]
+    pub(crate) device: Option<u16>,
 
     /// Where to write the decoded profile as JSON - the same report `onboard decode` writes for this
     /// image, and the format `tools/profile-gui` opens. Default: the profile name the read returns,
@@ -251,6 +260,19 @@ pub(crate) struct OnboardReadArgs {
     /// Read twice and compare the profile bytes
     #[arg(long)]
     pub(crate) verify: bool,
+}
+
+/// clap parser for `onboard read --device`: the product ID in the hex form every reference writes it in
+/// (`1612`, `0x1612`). The vendor ID is not asked for: every SteelSeries device answers `0x1038`, so the
+/// product ID identifies the device.
+fn parse_product_id(text: &str) -> std::result::Result<u16, String> {
+    let text = text.trim();
+    let digits = text.strip_prefix("0x").or(text.strip_prefix("0X")).unwrap_or(text);
+    u16::from_str_radix(digits, 16).map_err(|_| {
+        format!(
+            "{text} is not a product ID: write it as the hex number a device reports as its `idProduct` (`1612`, `0x1612`), the form ssgg's on-board notes use"
+        )
+    })
 }
 
 #[derive(clap::Args)]
