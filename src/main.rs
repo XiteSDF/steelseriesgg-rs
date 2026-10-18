@@ -1081,6 +1081,83 @@ fn print_onboard_profile(profile: &steelseries_gg::devices::keyboards::apex_lega
             block.len, block.offset, block.nonzero, block.fnv1a_64, block.head
         );
     }
+
+    print_macro_records(profile);
+}
+
+/// The macro block as GG shows it: the records the block packs, and what each `0x71` binding points
+/// at. The record index is the third code byte of the binding, so an index past the record list is a
+/// macro that was deleted with its binding left behind on the keyboard.
+fn print_macro_records(profile: &steelseries_gg::devices::keyboards::apex_legacy_profile::OnboardProfile) {
+    use steelseries_gg::devices::keyboards::apex_legacy_profile::MacroAction;
+
+    fn actions_line(actions: &[MacroAction]) -> String {
+        actions
+            .iter()
+            .map(|action| match action.kind {
+                "press" => format!(
+                    "press {} for {} ms",
+                    action
+                        .key
+                        .map_or_else(|| "key ?".to_string(), |key| format!("key 0x{key:02X}")),
+                    action.ms.unwrap_or(0)
+                ),
+                "release" => format!(
+                    "release {}",
+                    action
+                        .key
+                        .map_or_else(|| "key ?".to_string(), |key| format!("key 0x{key:02X}"))
+                ),
+                _ => format!("delay {} ms", action.ms.unwrap_or(0)),
+            })
+            .collect::<Vec<_>>()
+            .join(" > ")
+    }
+
+    if profile.macros.is_empty() {
+        match &profile.macro_note {
+            Some(note) => println!("  macro records [EXPERIMENTAL]: {note}"),
+            None => println!(
+                "  macro records: the block is empty ({} non-zero bytes in {} at {})",
+                profile.macro_data.nonzero, profile.macro_data.len, profile.macro_data.offset
+            ),
+        }
+        return;
+    }
+
+    let content_end = profile.macros.iter().map(|rec| rec.record_bytes).sum::<usize>() + profile.macro_data.offset;
+    println!(
+        "  macro records [EXPERIMENTAL]: {} record(s) packed from {} - {} bytes, content ends at {} (the block has no length word: a record is its header plus its actions and the next record starts at the next 0x77)",
+        profile.macros.len(),
+        profile.macro_data.offset,
+        content_end - profile.macro_data.offset,
+        content_end
+    );
+    for rec in &profile.macros {
+        println!(
+            "    record {}: {} (mode 0x{:02X}), id {}, interval {} ms, {} action(s), {} bytes at {}",
+            rec.index, rec.mode_name, rec.mode, rec.id, rec.interval_ms, rec.action_count, rec.record_bytes, rec.offset
+        );
+        println!("      keys: {}", actions_line(&rec.actions));
+        println!("      raw:  {}", rec.raw);
+    }
+    for (offset, entry) in profile.button_meta_mappings.iter().enumerate() {
+        let Some(index) = entry.macro_index else { continue };
+        match profile.macros.iter().find(|rec| rec.index == usize::from(index)) {
+            Some(rec) => println!(
+                "    bound at META mapping {}: record {} - {} every {} ms: {}",
+                offset,
+                rec.index,
+                rec.mode_name,
+                rec.interval_ms,
+                actions_line(&rec.actions)
+            ),
+            None => println!(
+                "    bound at META mapping {}: record {} - deleted macro, the record is gone and the binding is left behind",
+                offset, index
+            ),
+        }
+    }
 }
 
 async fn cmd_pollrate(action: PollrateAction) -> Result<()> {

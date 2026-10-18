@@ -566,6 +566,13 @@ pub struct KeyMapping {
     pub binding: &'static str,
     /// Four raw key-code bytes, hex.
     pub key_codes: String,
+    /// For a `0x71` macro binding, the index of the macro record this slot points at; `None` for
+    /// every other function. `[EXPERIMENTAL]`: `key_codes[2]`, the third code byte, on the strength
+    /// of the one read that carries macros - its META + Insert binding is all-zero codes and its
+    /// record 0 is the macro GG shows bound to that key. Ground truth, the second binding of that
+    /// read (an index past the record list = a deleted macro) and the engine comment this rests on:
+    /// `docs/development/apex-7-onboard-profile-read.md` §The macro block is a packed record list.
+    pub macro_index: Option<u8>,
 }
 
 /// A lighting colour of the on-board profile.
@@ -649,6 +656,213 @@ pub struct MacroSummary {
     pub bytes_hex: Option<String>,
 }
 
+/// Marker byte that starts a packed macro record.
+pub const MACRO_RECORD_MARKER: u8 = 0x77;
+/// Action byte of a key press or release inside a macro record.
+pub const MACRO_ACTION_KEY: u8 = 0x02;
+/// Action byte of a timed pause inside a macro record.
+pub const MACRO_ACTION_DELAY: u8 = 0x04;
+/// Bytes of a macro record header: `0x77 | mode | id u16 | flags u16 | interval u16`.
+pub const MACRO_HEADER_LEN: usize = 8;
+/// Bytes of a macro press action: `0x02 | key | 0x01 0x01 | word u16 | ms u16`.
+pub const MACRO_PRESS_LEN: usize = 8;
+/// Bytes of a macro release action: `0x02 | key | 0x01 0x00`.
+pub const MACRO_RELEASE_LEN: usize = 4;
+/// Bytes of a macro delay action: `0x04 | 0x00 | ms u16`.
+pub const MACRO_DELAY_LEN: usize = 4;
+/// Macro mode GG writes for "play again every interval": the META + Insert binding of profile 1 in
+/// the read round is a mode 4 record that presses `4` with `interval` 5000 ms.
+pub const MACRO_MODE_REPEAT: u8 = 4;
+/// Macro mode of a record that plays once, stepping `interval` ms between its actions.
+pub const MACRO_MODE_ONCE: u8 = 1;
+
+/// One action of a packed macro record. `[EXPERIMENTAL]`: the split below is what makes the 134
+/// non-zero bytes of the only read that carries macros parse exactly, and the press `word` (4 in
+/// every press seen) is still unexplained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct MacroAction {
+    /// `press`, `release` or `delay`.
+    pub kind: &'static str,
+    /// Key code of a press or release, absent on a delay.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<u8>,
+    /// `u16` a press carries between its key byte and its duration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub word: Option<u16>,
+    /// Milliseconds: press duration on a press, pause length on a delay.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ms: Option<u16>,
+}
+
+/// One packed record of the macro data block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OnboardMacro {
+    /// Position in the packed list, from 0: the value a `0x71` binding points at.
+    pub index: usize,
+    /// Offset of the record inside the payload.
+    pub offset: usize,
+    /// Mode byte, see [`MACRO_MODE_REPEAT`] and [`MACRO_MODE_ONCE`]; `[EXPERIMENTAL]`, two records seen.
+    pub mode: u8,
+    /// Mode as a word, for the summary line.
+    pub mode_name: &'static str,
+    /// Record id (3 and 27 in the only read with macros; read as GG's database id).
+    pub id: u16,
+    /// The two bytes every record seen carries as `01 01`, unexplained.
+    pub flags: u16,
+    /// Repeat interval in mode [`MACRO_MODE_REPEAT`], inter-action delay in mode [`MACRO_MODE_ONCE`].
+    pub interval_ms: u16,
+    /// Bytes the record fills: header plus its actions. The list is packed with no length word, so
+    /// this is what the decoder walked. In the reference read 2076 + 20 + 116 = 2212 is where the
+    /// block content ends.
+    pub record_bytes: usize,
+    /// Number of actions parsed.
+    pub action_count: usize,
+    /// Actions of the record, in order.
+    pub actions: Vec<MacroAction>,
+    /// Raw record bytes, hex.
+    pub raw: String,
+}
+
+/// Mode byte as a word.
+#[must_use]
+pub fn macro_mode_name(mode: u8) -> &'static str {
+    match mode {
+        MACRO_MODE_REPEAT => "repeat",
+        MACRO_MODE_ONCE => "once",
+        _ => "unknown",
+    }
+}
+
+/// Parse the packed macro records out of a macro data block. `[EXPERIMENTAL]`.
+///
+/// A record is `0x77 | mode u8 | id u16 LE | flags u16 LE | interval u16 LE` followed by actions up
+/// to the next record marker or the zero run that pads the block: press
+/// `0x02 | key u8 | 0x01 0x01 | word u16 LE | ms u16 LE`, release `0x02 | key u8 | 0x01 0x00`, delay
+/// `0x04 | 0x00 | ms u16 LE`.
+///
+/// Returns the records in list order and a note when the block does not parse cleanly; an all-zero
+/// block (the usual case, GG leaves it empty) yields no records and no note.
+#[must_use]
+pub fn decode_macros(data: &[u8], offset: usize, len: usize) -> (Vec<OnboardMacro>, Option<String>) {
+    let start = offset.min(data.len());
+    let end = (offset + len).min(data.len());
+    let block = &data[start..end];
+    let mut records: Vec<OnboardMacro> = Vec::new();
+    let mut at = 0usize;
+    while at < block.len() {
+        if block[at] == 0 {
+            let tail = &block[at..];
+            let nonzero = tail.iter().filter(|b| **b != 0).count();
+            let note = (nonzero > 0).then(|| {
+                format!("{nonzero} non-zero bytes sit behind a zero run starting at +{at}: a packed record does not survive a zero pad")
+            });
+            return (records, note);
+        }
+        if block[at] != MACRO_RECORD_MARKER {
+            return (
+                records,
+                Some(format!(
+                    "record at +{at} starts with 0x{:02X}, not the marker 0x77",
+                    block[at]
+                )),
+            );
+        }
+        if at + MACRO_HEADER_LEN > block.len() {
+            return (records, Some(format!("record header at +{at} runs past the block end")));
+        }
+        let mode = block[at + 1];
+        let id = u16::from_le_bytes([block[at + 2], block[at + 3]]);
+        let flags = u16::from_le_bytes([block[at + 4], block[at + 5]]);
+        let interval_ms = u16::from_le_bytes([block[at + 6], block[at + 7]]);
+        let mut actions: Vec<MacroAction> = Vec::new();
+        let mut pos = at + MACRO_HEADER_LEN;
+        let broken = loop {
+            // Reaching the block end after a whole action is a normal end: the block is zero padded
+            // only behind the last record, and a read image can stop right on the record's last byte.
+            let Some(&byte) = block.get(pos) else { break None };
+            if byte == 0 || byte == MACRO_RECORD_MARKER {
+                break None;
+            }
+            if byte == MACRO_ACTION_KEY {
+                let shape = block.get(pos + 2).copied();
+                let flag = block.get(pos + 3).copied();
+                match (shape, flag) {
+                    (None, _) | (_, None) => {
+                        break Some(format!(
+                            "key action at +{pos} is cut by the block end: {} bytes left, a key action needs at least {MACRO_RELEASE_LEN}",
+                            block.len() - pos
+                        ));
+                    }
+                    (Some(0x01), Some(0x01)) => {
+                        if pos + MACRO_PRESS_LEN > block.len() {
+                            break Some("press action runs past the block end".to_string());
+                        }
+                        actions.push(MacroAction {
+                            kind: "press",
+                            key: Some(block[pos + 1]),
+                            word: Some(u16::from_le_bytes([block[pos + 4], block[pos + 5]])),
+                            ms: Some(u16::from_le_bytes([block[pos + 6], block[pos + 7]])),
+                        });
+                        pos += MACRO_PRESS_LEN;
+                    }
+                    (Some(0x01), Some(0x00)) => {
+                        actions.push(MacroAction {
+                            kind: "release",
+                            key: Some(block[pos + 1]),
+                            word: None,
+                            ms: None,
+                        });
+                        pos += MACRO_RELEASE_LEN;
+                    }
+                    (Some(0x01), other) => {
+                        break Some(format!(
+                            "key action at +{pos} has flag {other:?}, not 0x01 (press) or 0x00 (release)"
+                        ));
+                    }
+                    (other, _) => {
+                        break Some(format!(
+                            "key action at +{pos} has 0x{:02X} where 0x01 is expected",
+                            other.unwrap_or(0)
+                        ));
+                    }
+                }
+            } else if byte == MACRO_ACTION_DELAY {
+                if pos + MACRO_DELAY_LEN > block.len() {
+                    break Some("delay action runs past the block end".to_string());
+                }
+                actions.push(MacroAction {
+                    kind: "delay",
+                    key: None,
+                    word: None,
+                    ms: Some(u16::from_le_bytes([block[pos + 2], block[pos + 3]])),
+                });
+                pos += MACRO_DELAY_LEN;
+            } else {
+                break Some(format!("unknown action byte 0x{byte:02X} at +{pos}"));
+            }
+        };
+        let record_bytes = pos - at;
+        records.push(OnboardMacro {
+            index: records.len(),
+            offset: start + at,
+            mode,
+            mode_name: macro_mode_name(mode),
+            id,
+            flags,
+            interval_ms,
+            record_bytes,
+            action_count: actions.len(),
+            actions,
+            raw: hex_of(&block[at..pos]),
+        });
+        if let Some(reason) = broken {
+            return (records, Some(reason));
+        }
+        at = pos;
+    }
+    (records, None)
+}
+
 /// Decoded on-board profile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OnboardProfile {
@@ -680,6 +894,11 @@ pub struct OnboardProfile {
     pub rapid_tap: Option<RapidTap>,
     /// Macro data block summary.
     pub macro_data: MacroSummary,
+    /// Packed macro records of the macro data block, in list order. Empty when the block is empty.
+    pub macros: Vec<OnboardMacro>,
+    /// Why the macro block did not parse cleanly, `None` when it did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub macro_note: Option<String>,
     /// 16-byte profile GUID, hex.
     pub guid: String,
     /// Schema [`SCHEMA_A`] padding behind the GUID, hex (empty for schema [`SCHEMA_B`]).
@@ -920,6 +1139,7 @@ fn key_mapping(data: &[u8], at: usize, offset: usize) -> Result<KeyMapping> {
         function_name: function_name(function).to_string(),
         binding,
         key_codes: hex_of(codes),
+        macro_index: (function == 0x71).then_some(codes[2]),
     })
 }
 
@@ -997,6 +1217,7 @@ pub fn decode(data: &[u8]) -> Result<OnboardProfile> {
     // The checksum word is the last four bytes of the schema's payload, not of the image: a read
     // image is padded out to whole resource buffers behind it.
     let crc_offset = checksum_offset(expected);
+    let (macros, macro_note) = decode_macros(data, macro_offset, MACRO_DATA_LEN);
     let computed = compute_checksum(&data[..crc_offset]);
     let stored = u32::from_le_bytes([
         data[crc_offset],
@@ -1023,6 +1244,8 @@ pub fn decode(data: &[u8]) -> Result<OnboardProfile> {
         oled: summary_of_bytes(data, OLED_OFFSET, OLED_LEN),
         rapid_tap,
         macro_data: summary_of(data, macro_offset, MACRO_DATA_LEN),
+        macros,
+        macro_note,
         guid: hex_of(&data[guid_offset..guid_offset + GUID_LEN]),
         guid_padding: if schema_b {
             String::new()
@@ -1055,12 +1278,13 @@ pub fn hex_dump(data: &[u8], from: usize, to: usize) -> String {
 /// One-line human summary of a decoded profile.
 pub fn summary_line(profile: &OnboardProfile) -> String {
     format!(
-        "schema {}  name {:?}  guid {}  macro {} bytes ({} nonzero, fnv1a {})  crc {}",
+        "schema {}  name {:?}  guid {}  macro {} bytes ({} nonzero, {} record(s), fnv1a {})  crc {}",
         profile.schema_name,
         profile.name,
         profile.guid,
         profile.macro_data.len,
         profile.macro_data.nonzero,
+        profile.macros.len(),
         profile.macro_data.fnv1a_64,
         if profile.crc_ok {
             "ok".to_string()
@@ -1149,6 +1373,25 @@ mod tests {
         buffer[1..frame_len + 1].to_vec()
     }
 
+    /// A macro data block of the measured shape (see
+    /// `docs/development/apex-7-onboard-profile-read.md` §The macro block is a packed record list):
+    /// two packed records, 20 bytes then 116, marker `0x77`, then the zero pad. The numbers and the
+    /// keys here are **made up** - the measurements live in the docs, and no bytes of a real profile
+    /// are kept in this file. What the fixture carries is the structure the decoder has to walk: no
+    /// stride, no length word, the second record starting at the next `0x77`, a press of 8 bytes
+    /// (`02 key 01 01 word u16 ms u16`), a release of 4 (`02 key 01 00`) and a delay of 4
+    /// (`04 00 ms u16`), the last action byte equal to the pad.
+    const SYNTH_MACRO_BLOCK: [u8; 136] = [
+        0x77, 0x04, 0x09, 0x00, 0x01, 0x01, 0x88, 0x13, 0x02, 0x04, 0x01, 0x01, 0x04, 0x00, 0x01, 0x00, 0x02, 0x04,
+        0x01, 0x00, 0x77, 0x01, 0x0B, 0x00, 0x01, 0x01, 0x0F, 0x00, 0x02, 0x1E, 0x01, 0x01, 0x04, 0x00, 0x0F, 0x00,
+        0x02, 0x1E, 0x01, 0x00, 0x04, 0x00, 0x0F, 0x00, 0x02, 0x1F, 0x01, 0x01, 0x04, 0x00, 0x0F, 0x00, 0x02, 0x1F,
+        0x01, 0x00, 0x04, 0x00, 0x0F, 0x00, 0x02, 0x1F, 0x01, 0x01, 0x04, 0x00, 0x0F, 0x00, 0x02, 0x1F, 0x01, 0x00,
+        0x04, 0x00, 0x0F, 0x00, 0x02, 0x1F, 0x01, 0x01, 0x04, 0x00, 0x0F, 0x00, 0x02, 0x1F, 0x01, 0x00, 0x04, 0x00,
+        0x0F, 0x00, 0x02, 0x1F, 0x01, 0x01, 0x04, 0x00, 0x0F, 0x00, 0x02, 0x1F, 0x01, 0x00, 0x04, 0x00, 0x0F, 0x00,
+        0x02, 0x1F, 0x01, 0x01, 0x04, 0x00, 0x0F, 0x00, 0x02, 0x1F, 0x01, 0x00, 0x04, 0x00, 0x0F, 0x00, 0x02, 0x20,
+        0x01, 0x01, 0x04, 0x00, 0x0F, 0x00, 0x02, 0x20, 0x01, 0x00,
+    ];
+
     fn synthetic_payload(schema: u16) -> Vec<u8> {
         let len = payload_len_for_schema(schema).unwrap();
         let mut data = vec![0u8; len];
@@ -1179,8 +1422,12 @@ mod tests {
         } else {
             MACRO_OFFSET_A
         };
-        data[macro_offset] = 0x01;
-        data[macro_offset + 1] = 0xA7;
+        data[macro_offset..macro_offset + SYNTH_MACRO_BLOCK.len()].copy_from_slice(&SYNTH_MACRO_BLOCK);
+        // Two META-layer macro bindings: offset 114 names record 0, which the list holds, and offset
+        // 22 names record 5, which it does not - the deleted-macro state, with no real profile behind it.
+        data[BUTTON_META_MAPPINGS_OFFSET + 114 * KEY_MAPPING_LEN] = 0x71;
+        data[BUTTON_META_MAPPINGS_OFFSET + 22 * KEY_MAPPING_LEN] = 0x71;
+        data[BUTTON_META_MAPPINGS_OFFSET + 22 * KEY_MAPPING_LEN + 3] = 5;
         data[guid_offset_for_schema(schema)] = 0xAB;
         let crc_offset = checksum_offset(len);
         let computed = compute_checksum(&data[..crc_offset]);
@@ -1457,7 +1704,10 @@ mod tests {
         assert_eq!(profile.button_mappings[1].function_name, "mouse_button_4");
         assert_eq!(profile.macro_data.offset, MACRO_OFFSET_A);
         assert_eq!(profile.macro_data.len, MACRO_DATA_LEN);
-        assert_eq!(profile.macro_data.nonzero, 2);
+        assert_eq!(
+            profile.macro_data.nonzero,
+            SYNTH_MACRO_BLOCK.iter().filter(|b| **b != 0).count()
+        );
         assert!(profile.guid.starts_with("AB"), "{}", profile.guid);
         assert_eq!(profile.guid_padding, "00 00 00");
         assert!(profile.crc_ok, "stored crc matches the computed one");
@@ -1684,6 +1934,7 @@ mod tests {
                 "oled",
                 "rapid_tap",
                 "macro_data",
+                "macros",
                 "guid",
                 "guid_padding",
                 "crc_stored",
@@ -1731,11 +1982,30 @@ mod tests {
                     "function_name",
                     "hid_code",
                     "key_codes",
+                    "macro_index",
                     "offset"
                 ],
                 "{table} entries"
             );
         }
+        assert_eq!(
+            keys_of(&value["macros"]),
+            [
+                "action_count",
+                "actions",
+                "flags",
+                "id",
+                "index",
+                "interval_ms",
+                "mode",
+                "mode_name",
+                "offset",
+                "raw",
+                "record_bytes",
+            ],
+            "the packed macro records the GUI reads"
+        );
+        assert_eq!(keys_of(&value["macros"][0]["actions"]), ["key", "kind", "ms", "word"]);
         assert_eq!(
             keys_of(&value["oled"]),
             ["bytes_hex", "fnv1a_64", "head", "len", "nonzero", "offset"]
@@ -1819,5 +2089,137 @@ mod tests {
         assert!(lines[0].starts_with("000000  0A 00 50 72 6F"), "{}", lines[0]);
         assert!(lines[1].starts_with("000010  "), "{}", lines[1]);
         assert!(hex_dump(&data, 10, 5).is_empty(), "an inverted range dumps nothing");
+    }
+
+    #[test]
+    fn a_packed_macro_block_parses_into_its_two_records() {
+        let mut data = vec![0u8; MACRO_DATA_LEN];
+        data[..SYNTH_MACRO_BLOCK.len()].copy_from_slice(&SYNTH_MACRO_BLOCK);
+        let (macros, note) = decode_macros(&data, 0, data.len());
+        assert_eq!(note, None, "136 bytes of records then the zero pad must parse clean");
+        assert_eq!(macros.len(), 2);
+        let repeat = &macros[0];
+        assert_eq!(
+            (repeat.offset, repeat.index, repeat.mode, repeat.id, repeat.flags),
+            (0, 0, 4, 9, 0x0101)
+        );
+        assert_eq!((repeat.mode_name, repeat.interval_ms), ("repeat", 5000));
+        assert_eq!(
+            repeat.actions,
+            vec![
+                MacroAction {
+                    kind: "press",
+                    key: Some(0x04),
+                    word: Some(4),
+                    ms: Some(1)
+                },
+                MacroAction {
+                    kind: "release",
+                    key: Some(0x04),
+                    word: None,
+                    ms: None
+                },
+            ],
+            "press `a` for 1 ms and release it, on a repeat record"
+        );
+        let once = &macros[1];
+        assert_eq!(
+            (once.offset, once.index, once.mode, once.id, once.interval_ms),
+            (20, 1, 1, 11, 15)
+        );
+        assert_eq!(once.mode_name, "once");
+        assert_eq!(once.actions.len(), 20, "7 key pairs and 6 delays");
+        assert_eq!(once.actions.iter().filter(|a| a.kind == "press").count(), 7);
+        assert_eq!(once.actions.iter().filter(|a| a.kind == "release").count(), 7);
+        assert_eq!(once.actions.iter().filter(|a| a.kind == "delay").count(), 6);
+        assert_eq!(
+            macros.iter().map(|m| m.raw.split_whitespace().count()).sum::<usize>(),
+            SYNTH_MACRO_BLOCK.len(),
+            "the two records account for exactly the 136 bytes"
+        );
+    }
+
+    #[test]
+    fn a_meta_layer_macro_binding_names_the_record_it_points_at() {
+        let profile = decode(&synthetic_payload(SCHEMA_B)).unwrap();
+        assert_eq!(profile.macro_note, None, "the fixture block parses clean");
+        let insert = profile
+            .button_meta_mappings
+            .iter()
+            .find(|mapping| mapping.hid_code == Some(0x49))
+            .expect("the fixture binds META + Insert");
+        assert_eq!((insert.function, insert.function_name.as_str()), (0x71, "macro"));
+        assert_eq!(insert.key_codes, "00 00 00 00");
+        assert_eq!(insert.macro_index, Some(0));
+        let index = insert.macro_index.expect("the binding carries its index") as usize;
+        let target = &profile.macros[index];
+        assert_eq!((target.mode_name, target.interval_ms), ("repeat", 5000));
+        assert_eq!(
+            target.actions[0].key,
+            Some(0x04),
+            "the record names its keys by HID code, not by mapping slot"
+        );
+        assert_eq!(
+            (target.record_bytes, target.action_count),
+            (20, 2),
+            "the first record fills 20 bytes with two actions"
+        );
+        assert_eq!(
+            profile.macros.iter().map(|rec| rec.record_bytes).sum::<usize>(),
+            SYNTH_MACRO_BLOCK.len(),
+            "the packed records fill 20 + 116 of the block, with no gap and no length word between them"
+        );
+        // The binding whose index is past the record list: the record is gone, the binding stays.
+        let ghost = profile
+            .button_meta_mappings
+            .iter()
+            .find(|mapping| mapping.offset == 22)
+            .expect("the fixture binds a second META key to macro 5");
+        assert_eq!(
+            (ghost.function, ghost.key_codes.as_str(), ghost.macro_index),
+            (0x71, "00 00 05 00", Some(5))
+        );
+        assert!(
+            profile.macros.iter().all(|rec| rec.index != 5),
+            "index 5 is past the list, so the binding points at a deleted macro"
+        );
+
+        // Every non-macro slot leaves the field empty.
+        assert!(
+            profile
+                .button_mappings
+                .iter()
+                .filter(|mapping| mapping.function != 0x71)
+                .all(|mapping| mapping.macro_index.is_none())
+        );
+    }
+
+    #[test]
+    fn a_macro_block_is_reported_when_it_does_not_parse() {
+        let mut data = vec![0u8; MACRO_DATA_LEN];
+        data[0] = 0x01;
+        data[1] = 0xA7;
+        let (macros, note) = decode_macros(&data, 0, data.len());
+        assert!(macros.is_empty(), "a block without the marker decodes to nothing");
+        assert!(note.as_ref().is_some_and(|n| n.contains("not the marker")), "{note:?}");
+        let mut data = vec![0u8; MACRO_DATA_LEN];
+        data[..20].copy_from_slice(&SYNTH_MACRO_BLOCK[..20]);
+        data[40] = MACRO_RECORD_MARKER;
+        let (macros, note) = decode_macros(&data, 0, data.len());
+        assert_eq!(macros.len(), 1, "the record before the zero run is kept");
+        assert!(
+            note.as_ref().is_some_and(|n| n.contains("behind a zero run")),
+            "{note:?}"
+        );
+        let (macros, note) = decode_macros(&[0u8; 64], 0, 64);
+        assert!(macros.is_empty() && note.is_none(), "an empty block is the normal case");
+        // A record that is cut by the block end is reported, not silently shortened.
+        let truncated = &SYNTH_MACRO_BLOCK[..12];
+        let (macros, note) = decode_macros(truncated, 0, truncated.len());
+        assert_eq!(macros.len(), 1, "the header is already a record");
+        assert!(
+            note.as_ref().is_some_and(|n| n.contains("press action runs past")),
+            "{note:?}"
+        );
     }
 }
