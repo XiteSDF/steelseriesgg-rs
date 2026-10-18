@@ -562,11 +562,12 @@ pub struct KeyMapping {
     pub binding: &'static str,
     /// Four raw key-code bytes, hex.
     pub key_codes: String,
-    /// For a `0x71` macro binding, the index of the macro record this slot points at; `None` for
-    /// every other function. `[EXPERIMENTAL]`: `key_codes[2]`, the third code byte, on the strength
-    /// of the one read that carries macros - its META + Insert binding is all-zero codes and its
-    /// record 0 is the macro GG shows bound to that key. Ground truth, the second binding of that
-    /// read (an index past the record list = a deleted macro) and the engine comment this rests on:
+    /// For a `0x71` macro binding, the binding index this slot carries; `None` for every other
+    /// function: `key_codes[2]`, the third code byte. The record it binds is the one at
+    /// `index / MACRO_INDEX_STRIDE` ([`MACRO_INDEX_STRIDE`] carries the measurement), so a binding of 7
+    /// and a binding of 11 both bind the record at ordinal 1, and an index whose ordinal is past the
+    /// record list is the deleted-macro state - GG deletes the macro and leaves the key bound.
+    /// `[EXPERIMENTAL]`, nothing here has been written back:
     /// `docs/development/apex-7-onboard-profile-read.md` §The macro block is a packed record list.
     pub macro_index: Option<u8>,
 }
@@ -671,6 +672,17 @@ pub const MACRO_DELAY_LEN: usize = 4;
 pub const MACRO_MODE_REPEAT: u8 = 4;
 /// Macro mode of a record that plays once, stepping `interval` ms between its actions.
 pub const MACRO_MODE_ONCE: u8 = 1;
+/// Records per binding index: a `0x71` mapping row carries `record ordinal * MACRO_INDEX_STRIDE` in its
+/// third code byte, so the index a key carries is `7` times the position of the record it binds, and
+/// `index / MACRO_INDEX_STRIDE` is the record. `[EXPERIMENTAL]`, measured 2026-10-19 on
+/// `some_rebounds.json` (schema B, profile "Some rebounds"): 14 keys carry bindings 0, 7, 14, 21, 25,
+/// 28, 33, 38, 43, 46, 63, 92, 96, 117, and every binding whose record the block holds resolves by
+/// `index / 7` with content that matches the bound key - 0, 7, 14 name the records that press Shift and
+/// release C, V and X, the three keys that carry those very bindings; 21 and 25 share record 3 (the Ctrl
+/// repeat) and 28 and 33 share record 4, an empty record. The block's 581 non-zero bytes hold about 20
+/// records and the largest binding, 117 = 7 * 16 + 5, needs 17 - the same order of size. Nothing here
+/// has been written back to a keyboard.
+pub const MACRO_INDEX_STRIDE: usize = 7;
 
 /// One action of a packed macro record. `[EXPERIMENTAL]`: the split below is what makes the 134
 /// non-zero bytes of the only read that carries macros parse exactly, and the press `word` (4 in
@@ -693,8 +705,11 @@ pub struct MacroAction {
 /// One packed record of the macro data block.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OnboardMacro {
-    /// Position in the packed list, from 0: the value a `0x71` binding points at.
+    /// The number a `0x71` binding carries for this record: `ordinal * MACRO_INDEX_STRIDE`. A key bound
+    /// to any index of the record's group (`0..MACRO_INDEX_STRIDE` around `ordinal * 7`) binds it.
     pub index: usize,
+    /// Position in the packed list, from 0: `index / MACRO_INDEX_STRIDE`.
+    pub ordinal: usize,
     /// Offset of the record inside the payload.
     pub offset: usize,
     /// Mode byte, see [`MACRO_MODE_REPEAT`] and [`MACRO_MODE_ONCE`]; `[EXPERIMENTAL]`, two records seen.
@@ -745,20 +760,22 @@ pub fn decode_macros(data: &[u8], offset: usize, len: usize) -> (Vec<OnboardMacr
     let block = &data[start..end];
     let mut records: Vec<OnboardMacro> = Vec::new();
     let mut at = 0usize;
+    let mut zeros = 0usize;
     while at < block.len() {
+        // A zero run is an empty binding group: GG leaves the records packed at the start of the block
+        // and the scan walks on to the next marker, because a binding can name a record past every gap
+        // in front of it (`some_rebounds.json` binds indices up to 117 in a block whose first records sit
+        // in its first 108 bytes).
         if block[at] == 0 {
-            let tail = &block[at..];
-            let nonzero = tail.iter().filter(|b| **b != 0).count();
-            let note = (nonzero > 0).then(|| {
-                format!("{nonzero} non-zero bytes sit behind a zero run starting at +{at}: a packed record does not survive a zero pad")
-            });
-            return (records, note);
+            zeros += 1;
+            at += 1;
+            continue;
         }
         if block[at] != MACRO_RECORD_MARKER {
             return (
                 records,
                 Some(format!(
-                    "record at +{at} starts with 0x{:02X}, not the marker 0x77",
+                    "record at +{at} starts with 0x{:02X}, not the marker 0x77 ({zeros} zero bytes skipped so far)",
                     block[at]
                 )),
             );
@@ -838,8 +855,10 @@ pub fn decode_macros(data: &[u8], offset: usize, len: usize) -> (Vec<OnboardMacr
             }
         };
         let record_bytes = pos - at;
+        let ordinal = records.len();
         records.push(OnboardMacro {
-            index: records.len(),
+            index: ordinal * MACRO_INDEX_STRIDE,
+            ordinal,
             offset: start + at,
             mode,
             mode_name: macro_mode_name(mode),
@@ -1916,36 +1935,57 @@ fn macro_lines(profile: &OnboardProfile) -> Vec<String> {
         };
     }
 
-    let content_end = profile.macros.iter().map(|rec| rec.record_bytes).sum::<usize>() + profile.macro_data.offset;
+    let content_end = profile
+        .macros
+        .iter()
+        .map(|rec| rec.offset + rec.record_bytes)
+        .max()
+        .unwrap_or(profile.macro_data.offset);
     let mut lines = vec![format!(
-        "  macro records [EXPERIMENTAL]: {} record(s) packed from {} - {} bytes, content ends at {} (the block has no length word: a record is its header plus its actions and the next record starts at the next 0x77)",
+        "  macro records [EXPERIMENTAL]: {} record(s) in the block from {} - a binding carries its record's ordinal times {}, so the block is walked to its end for the records a binding can name (last record ends at {})",
         profile.macros.len(),
         profile.macro_data.offset,
-        content_end - profile.macro_data.offset,
+        MACRO_INDEX_STRIDE,
         content_end
     )];
     for rec in &profile.macros {
         lines.push(format!(
-            "    record {}: {} (mode 0x{:02X}), id {}, interval {} ms, {} action(s), {} bytes at {}",
-            rec.index, rec.mode_name, rec.mode, rec.id, rec.interval_ms, rec.action_count, rec.record_bytes, rec.offset
+            "    record {} (ordinal {}, bound by indices {}..{}): {} (mode 0x{:02X}), id {}, interval {} ms, {} action(s), {} bytes at {}",
+            rec.index,
+            rec.ordinal,
+            rec.index,
+            rec.index + MACRO_INDEX_STRIDE - 1,
+            rec.mode_name,
+            rec.mode,
+            rec.id,
+            rec.interval_ms,
+            rec.action_count,
+            rec.record_bytes,
+            rec.offset
         ));
         lines.push(format!("      keys: {}", actions_line(&rec.actions)));
         lines.push(format!("      raw:  {}", rec.raw));
     }
     for (offset, entry) in profile.button_meta_mappings.iter().enumerate() {
         let Some(index) = entry.macro_index else { continue };
-        match profile.macros.iter().find(|rec| rec.index == usize::from(index)) {
+        let ordinal = usize::from(index) / MACRO_INDEX_STRIDE;
+        match profile.macros.iter().find(|rec| rec.ordinal == ordinal) {
             Some(rec) => lines.push(format!(
-                "    bound at META mapping {}: record {} - {} every {} ms: {}",
+                "    bound at META mapping {}: index {} -> record {} (ordinal {}) - {} every {} ms: {}",
                 offset,
+                index,
                 rec.index,
+                rec.ordinal,
                 rec.mode_name,
                 rec.interval_ms,
                 actions_line(&rec.actions)
             )),
             None => lines.push(format!(
-                "    bound at META mapping {}: record {} - deleted macro, the record is gone and the binding is left behind",
-                offset, index
+                "    bound at META mapping {}: index {} -> ordinal {}, past the {} record(s) the block holds - deleted macro, the record is gone and the binding is left behind",
+                offset,
+                index,
+                ordinal,
+                profile.macros.len()
             )),
         }
     }
@@ -2047,11 +2087,18 @@ mod tests {
             MACRO_OFFSET_A
         };
         data[macro_offset..macro_offset + SYNTH_MACRO_BLOCK.len()].copy_from_slice(&SYNTH_MACRO_BLOCK);
-        // Two META-layer macro bindings: offset 114 names record 0, which the list holds, and offset
-        // 22 names record 5, which it does not - the deleted-macro state, with no real profile behind it.
+        // Four META-layer macro bindings, in the shape the measurement says GG writes:
+        // offset 114 carries 0 (record 0, the list holds it), offset 30 carries 7 and offset 31 carries
+        // 11 (both resolve to record 1, the group of MACRO_INDEX_STRIDE indices around 7), and offset 22
+        // carries 21 - ordinal 3, past the two records the block holds: the deleted-macro state, with no
+        // real profile behind it.
         data[BUTTON_META_MAPPINGS_OFFSET + 114 * KEY_MAPPING_LEN] = 0x71;
+        data[BUTTON_META_MAPPINGS_OFFSET + 30 * KEY_MAPPING_LEN] = 0x71;
+        data[BUTTON_META_MAPPINGS_OFFSET + 30 * KEY_MAPPING_LEN + 3] = 7;
+        data[BUTTON_META_MAPPINGS_OFFSET + 31 * KEY_MAPPING_LEN] = 0x71;
+        data[BUTTON_META_MAPPINGS_OFFSET + 31 * KEY_MAPPING_LEN + 3] = 11;
         data[BUTTON_META_MAPPINGS_OFFSET + 22 * KEY_MAPPING_LEN] = 0x71;
-        data[BUTTON_META_MAPPINGS_OFFSET + 22 * KEY_MAPPING_LEN + 3] = 5;
+        data[BUTTON_META_MAPPINGS_OFFSET + 22 * KEY_MAPPING_LEN + 3] = 21;
         data[guid_offset_for_schema(schema)] = 0xAB;
         let crc_offset = checksum_offset(len);
         let computed = compute_checksum(&data[..crc_offset]);
@@ -2693,6 +2740,7 @@ mod tests {
                 "mode",
                 "mode_name",
                 "offset",
+                "ordinal",
                 "raw",
                 "record_bytes",
             ],
@@ -2793,8 +2841,15 @@ mod tests {
         assert_eq!(macros.len(), 2);
         let repeat = &macros[0];
         assert_eq!(
-            (repeat.offset, repeat.index, repeat.mode, repeat.id, repeat.flags),
-            (0, 0, 4, 9, 0x0101)
+            (
+                repeat.offset,
+                repeat.index,
+                repeat.ordinal,
+                repeat.mode,
+                repeat.id,
+                repeat.flags
+            ),
+            (0, 0, 0, 4, 9, 0x0101)
         );
         assert_eq!((repeat.mode_name, repeat.interval_ms), ("repeat", 5000));
         assert_eq!(
@@ -2817,8 +2872,14 @@ mod tests {
         );
         let once = &macros[1];
         assert_eq!(
+            (once.index, once.ordinal),
+            (MACRO_INDEX_STRIDE, 1),
+            "the second record of the list is bound by the indices of its group, 7..13"
+        );
+        assert_eq!(
             (once.offset, once.index, once.mode, once.id, once.interval_ms),
-            (20, 1, 1, 11, 15)
+            (20, MACRO_INDEX_STRIDE, 1, 11, 15),
+            "the second record of the list is bound by the indices of its group"
         );
         assert_eq!(once.mode_name, "once");
         assert_eq!(once.actions.len(), 20, "7 key pairs and 6 delays");
@@ -2844,8 +2905,12 @@ mod tests {
         assert_eq!((insert.function, insert.function_name.as_str()), (0x71, "macro"));
         assert_eq!(insert.key_codes, "00 00 00 00");
         assert_eq!(insert.macro_index, Some(0));
-        let index = insert.macro_index.expect("the binding carries its index") as usize;
-        let target = &profile.macros[index];
+        let index = usize::from(insert.macro_index.expect("the binding carries its index"));
+        let target = profile
+            .macros
+            .iter()
+            .find(|rec| rec.ordinal == index / MACRO_INDEX_STRIDE)
+            .expect("the binding resolves to the record its index names");
         assert_eq!((target.mode_name, target.interval_ms), ("repeat", 5000));
         assert_eq!(
             target.actions[0].key,
@@ -2862,19 +2927,47 @@ mod tests {
             SYNTH_MACRO_BLOCK.len(),
             "the packed records fill 20 + 116 of the block, with no gap and no length word between them"
         );
-        // The binding whose index is past the record list: the record is gone, the binding stays.
+        // Two bindings in the group of one record: 7 and 11 both name the record at ordinal 1.
+        let group: Vec<(usize, u8, usize)> = profile
+            .button_meta_mappings
+            .iter()
+            .filter(|mapping| mapping.offset == 30 || mapping.offset == 31)
+            .map(|mapping| {
+                (
+                    mapping.offset,
+                    mapping.macro_index.expect("both carry an index"),
+                    usize::from(mapping.macro_index.expect("both carry an index")) / MACRO_INDEX_STRIDE,
+                )
+            })
+            .collect();
+        assert_eq!(
+            group,
+            vec![(30, 7, 1), (31, 11, 1)],
+            "a binding index is 7 times the record position, so 7 and 11 bind the same record"
+        );
+        assert_eq!(
+            profile
+                .macros
+                .iter()
+                .find(|rec| rec.ordinal == 1)
+                .expect("record 1 is in the block")
+                .mode_name,
+            "once",
+            "the record 7 and 11 bind is the second record of the block"
+        );
+        // The binding whose ordinal is past the record list: the record is gone, the binding stays.
         let ghost = profile
             .button_meta_mappings
             .iter()
             .find(|mapping| mapping.offset == 22)
-            .expect("the fixture binds a second META key to macro 5");
+            .expect("the fixture binds a second META key to index 21");
         assert_eq!(
             (ghost.function, ghost.key_codes.as_str(), ghost.macro_index),
-            (0x71, "00 00 05 00", Some(5))
+            (0x71, "00 00 15 00", Some(21))
         );
         assert!(
-            profile.macros.iter().all(|rec| rec.index != 5),
-            "index 5 is past the list, so the binding points at a deleted macro"
+            profile.macros.iter().all(|rec| rec.ordinal != 21 / MACRO_INDEX_STRIDE),
+            "ordinal 3 is past the list, so the binding points at a deleted macro"
         );
 
         // Every non-macro slot leaves the field empty.
@@ -2888,6 +2981,34 @@ mod tests {
     }
 
     #[test]
+    fn a_macro_block_is_walked_past_the_gaps_a_binding_can_name() {
+        // The shape of `some_rebounds.json`: records packed at the head of the block, a zero gap, then
+        // more records - a binding index of 117 needs the record at ordinal 16, so the scan cannot stop
+        // at the first gap.
+        let mut data = vec![0u8; MACRO_DATA_LEN];
+        data[..SYNTH_MACRO_BLOCK.len()].copy_from_slice(&SYNTH_MACRO_BLOCK);
+        let deep = 300;
+        data[deep..deep + 20].copy_from_slice(&SYNTH_MACRO_BLOCK[..20]);
+        let (macros, note) = decode_macros(&data, 0, data.len());
+        assert_eq!(note, None, "the gap is an empty slot, not a parse failure");
+        assert_eq!(macros.len(), 3, "the two packed records and the one behind the gap");
+        assert_eq!(
+            macros.iter().map(|rec| rec.offset).collect::<Vec<_>>(),
+            vec![0, 20, deep],
+            "the scan walks the block in payload order"
+        );
+        assert_eq!(
+            macros.iter().map(|rec| rec.index).collect::<Vec<_>>(),
+            vec![0, MACRO_INDEX_STRIDE, 2 * MACRO_INDEX_STRIDE],
+            "the binding index is the position in the list times the stride, gaps included"
+        );
+        assert!(
+            macros.iter().all(|rec| rec.index / MACRO_INDEX_STRIDE == rec.ordinal),
+            "index / stride is the record, which is how a binding resolves"
+        );
+    }
+
+    #[test]
     fn a_macro_block_is_reported_when_it_does_not_parse() {
         let mut data = vec![0u8; MACRO_DATA_LEN];
         data[0] = 0x01;
@@ -2895,14 +3016,39 @@ mod tests {
         let (macros, note) = decode_macros(&data, 0, data.len());
         assert!(macros.is_empty(), "a block without the marker decodes to nothing");
         assert!(note.as_ref().is_some_and(|n| n.contains("not the marker")), "{note:?}");
+        // A record, a zero gap, then bytes that are not a record: the record the block holds is kept
+        // and the gap is named in the note (the gap is what a binding index can point across).
+        let mut data = vec![0u8; MACRO_DATA_LEN];
+        data[..20].copy_from_slice(&SYNTH_MACRO_BLOCK[..20]);
+        data[40] = 0x01;
+        data[41] = 0xA7;
+        let (macros, note) = decode_macros(&data, 0, data.len());
+        assert_eq!(macros.len(), 1, "the record before the gap is kept");
+        assert!(
+            note.as_ref()
+                .is_some_and(|n| n.contains("not the marker 0x77") && n.contains("20 zero bytes skipped")),
+            "{note:?}"
+        );
+        // A marker with nothing behind it is a header-only record: mode, id and interval read as zeros
+        // and its action list ends at once. The scan walks on and the block reports no note.
         let mut data = vec![0u8; MACRO_DATA_LEN];
         data[..20].copy_from_slice(&SYNTH_MACRO_BLOCK[..20]);
         data[40] = MACRO_RECORD_MARKER;
         let (macros, note) = decode_macros(&data, 0, data.len());
-        assert_eq!(macros.len(), 1, "the record before the zero run is kept");
-        assert!(
-            note.as_ref().is_some_and(|n| n.contains("behind a zero run")),
-            "{note:?}"
+        assert_eq!(
+            (macros.len(), note),
+            (2, None),
+            "a lone marker across a gap is the second record, not a parse failure"
+        );
+        assert_eq!(
+            (
+                macros[1].index,
+                macros[1].ordinal,
+                macros[1].record_bytes,
+                macros[1].action_count
+            ),
+            (MACRO_INDEX_STRIDE, 1, MACRO_HEADER_LEN, 0),
+            "the header-only record is 8 bytes with no actions"
         );
         let (macros, note) = decode_macros(&[0u8; 64], 0, 64);
         assert!(macros.is_empty() && note.is_none(), "an empty block is the normal case");
