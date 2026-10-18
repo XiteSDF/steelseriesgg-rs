@@ -206,6 +206,10 @@ pub(crate) enum OnboardAction {
 
     /// Decode a profile image saved by an earlier read (no device, no hardware).
     Decode(OnboardDecodeArgs),
+
+    /// Encode a profile JSON back into profile bytes (no device, no hardware). Nothing is sent to a
+    /// keyboard: the write path that will use these bytes is not implemented.
+    Encode(OnboardEncodeArgs),
 }
 
 /// One on-board profile read. The flags pick the slot, the keyboard and what to do with the result;
@@ -260,6 +264,35 @@ pub(crate) struct OnboardDecodeArgs {
     pub(crate) out: Option<PathBuf>,
 
     /// Hex-dump profile bytes
+    #[arg(long)]
+    pub(crate) hex: bool,
+
+    /// First byte of the hex dump
+    #[arg(long, default_value = "0")]
+    pub(crate) hex_from: usize,
+
+    /// Number of bytes in the hex dump
+    #[arg(long, default_value = "64")]
+    pub(crate) hex_len: usize,
+}
+
+/// One profile JSON written back as payload bytes. The JSON is the input, the geometry is the
+/// decoder's layout table, and the checksum is computed here: the report's stored word is ignored.
+#[derive(clap::Args)]
+pub(crate) struct OnboardEncodeArgs {
+    /// Profile JSON, as written by `ssgg onboard decode`
+    pub(crate) file: PathBuf,
+
+    /// Where to write the profile bytes. Default: the input file name with a `.bin` extension
+    #[arg(short, long, value_name = "FILE")]
+    pub(crate) out: Option<PathBuf>,
+
+    /// Compare the encoded bytes with a profile image (e.g. the `--bin` of the read this JSON came
+    /// from) and report where they differ, or that they are identical
+    #[arg(long, value_name = "FILE")]
+    pub(crate) check: Option<PathBuf>,
+
+    /// Hex-dump the encoded bytes
     #[arg(long)]
     pub(crate) hex: bool,
 

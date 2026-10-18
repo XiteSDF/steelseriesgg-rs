@@ -812,7 +812,7 @@ async fn cmd_profile(action: ProfileAction) -> Result<()> {
 /// the decoded layout and checksum now match GG's payload struct and a hardware read of the factory
 /// profile. Field meanings inside the OLED and macro blocks are still reverse-engineered.
 async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAction) -> Result<()> {
-    use steelseries_gg::devices::keyboards::apex_legacy_profile::{hex_dump, profile_json, schema_of};
+    use steelseries_gg::devices::keyboards::apex_legacy_profile::{hex_dump, profile_json, schema_of, summary_line};
 
     match action {
         OnboardAction::Read(args) => {
@@ -902,8 +902,76 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
             secure_write_async(json.clone(), profile_json(&profile)?).await?;
             println!("JSON decode report written to {}", json.display());
         }
+        OnboardAction::Encode(args) => {
+            let data = encode_profile_json(&args.file).await?;
+            // Read the bytes back through the decoder, so what is printed is what the file says,
+            // not what the JSON claimed.
+            let profile = decode(&data)?;
+            println!("{}", summary_line(&profile));
+            let out = args.out.unwrap_or_else(|| args.file.with_extension("bin"));
+            secure_write_async(out.clone(), data.clone()).await?;
+            println!(
+                "profile bytes written to {} ({} bytes, checksum {:08X})",
+                out.display(),
+                data.len(),
+                profile.crc_computed
+            );
+            if let Some(reference) = args.check {
+                check_encoded_bytes(&data, &reference).await?;
+            }
+            if args.hex {
+                let from = args.hex_from;
+                let to = (from + args.hex_len).min(data.len());
+                print!("{}", hex_dump(&data, from, to));
+            }
+        }
     }
 
+    Ok(())
+}
+
+/// A profile JSON, as written by `onboard decode`, encoded back into payload bytes.
+async fn encode_profile_json(path: &std::path::Path) -> Result<Vec<u8>> {
+    use steelseries_gg::devices::keyboards::apex_legacy_profile::encode_json;
+
+    let text = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|e| Error::Other(format!("read {}: {e}", path.display())))?;
+    let data = encode_json(&text).map_err(|e| Error::Other(format!("encode {}: {e}", path.display())))?;
+    Ok(data)
+}
+
+/// Compare encoded bytes with a profile file from a read: the check a write path will do before it
+/// sends, run here on the files. A read image is longer than the payload it carries (the pulls fill
+/// whole 1024-byte buffers), so the comparison runs over the payload and the bytes behind it are
+/// reported as what they are: device buffer content, not profile bytes. In the read of
+/// slot 3 those 592 bytes behind the 11,696-byte payload are 80 bytes of `FF` and then zeros.
+async fn check_encoded_bytes(data: &[u8], path: &std::path::Path) -> Result<()> {
+    let wanted = tokio::fs::read(path)
+        .await
+        .map_err(|e| Error::Other(format!("read {}: {e}", path.display())))?;
+    let common = data.len().min(wanted.len());
+    match data[..common].iter().zip(&wanted[..common]).position(|(a, b)| a != b) {
+        Some(at) => println!(
+            "check {}: first difference at byte {at} ({} bytes encoded, {} bytes in the file)",
+            path.display(),
+            data.len(),
+            wanted.len()
+        ),
+        None if data.len() == wanted.len() => {
+            println!("check {}: byte identical, {} bytes", path.display(), data.len());
+        }
+        None => {
+            let behind = &wanted[common..];
+            println!(
+                "check {}: byte identical over the {common} profile bytes; the file is a {}-byte read image,                  carrying {} bytes behind the payload ({} of them non-zero: device buffer content, not profile bytes)",
+                path.display(),
+                wanted.len(),
+                behind.len(),
+                behind.iter().filter(|b| **b != 0).count()
+            );
+        }
+    }
     Ok(())
 }
 

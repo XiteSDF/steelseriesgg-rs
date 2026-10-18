@@ -90,7 +90,7 @@
 use crate::devices::hid_reports::{ONBOARD_GET_WIRE_BYTES, ONBOARD_MAX_READ_LEN, ONBOARD_OUTPUT_REPORT_SIZE};
 use crate::devices::keyboards::apex_pro_tkl_2023_profile::profile_checksum;
 use crate::error::{Error, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 /// Schema the pre-4.16.3 firmware uses.
@@ -1356,6 +1356,356 @@ pub fn to_json(image: &ProfileImage) -> Result<String> {
     serde_json::to_string_pretty(&value).map_err(|e| Error::Profile(format!("serialize profile image: {e}")))
 }
 
+/// Parse the space-separated hex a decoder field carries, requiring exactly `want` bytes.
+fn parse_hex(text: &str, what: &str, want: usize) -> Result<Vec<u8>> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.len() != want {
+        return Err(Error::Profile(format!(
+            "{what} carries {} bytes, {want} expected: {text}",
+            words.len()
+        )));
+    }
+    words
+        .iter()
+        .map(|word| {
+            u8::from_str_radix(word, 16)
+                .map_err(|e| Error::Profile(format!("{what} has the byte {word:?}, which is not a hex byte: {e}")))
+        })
+        .collect()
+}
+
+#[derive(Deserialize)]
+struct HexColor {
+    r: u8,
+    g: u8,
+    b: u8,
+}
+
+#[derive(Deserialize)]
+struct JsonLighting {
+    oled_illumination_options: String,
+    lock_key_color: HexColor,
+    meta_key_color: HexColor,
+    disabled_win_key_color: HexColor,
+    meta_mapped_elements: String,
+    lock_key_hid_codes: String,
+    win_key_hid_code: u8,
+    meta_key_background_dimmer: u8,
+    idle_mode_dimmer: u8,
+    idle_timeout_ms: u32,
+}
+
+#[derive(Deserialize)]
+struct JsonMapping {
+    offset: usize,
+    function: u8,
+    key_codes: String,
+}
+
+#[derive(Deserialize)]
+struct JsonBlock {
+    offset: usize,
+    len: usize,
+    #[serde(default)]
+    bytes_hex: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct JsonRapidPair {
+    hid_1: u8,
+    hid_2: u8,
+    mode: u8,
+    report_both_keys: bool,
+    reserved: String,
+}
+
+#[derive(Deserialize)]
+struct JsonRapidTap {
+    enable: u8,
+    pairs: Vec<JsonRapidPair>,
+}
+
+#[derive(Deserialize)]
+struct JsonMacro {
+    offset: usize,
+    record_bytes: usize,
+    raw: String,
+}
+
+/// The shape of a decode report, read back for encoding. Every field the encoder does not need
+/// (`crc_ok`, `binding`, `function_name`, `keystrokes`, hashes) is ignored.
+#[derive(Deserialize)]
+struct JsonProfile {
+    schema: u16,
+    name_hex: String,
+    lighting: JsonLighting,
+    meta_toggle_hid: u8,
+    button_mappings: Vec<JsonMapping>,
+    wheel_mappings: Vec<JsonMapping>,
+    button_meta_mappings: Vec<JsonMapping>,
+    wheel_meta_mappings: Vec<JsonMapping>,
+    oled: JsonBlock,
+    #[serde(default)]
+    rapid_tap: Option<JsonRapidTap>,
+    macro_data: JsonBlock,
+    #[serde(default)]
+    macros: Vec<JsonMacro>,
+    /// The encoder writes the records it was given, so a block the decoder could not walk is refused.
+    #[serde(default)]
+    macro_note: Option<String>,
+    guid: String,
+    guid_padding: String,
+}
+
+fn write_color(data: &mut [u8], at: usize, color: &HexColor) {
+    data[at] = color.r;
+    data[at + 1] = color.g;
+    data[at + 2] = color.b;
+}
+
+fn write_mapping_table(data: &mut [u8], at: usize, entries: &[JsonMapping], count: usize, what: &str) -> Result<()> {
+    if entries.len() != count {
+        return Err(Error::Profile(format!(
+            "{what} has {} entries, {count} expected",
+            entries.len()
+        )));
+    }
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.offset != index {
+            return Err(Error::Profile(format!(
+                "{what} slot {index} carries offset {}, so the table is not in payload order",
+                entry.offset
+            )));
+        }
+        let at = at + index * KEY_MAPPING_LEN;
+        let codes = parse_hex(
+            &entry.key_codes,
+            &format!("{what} slot {index} codes"),
+            KEY_MAPPING_LEN - 1,
+        )?;
+        data[at] = entry.function;
+        data[at + 1..at + KEY_MAPPING_LEN].copy_from_slice(&codes);
+    }
+    Ok(())
+}
+
+/// Write the block a summary describes, validating that the summary still points where this schema
+/// puts it: a JSON from an older decoder, or from the other schema, is refused instead of writing
+/// bytes into the wrong place.
+fn write_block(
+    data: &mut [u8],
+    summary: &JsonBlock,
+    offset: usize,
+    len: usize,
+    bytes_hex: &str,
+    what: &str,
+) -> Result<()> {
+    if summary.offset != offset || summary.len != len {
+        return Err(Error::Profile(format!(
+            "{what} is described at offset {} as {len} bytes, this schema puts it at offset {offset} as {len} bytes",
+            summary.offset
+        )));
+    }
+    let bytes = parse_hex(bytes_hex, what, len)?;
+    data[offset..offset + len].copy_from_slice(&bytes);
+    Ok(())
+}
+
+/// Encode a decode report back into profile payload bytes: the inverse of [`decode`].
+///
+/// The payload is rebuilt from the schema word, the name bytes, the lighting block, the META toggle
+/// key, the four mapping tables, the OLED pixels, the Rapid Tap block, the packed macro records and
+/// the GUID; the last four bytes are the checksum this function computes, never the `crc_stored` of
+/// the report. Everything the report does not carry (the zero pad of the macro block, the padding
+/// behind the name) is written as the zero bytes the reference reads have there.
+///
+/// `[EXPERIMENTAL]`: the layout this inverts is reverse-engineered and only read from keyboards,
+/// never written to one - no write path uses this yet, and nothing here has been sent to hardware.
+///
+/// # Errors
+///
+/// Returns [`Error::Profile`] when the JSON is not a decode report, when a field is the wrong length,
+/// when a block sits where this schema does not put it, when a macro block carries a decode note (the
+/// records the decoder could not walk cannot be written back), when Rapid Tap does not match the
+/// schema, or when the tables are not in payload order.
+pub fn encode_json(text: &str) -> Result<Vec<u8>> {
+    let profile: JsonProfile = serde_json::from_str(text).map_err(|e| Error::Profile(format!("profile JSON: {e}")))?;
+    let len = payload_len_for_schema(profile.schema)?;
+    let schema_b = profile.schema == SCHEMA_B;
+    let macro_offset = if schema_b { MACRO_OFFSET_B } else { MACRO_OFFSET_A };
+    let guid_offset = guid_offset_for_schema(profile.schema);
+    let mut data = vec![0u8; len];
+    data[..2].copy_from_slice(&profile.schema.to_le_bytes());
+
+    let name = parse_hex(
+        &profile.name_hex,
+        "profile name",
+        profile.name_hex.split_whitespace().count(),
+    )?;
+    if name.len() > NAME_LEN {
+        return Err(Error::Profile(format!(
+            "profile name is {} bytes, the field holds {NAME_LEN}",
+            name.len()
+        )));
+    }
+    data[NAME_OFFSET..NAME_OFFSET + name.len()].copy_from_slice(&name);
+
+    let l = LIGHTING_OFFSET;
+    let lighting = &profile.lighting;
+    data[l..l + 6].copy_from_slice(&parse_hex(
+        &lighting.oled_illumination_options,
+        "OLED illumination options",
+        6,
+    )?);
+    write_color(&mut data, l + 6, &lighting.lock_key_color);
+    write_color(&mut data, l + 9, &lighting.meta_key_color);
+    write_color(&mut data, l + 12, &lighting.disabled_win_key_color);
+    data[l + 15..l + 47].copy_from_slice(&parse_hex(&lighting.meta_mapped_elements, "META mapping mask", 32)?);
+    data[l + 47..l + 50].copy_from_slice(&parse_hex(&lighting.lock_key_hid_codes, "lock-key HID codes", 3)?);
+    data[l + 50] = lighting.win_key_hid_code;
+    data[l + 51] = lighting.meta_key_background_dimmer;
+    data[l + 52] = lighting.idle_mode_dimmer;
+    data[l + 53..l + 57].copy_from_slice(&lighting.idle_timeout_ms.to_le_bytes());
+    data[META_TOGGLE_HID_OFFSET] = profile.meta_toggle_hid;
+
+    write_mapping_table(
+        &mut data,
+        BUTTON_MAPPINGS_OFFSET,
+        &profile.button_mappings,
+        BUTTON_MAPPING_COUNT,
+        "button mapping",
+    )?;
+    write_mapping_table(
+        &mut data,
+        WHEEL_MAPPINGS_OFFSET,
+        &profile.wheel_mappings,
+        WHEEL_MAPPING_COUNT,
+        "wheel mapping",
+    )?;
+    write_mapping_table(
+        &mut data,
+        BUTTON_META_MAPPINGS_OFFSET,
+        &profile.button_meta_mappings,
+        BUTTON_MAPPING_COUNT,
+        "button META mapping",
+    )?;
+    write_mapping_table(
+        &mut data,
+        WHEEL_META_MAPPINGS_OFFSET,
+        &profile.wheel_meta_mappings,
+        WHEEL_MAPPING_COUNT,
+        "wheel META mapping",
+    )?;
+
+    write_block(
+        &mut data,
+        &profile.oled,
+        OLED_OFFSET,
+        OLED_LEN,
+        profile.oled.bytes_hex.as_deref().ok_or_else(|| {
+            Error::Profile("OLED block carries no bytes_hex, so its pixels cannot be written".to_string())
+        })?,
+        "OLED block",
+    )?;
+
+    match (&profile.rapid_tap, schema_b) {
+        (Some(rapid_tap), true) => {
+            data[RAPID_TAP_ENABLE_OFFSET] = rapid_tap.enable;
+            if rapid_tap.pairs.len() != 10 {
+                return Err(Error::Profile(format!(
+                    "Rapid Tap has {} pairs, 10 expected",
+                    rapid_tap.pairs.len()
+                )));
+            }
+            for (index, pair) in rapid_tap.pairs.iter().enumerate() {
+                let at = RAPID_TAP_PAIRS_OFFSET + index * RAPID_TAP_PAIR_LEN;
+                data[at] = pair.hid_1;
+                data[at + 1] = pair.hid_2;
+                data[at + 2] = pair.mode | if pair.report_both_keys { 0x80 } else { 0 };
+                data[at + 3..at + RAPID_TAP_PAIR_LEN].copy_from_slice(&parse_hex(
+                    &pair.reserved,
+                    &format!("Rapid Tap pair {index} reserved bytes"),
+                    2,
+                )?);
+            }
+        }
+        (None, true) => {
+            return Err(Error::Profile(
+                "schema b carries a Rapid Tap block and the JSON has none".to_string(),
+            ));
+        }
+        (Some(_), false) => {
+            return Err(Error::Profile(
+                "the JSON carries Rapid Tap and schema a has no Rapid Tap block".to_string(),
+            ));
+        }
+        (None, false) => {}
+    }
+
+    if let Some(note) = &profile.macro_note {
+        return Err(Error::Profile(format!(
+            "the macro block did not parse ({note}), so its bytes cannot be written back"
+        )));
+    }
+    if profile.macro_data.offset != macro_offset || profile.macro_data.len != MACRO_DATA_LEN {
+        return Err(Error::Profile(format!(
+            "macro block is described at offset {} as {} bytes, this schema puts it at offset {macro_offset} as {MACRO_DATA_LEN} bytes",
+            profile.macro_data.offset, profile.macro_data.len
+        )));
+    }
+    let mut written = 0usize;
+    for record in &profile.macros {
+        let raw = parse_hex(
+            &record.raw,
+            &format!("macro record at {}", record.offset),
+            record.record_bytes,
+        )?;
+        let at = record.offset;
+        if at < macro_offset || at + raw.len() > macro_offset + MACRO_DATA_LEN {
+            return Err(Error::Profile(format!(
+                "macro record at {at} ({} bytes) is outside the macro block ({macro_offset}..)",
+                raw.len()
+            )));
+        }
+        if at < macro_offset + written {
+            return Err(Error::Profile(format!(
+                "macro record at {at} overlaps the record the list packed before it, so the list is not in payload order"
+            )));
+        }
+        data[at..at + raw.len()].copy_from_slice(&raw);
+        written = at + raw.len() - macro_offset;
+    }
+
+    data[guid_offset..guid_offset + GUID_LEN].copy_from_slice(&parse_hex(&profile.guid, "profile GUID", GUID_LEN)?);
+    if schema_b {
+        if !profile.guid_padding.is_empty() {
+            return Err(Error::Profile(
+                "schema b has no padding behind the GUID and the JSON carries some".to_string(),
+            ));
+        }
+    } else {
+        data[guid_offset + GUID_LEN..guid_offset + GUID_LEN + GUID_PADDING_LEN].copy_from_slice(&parse_hex(
+            &profile.guid_padding,
+            "GUID padding",
+            GUID_PADDING_LEN,
+        )?);
+    }
+
+    let crc_offset = checksum_offset(len);
+    let computed = compute_checksum(&data[..crc_offset]);
+    data[crc_offset..crc_offset + 4].copy_from_slice(&computed.to_le_bytes());
+    Ok(data)
+}
+
+/// Bytes where two payload images start to differ, `None` when they are equal.
+#[must_use]
+pub fn payload_diff(a: &[u8], b: &[u8]) -> Option<usize> {
+    if a.len() != b.len() {
+        return Some(a.len().min(b.len()));
+    }
+    a.iter().zip(b).position(|(x, y)| x != y)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1433,6 +1783,75 @@ mod tests {
         let computed = compute_checksum(&data[..crc_offset]);
         data[crc_offset..].copy_from_slice(&computed.to_le_bytes());
         data
+    }
+
+    /// The encoder is the inverse of the decoder: a decode report written back must give the same
+    /// bytes, on both schemas and with a macro block, an OLED block and Rapid Tap pairs behind it.
+    #[test]
+    fn encode_writes_back_a_decoded_payload_byte_for_byte() {
+        for schema in [SCHEMA_A, SCHEMA_B] {
+            let data = synthetic_payload(schema);
+            let profile = decode(&data).expect("the synthetic payload decodes");
+            let json = profile_json(&profile).expect("the decoded profile serializes");
+            let encoded = encode_json(&json).expect("the decode report encodes");
+            assert_eq!(
+                encoded.len(),
+                payload_len_for_schema(schema).unwrap(),
+                "schema 0x{schema:04X} encodes to its own payload length"
+            );
+            assert_eq!(encoded, data, "schema 0x{schema:04X} round-trips");
+        }
+    }
+
+    /// The last four bytes are always the checksum the encoder computes, never the stored word of
+    /// the report, so an image read with a wrong checksum encodes to a self-consistent payload.
+    #[test]
+    fn encode_recomputes_the_checksum_of_the_bytes_it_writes() {
+        let mut data = synthetic_payload(SCHEMA_B);
+        let crc_offset = checksum_offset(data.len());
+        data[crc_offset] ^= 0xFF;
+        let profile = decode(&data).expect("a payload with a wrong stored checksum still decodes");
+        assert!(!profile.crc_ok, "the stored word disagrees with the bytes");
+        let encoded = encode_json(&profile_json(&profile).expect("json")).expect("encodes");
+        assert_eq!(
+            payload_diff(&data, &encoded),
+            Some(crc_offset),
+            "only the checksum word changes"
+        );
+        assert!(decode(&encoded).expect("re-decode").crc_ok);
+    }
+
+    /// The decoder reports the macro block as a summary plus the records it could walk. A block it
+    /// could not walk has bytes behind that note, and writing the records alone would silently drop
+    /// them, so the encoder refuses the JSON.
+    #[test]
+    fn encode_refuses_a_macro_block_the_decoder_could_not_walk() {
+        let data = synthetic_payload(SCHEMA_B);
+        let profile = decode(&data).expect("decodes");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&profile_json(&profile).expect("json")).expect("valid JSON");
+        value["macro_note"] = json!("stopped at offset 2100");
+        let json = value.to_string();
+        let error = encode_json(&json).expect_err("a noted block is refused");
+        assert!(
+            error.to_string().contains("did not parse"),
+            "the reason names the decode note: {error}"
+        );
+    }
+
+    /// A table whose slots are not in payload order would write bindings into the wrong keys, so the
+    /// encoder checks the `offset` the report carries against the position it writes.
+    #[test]
+    fn encode_refuses_a_mapping_table_that_is_not_in_payload_order() {
+        let data = synthetic_payload(SCHEMA_B);
+        let mut value: serde_json::Value =
+            serde_json::from_str(&profile_json(&decode(&data).expect("decodes")).expect("json")).expect("valid JSON");
+        value["button_mappings"][1]["offset"] = json!(9);
+        let error = encode_json(&value.to_string()).expect_err("an out-of-order table is refused");
+        assert!(
+            error.to_string().contains("not in payload order"),
+            "the reason names the order: {error}"
+        );
     }
 
     #[test]
