@@ -89,7 +89,7 @@
 
 use crate::devices::hid_reports::{ONBOARD_GET_WIRE_BYTES, ONBOARD_MAX_READ_LEN, ONBOARD_OUTPUT_REPORT_SIZE};
 use crate::devices::keyboards::apex_pro_tkl_2023_profile::profile_checksum;
-use crate::devices::keyboards::onboard::OnboardProfileCodec;
+use crate::devices::keyboards::onboard::{OnboardDevice, OnboardProfileCodec};
 // Generic payload helpers live in the interface module since 2026-10-19; re-exported here because this
 // family's decode, encode and read path, and `src/main.rs`'s older call sites, name them through it.
 pub use crate::devices::keyboards::onboard::{hex_dump, hex_of, image_diff, payload_diff, schema_of};
@@ -405,6 +405,9 @@ pub struct ProfileImage {
     /// Firmware version the read's `90 00` poll answered with (`None` when the poll was refused or the
     /// keyboard answered nothing: the version is informational, the read does not depend on it).
     pub firmware: Option<String>,
+    /// The keyboard the read ran on (vendor and product ID plus the model name this crate lists for
+    /// the product ID). `None` only for an image built without a device.
+    pub device: Option<OnboardDevice>,
 }
 
 impl ProfileImage {
@@ -496,6 +499,7 @@ impl ProfileImage {
             chunks,
             data,
             firmware: None,
+            device: None,
         })
     }
 
@@ -926,6 +930,11 @@ pub struct OnboardProfile {
     pub crc_ok: bool,
     /// Length of the checksummed prefix.
     pub crc_region_len: usize,
+    /// The keyboard these bytes were read from, recorded by a read (see [`OnboardDevice`]). `None` for
+    /// a decode of a file: the file names no keyboard. Absent from the JSON when `None`, so a report
+    /// from before this field existed reads unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device: Option<OnboardDevice>,
 }
 
 /// Layout of the decoded blocks.
@@ -1054,6 +1063,27 @@ pub fn offset_to_hid(offset: usize) -> Option<u8> {
 pub fn hid_to_offset(hid: u8) -> Option<usize> {
     let slot = HID_TO_OFFSET[usize::from(hid)];
     if slot == 0xFF { None } else { Some(usize::from(slot)) }
+}
+
+/// GG's Meta cap: HID usage `0x65`, electrically the Application/Select keystroke. The table has no
+/// slot under it - no profile key is named Meta - and GG binds it through [`META_KEY_GG_CODE`].
+pub const META_KEY_USAGE: u8 = 0x65;
+/// The code GG carries the Meta cap on: slot [`META_KEY_SLOT`] is the only slot whose own table code
+/// is this, and GG's factory base layer binds it to itself (`51 F0 00 00 00`). A user profile may
+/// rebind that slot - `some_rebounds.json` binds it to `0x65`, the Context Menu keystroke - while the
+/// profile keeps naming a different key as the META toggle.
+pub const META_KEY_GG_CODE: u8 = 0xF0;
+/// The slot GG carries the Meta cap on, found by code, not written as a literal.
+pub const META_KEY_SLOT: usize = 93;
+
+/// The slot GG carries the Meta cap on: the slot whose table code is [`META_KEY_GG_CODE`].
+/// `META_KEY_USAGE` itself has no slot ([`hid_to_offset`] returns `None` for it).
+///
+/// The Meta cap / slot / code identity is read-side evidence from the Apex 7 capture, not
+/// a protocol fact confirmed on hardware (`[EXPERIMENTAL]`).
+#[must_use]
+pub fn meta_key_offset() -> Option<usize> {
+    OFFSET_TO_HID.iter().position(|&code| code == META_KEY_GG_CODE)
 }
 
 /// Function selector names, for summaries only; `0x00` means the key is deactivated.
@@ -1230,6 +1260,8 @@ pub fn decode(data: &[u8]) -> Result<OnboardProfile> {
     ]);
 
     Ok(OnboardProfile {
+        // A decode of bytes names no keyboard; the read stamps this field from the device it ran on.
+        device: None,
         schema,
         schema_name: match schema {
             SCHEMA_A => "a".to_string(),
@@ -1334,6 +1366,7 @@ pub fn to_json(image: &ProfileImage) -> Result<String> {
         "schema": format!("0x{schema:04X}"),
         "schema_decoded": decoded,
         "firmware": image.firmware,
+        "device": image.device,
         "data_len": payload.len(),
         "sha_like_fnv1a_64": fnv1a_64(payload),
         "stats": image.stats,
@@ -1701,6 +1734,13 @@ impl OnboardProfileCodec for LegacyApexOnboard {
         "legacy Apex (Apex 7, Apex Raw, Apex 2014)"
     }
 
+    /// The product IDs this protocol was reverse-engineered on (`Apex7::onboard_family`): the four
+    /// boards of the legacy platform. Every other product ID needs its family's codec, its own payload
+    /// layout and its own encodable feature set.
+    fn knows_product(&self, product_id: u16) -> bool {
+        crate::devices::keyboards::apex7::onboard_family(product_id)
+    }
+
     fn config_count(&self) -> u8 {
         MAX_PROFILE_INDEX + 1
     }
@@ -1799,6 +1839,20 @@ fn banner_lines() -> Vec<String> {
 fn image_lines(image: &ProfileImage, label: &str) -> Vec<String> {
     let mut lines = vec![
         format!("read {} profile bytes from {label}", image.data.len()),
+        match image.device.as_ref() {
+            Some(device) => format!(
+                "device:  {}{known} (vendor {:04X}, product {:04X})",
+                device.product,
+                device.vendor_id,
+                device.product_id,
+                known = if device.known {
+                    String::new()
+                } else {
+                    " - product ID not in this crate's registry".to_string()
+                },
+            ),
+            None => "device:  not recorded".to_string(),
+        },
         match image.firmware.as_deref() {
             Some(firmware) => format!("firmware:  {firmware} (answered the 0x90 firmware poll)"),
             None => "firmware:  no answer to the 0x90 firmware poll".to_string(),
@@ -1828,6 +1882,13 @@ fn profile_lines(profile: &OnboardProfile) -> Vec<String> {
     }
 
     let mut lines = vec![
+        match profile.device.as_ref() {
+            Some(device) => format!(
+                "device:  {} (vendor {:04X}, product {:04X})",
+                device.product, device.vendor_id, device.product_id
+            ),
+            None => "device:  not recorded (decoded from a file, which names no keyboard)".to_string(),
+        },
         format!("schema: {} (0x{:04X})", profile.schema_name, profile.schema),
         format!(
             "checksum: stored {:08X}, computed {:08X} over the {}-byte payload (offsets 0..{}), match: {}",
@@ -3059,6 +3120,64 @@ mod tests {
         assert!(
             note.as_ref().is_some_and(|n| n.contains("press action runs past")),
             "{note:?}"
+        );
+    }
+
+    /// A profile file names no keyboard, a read names the one it ran on, and the encoder ignores the
+    /// block: the layout, the encodable fields and the feature set are per device, so the JSON has to
+    /// carry the product ID and the encoder must not be moved by it.
+    #[test]
+    fn a_stamped_device_is_metadata_the_encoder_ignores() {
+        let data = synthetic_payload(SCHEMA_B);
+        let profile = decode(&data).expect("the synthetic payload decodes");
+        let plain = profile_json(&profile).expect("the decode report serializes");
+        assert!(
+            !plain.contains("\"device\""),
+            "a decode of bytes writes no device block: it names no keyboard"
+        );
+
+        let mut stamped = profile.clone();
+        stamped.device = Some(OnboardDevice {
+            vendor_id: crate::devices::STEELSERIES_VENDOR_ID,
+            product_id: crate::devices::product_ids::APEX_7,
+            product: crate::devices::device_name_from_product_id(crate::devices::product_ids::APEX_7).to_string(),
+            known: crate::devices::known_product_id(crate::devices::product_ids::APEX_7),
+        });
+        let text = profile_json(&stamped).expect("the stamped report serializes");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("the stamped report parses");
+        let keys = value["device"]
+            .as_object()
+            .map(|object| object.keys().cloned().collect::<Vec<_>>());
+        assert_eq!(
+            keys,
+            Some(vec![
+                "known".to_string(),
+                "product".to_string(),
+                "product_id".to_string(),
+                "vendor_id".to_string(),
+            ]),
+            "serde_json parses objects sorted"
+        );
+        assert_eq!(value["device"]["product_id"], serde_json::json!(0x1612));
+        assert_eq!(value["device"]["product"], serde_json::json!("Apex 7"));
+        assert_eq!(value["device"]["known"], serde_json::json!(true));
+        assert_eq!(
+            encode_json(&text).expect("a device block does not stop the encoder"),
+            data,
+            "the device block is metadata: the payload bytes are unchanged"
+        );
+    }
+
+    /// The read's record carries the same identity, and an image assembled without a device says so.
+    #[test]
+    fn the_read_record_carries_the_device_the_image_names() {
+        let image = ProfileImage::assemble(0, Vec::new()).expect("an empty assembly is valid");
+        assert!(image.device.is_none(), "assembled without a device");
+        assert!(
+            to_json(&image)
+                .expect("the record serializes")
+                .contains("\"device\": null"),
+            "the record states openly that no keyboard is recorded"
         );
     }
 }

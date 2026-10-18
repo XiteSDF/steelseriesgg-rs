@@ -18,9 +18,17 @@ with its `FirmwareSource` byte, `OnboardDriverModeCommand`, `OnboardLoadProfileC
 `apex_legacy_onboard` module these lived in was folded into `Apex7` on 2026-10-18) - the packet I/O is
 `GenericKeyboard`'s own profile transfers on the handle it owns
 (`write_profile_packet` for output frames - not `send_report`, whose write dedups: see "Write path" below -
-`send_feature`, `read_profile_feature_packet`, `read_profile_input_packet`), `ssgg onboard` (`src/cli.rs`, `src/main.rs`). Discovery builds `Apex7` for the family
+`send_feature`, `read_profile_feature_packet`, `read_profile_input_packet`), `ssgg onboard` (`src/cli.rs`, `src/main.rs`), and the interfaces the CLI runs on: `src/devices/keyboards/onboard.rs` (2026-10-19). Discovery builds `Apex7` for the family
 (the device class is part of the device tree); the read path
 (transport, read plan, `Keyboard::read_onboard_profile`) is core code, labelled `[EXPERIMENTAL]`, as are the report builders.
+
+The interfaces (2026-10-19) are per keyboard family: `Keyboard::onboard_codec` answers *which family protocol a
+keyboard speaks* (`Apex7` answers with `apex_legacy_profile::LegacyApexOnboard`, every other keyboard `None`),
+`Keyboard::read_onboard_profile` pulls a slot on the keyboard's handle, and `OnboardProfileCodec` is the family's
+device-free codec - decode, encode, report JSON, dump names, the `Config 1..5` numbering, and the text a read
+prints. `DeviceManager::open_onboard_keyboard` selects a keyboard that answers it, and `src/main.rs` names no family
+module: what moved out of it is the device selection by Apex 7 product ID, the read's print text, the dump file-name
+rule and the config-number rule. Nothing on the wire changed - same frames, same geometry, same output text.
 
 The framing below is decoded from the capture's URBs (engine capture 2, parsed packet by packet: the 8-byte
 setup block of every control transfer plus its data stage), not from the decoded response listing. The CSV holds only
@@ -35,7 +43,7 @@ traffic; the counts below are from that file. On the Linux box used for the hard
 (same keyboard family, firmware `2.4.3`) the collection that accepts the same frames is
 `the hidraw node`, usage page `0xFFC1`, interface 4, `max_report_size 644`, `max_input_report 1024`,
 `max_output_report 64`. `/dev/hidrawN` numbers are not enumeration order. Since 2026-10-17 the read runs on the collection the
-device manager opened for the keyboard (the handle `Apex7` owns), selected by `vid:pid`, not by node path
+device manager opened for the keyboard (the handle `Apex7` owns), selected by product ID (`--device <pid>`, hex; every SteelSeries device shares the vendor ID, so the product ID identifies it), not by node path
 and not by an interface-1 preference: the device manager picks a vendor-defined collection by usage page
 (`keyboards/mod.rs`, `find_best_device_info`), which on the 2026-10-15 box landed on interface 4 - the
 collection that accepted the frames there. **Open**: if a box needs interface 1 (the `wIndex 1` of every
@@ -62,13 +70,17 @@ feature-report write for the read request.
 Counts in the engine capture 2 for the profile collection (interface 1): 385 `SET_REPORT wValue 0x0300
 wLength 642` transfers (241 read requests, 144 payload writes), 241 `GET_REPORT wValue 0x0300
 wLength 642` transfers (the answers), 230 `SET_REPORT wValue 0x0200 wLength 64` transfers, 12 of the
-pull shape on `wIndex 0`. The 230 split by leading byte: 121 pulls (`85`), 72 lighting frames (`05`),
+pull shape on `wIndex 0`. The 230 split by leading byte: 121 pulls (`85`), 72 push frames (`05`, §Push: the pull frame with the direction bit swapped),
 10 `6e`, 6 `68`, 6 `6a`, 4 `90`, 3 `89`, 3 `41`, 2 `69`, 1 `f4`, 1 `6c`, 1 `ff`. The four `90` frames,
 the `f4` and the `6c` are the opening chain (see "Procedure"). The capture contains **no** 13-byte
 transfer: an earlier version of this document described a 13-byte "pacing frame" with
 `01 00 00 …`; it is a misreading of the capture's text export (see "Reply framing"), and
 no such transfer exists on the wire. The words `f4 01 60 00` do appear on the wire, as `f4 00`-family
 frames zero-padded to 64 bytes.
+
+Decoded 2026-10-19 from the same file's control-endpoint SETUP records plus their data fragments, the 72
+`0x05` frames are one shape: `05 00 | fs_id u16 | file offset u32 | size u16` with `fs_id 0x0102`, offsets
+`0x0, 0x400, …, 0x2C00` and size 1024 - 12 chunks per run, 6 runs, 12,288 bytes declared per run. See §Push.
 
 The engine's tail after a profile transfer is three output reports: `69` (Gamesense OLED off), `89 <profile>`
 (deploy that profile) and `41 00` (profile not volatile); the engine sleeps 250 ms behind the deploy frame.
@@ -119,7 +131,15 @@ write output report 0, 64 bytes: 69 00 …  89 (slot+1) 00 …  41 00 00 …  6c
 ```
 
 12 pulls of 1024 bytes cover 12288 bytes, enough for the 11648-byte schema A payload and the
-11696-byte schema B payload. A schema-only read is the opening chain, one 2-byte pull of the file head
+11696-byte schema B payload. **`ssgg onboard read` pulls 40 fills, not 12** (2026-10-19,
+`PULLS_PER_FILE = 40`): file offsets `0..=0x9C00`, so the assembled image is 40,960 bytes and the
+29,264 bytes behind the payload are kept. The extra 28 pulls are GG's **write** reach - its pushes
+declare offsets up to `0x9C00` - and the point of pulling them is the open question of whether the
+board stores more macro data past the 12,288 bytes its read walks. Nothing decodes that region: the
+decode report records it as `payload_len`, `extra_len` and `extra_fnv1a_64`, the read's record prints
+it as `region:`, and `--bin` writes the payload while the region goes to `<out>.extra.bin`. The
+reference reads have only device-buffer content behind the payload (zeros; 80 bytes of `FF` behind
+slot 3), and the 28 extra pulls per file have **not been run on hardware**. A schema-only read is the opening chain, one 2-byte pull of the file head
 and one 2-byte read (GG's own probe, kept in the transfer map). `ssgg onboard read` runs that pair as the
 first step of every read (`Apex7::probe_schema`: 2-byte pull at file offset 0, then one window read at
 buffer offset 0) and **stops the read when the schema word is not `0x000B`** - schema B is what the decoder
@@ -134,6 +154,20 @@ per chunk from the typed commands, nothing materialises a transfer list (`Step`,
 2026-10-17). What it writes: `-o/--out` is the decoded profile JSON, byte-for-byte the report `decode`
 writes for the same image (the format `tools/profile-gui` opens); `--report FILE` adds the per-pull read
 record (chunk headers, framing stats, image hash) and `--bin FILE` the raw image bytes.
+
+The decoded report names the keyboard it came from in its `device` block (`vendor_id`, `product_id`,
+`product`, `known`): a read stamps the product ID it ran on, a decode of a file records nothing. The GUI
+shows a model **name** for that number, and takes it from Rust rather than from the file:
+`tools/profile-gui/sync-products.mjs` parses `pub mod product_ids`, `device_name_from_product_id` and
+`device_type_from_product_id` (`src/devices/mod.rs`), `onboard_family` (`apex7.rs`) and the `codecs()`
+registry (`onboard.rs`) into `tools/profile-gui/products.generated.js`, which `index.html` loads before
+`app.js` (2026-10-19). The registry's name for the recorded ID wins over the `product` string the file
+carries - the crate's own rule, trust the number and not the name - and the same import carries the
+per-model feature set the page prints: the device kind, and membership of the family this payload layout
+was read back on, which is the set its encodings apply to. A model outside that family is labelled as
+needing its own layout, encoder and feature set, which is the point of recording the product ID at all.
+`node tools/profile-gui/sync-products.mjs --check` fails when Rust moved and the generated file did not,
+and `selftest.mjs` runs it as a check.
 The profile slot is the only run-time choice. The geometry (25 pulls of 1024, 5 reads of 636), the pacing
 ([`GG_GAP_MS`]), the firmware poll (one `90 00`) and the reply framing
 ([`READ_REPLY_FRAMING_LEN`], 0 = the offset the capture's replies show) are constants:
@@ -159,17 +193,64 @@ Block layout, in the order the Windows engine's decoder walks the payload:
 | 0 | schema word (u16) | confirmed |
 | 2 | profile name, 24 bytes | engine decoder |
 | 27 | lighting block, 57 bytes (lock/meta/win colours, dimmers, idle mode and timeout, three lock-key HID codes, OLED illumination options, 6 trailing reserved bytes) | engine decoder, layout `[EXPERIMENTAL]` |
-| 84 | META toggle HID code | engine decoder |
+| 84 | META toggle HID code | engine decoder, measured value in every read decoded so far: `0xF0` - see §The META toggle is a byte and a binding |
 | 85 | 128 button mappings, **5-byte** entries (`key_mapping`: function byte + 4 key codes) | engine struct, verified on hardware |
 | 725 | 2 wheel mappings, 5-byte entries | engine struct |
 | 735 | 128 button META mappings, 5-byte entries | engine struct, verified on hardware |
 | 1375 | 2 wheel META mappings, 5-byte entries | engine struct |
 | 1385 | OLED pixel block, 640 bytes (`oled_settings: bytearray (size 640)`) | engine struct, verified on hardware |
 | 2025 / 2026 | Rapid Tap (schema B only): 1 enable byte + 10 **5-byte** `onboard_rapid_tap_pair` (`hid1`, `hid2`, `mode`, 2 reserved bytes) | engine struct, verified on hardware |
-| 2025 / 2076 | macro data, 9600 bytes (`uint16` count + bytes) (schema A / schema B) | engine struct, verified on hardware |
+| 2025 / 2076 | macro data, 9600 bytes (`uint16` count + bytes) (schema A / schema B). `2025` is the **length word** (2210) of the packed **macro record list** the block holds - see §The macro block is a packed record list | engine struct, verified on hardware |
 | 11625 / 11676 | profile GUID, 16 bytes (schema A / schema B) | engine struct, verified on hardware |
 | 11641 | 3 padding bytes (schema A only - schema B has none) | engine struct |
 | 11644 / 11692 | checksum (u32 LE) = payload length − 4 | **verified on hardware 2026-10-18** (`AE57B9DC`) |
+
+### The META toggle is a byte and a binding (measured 2026-10-19) `[EXPERIMENTAL]`
+
+Payload offset 84 (`meta_toggle_hid`) is one byte naming the key GG switches META mode with. The
+binding GG marks a slot with lives in the META-layer table: `function 0x62` with **code 1 = 0x05**.
+The reads decoded so far carry the pair the same way:
+
+| file | byte 84 | the META entry marked `62 / 05` | that slot's base entry |
+|------|---------|--------------------------------|----------------------|
+| `config_3.bin` (stock, firmware 4.16.3) | `0xF0` | slot 13 = `62 05 00 00 00`, usage `0xE3` (LWin) | slot 13 = `51 E3 00 00 00` (LWin bound to itself) |
+| the remapped slot, the macro slot (same family) | `0xF0` | slot 13 = `62 05 00 00 00` | slot 13 = `51 E3 00 00 00` |
+| `apex_pro_tkl_2023` `some_rebounds.json` | `0x10` (the M key) | slot 13 = LWin and slot 35 = PrtSc, both `62 05 00 00 00` | slot 93 = `51 65 00 00 00` (GG's Meta slot rebound to `0x65`) |
+
+Four facts come off that:
+
+- **`0xF0` is GG's code for the Meta cap, and the cap binds through slot 93.** The cap is the HID usage
+  `0x65` (electrically the Application/Select keystroke), and `hid_to_offset(0x65)` is `None` - the
+  embedded legacy table has `-1` at 0x65, so no profile key is named Meta. The slot GG carries the cap
+  on is the slot whose own table code is `0xF0`: slot 93 (`apex_legacy_profile::meta_key_offset`, the
+  code the page's usage table calls `Fn F0`), which a stock read binds to itself (`51 F0 00 00 00`).
+  The user profile above binds slot 93 to `0x65` - the cap types the Context Menu - while its byte
+  names the M key, so the cap's binding, the slot and the byte are three separable things. Every other
+  key the byte names is named by its own usage.
+- **`0x05` at code 1 is the toggle's marker, not a general "is bound" byte.** The five `0x62` entries
+  of a stock META layer write `01`, `02`, `03`, `04` at code 1 on GG's four defaults and `05` **only**
+  on the slot the byte names, and no read decoded so far carries a `0x62` entry on the base layer at
+  all - so a binding write marks the toggle by writing `62` with code 1 = `05`, and nothing in these
+  reads supports writing `05` anywhere else.
+- **The rest of the META layer's `0x62` entries are GG's own defaults**, not the toggle: slots 72, 80,
+  88 and 96 (usages `0x42`-`0x45` = F9-F12) carry `01 00 00 00`, `02 01 00 00`, `03 01 00 00`,
+  `04 01 00 00`. That is why a stock slot read classifies as `meta: 6 custom` - the toggle slot plus
+  the four defaults, none of them self-bound.
+- **The byte and the marker can name different keys, so the byte is the binding.** The stock reads mark
+  slot 13 and name the cap (`0xF0`); the user profile marks slots 13 and 35 and names the M key
+  (`0x10`), whose own base and META entries are plain self-bindings (`51 10 00 00 00`) with no
+  `0x62 / 05` marker. A stock META layer has no `0x62` entry bound on the *base* layer at all, so the
+  base-layer `0x62` with code 1 = `05` is the binding this page writes and the META-layer marker is
+  GG's own note, which the page shows and leaves alone.
+
+No write path is measured. `tools/profile-gui` writes the byte and the binding: the Meta action select
+of a key bound `0x62` (and any base-layer key, which the page fills with GG's factory `0x62` binding)
+offers `Meta Toggle (0x05) - make this key the META toggle`, which writes `62 05 00 00 00` on the base
+layer and moves `meta_toggle_hid` to that key's code. The option is not offered on the META layer - a
+stock META layer has no `0x62` entry bound on the base layer, and GG's marker slots are shown as the
+file has them - nor on a wheel entry, because GG switches a layer with a key. The Meta cap edits
+through slot 93, so it rebinds like any other key and keeps the byte. See
+`tools/profile-gui/README.md`, §The META toggle.
 
 ### The OLED block is the picture GG shows (measured 2026-10-19)
 
@@ -184,11 +265,90 @@ the JSON next to the block.
 The engine also serves the profile picture on `http://localhost:27304/screenshots/<id>.bmp`, and
 that screenshot contains the same 128x40 bitmap GG drew, which is why the block is the picture.
 
-`fnv1a_64` is **not** FNV-1a-64 of `bytes_hex`. In all three reference dumps the recorded field
-and the hash recomputed over the block share their low 32 bits and differ in the high half — the
-shape a running hash over a longer prefix of the payload leaves behind (the engine's FNV helper
-is fed the block in place, not on its own). `ssgg`'s JSON keeps the recorded field as the
-decoder produced it; the profile GUI shows both values and says plainly when they differ.
+Two fields carry the name `fnv1a_64`, and they use the same hash with **two different inputs**.
+The variant is the point: `lisp/base_apex_legacy.lisp:343` (`:356` for the wireless struct) uses
+`(fnv1a-64 (sha-256 (…))))`, and its FNV **prime literal is one byte short** - `#x10000000_01b3`
+= `0x1000000001b3`, where FNV-1a-64 needs `0x100000001b3`; the offset basis is the correct
+`0xcbf29ce484222325`.
+
+- **GG's block tag** (`0x59e9c7338286e654` for the 12,500-byte payload in the device-offset table,
+  written in `docs/development/apex-7-ggpkg-format.md`) runs the variant over the **hex string of
+  the SHA-256 digest** - the 64 ASCII characters, not the 32 digest bytes. `profile.py` agrees on
+  the SHA-256 step. Rebuilding that combination reproduces the recorded tag exactly; hashing the
+  raw digest bytes instead gives a different value.
+- **This decoder's summary fields** (`oled.fnv1a_64`, `macro_data.fnv1a_64`) run the same variant
+  over the **block's own bytes**, no digest in between: the 640 OLED bytes of a stock slot read
+  hash to `ED411A7750D88E1B`, which is what the JSON records, and 9600 zero bytes hash to
+  `083B452CD5075125`, the value a macro-less read records. Measured 2026-10-19; pinned by
+  `tools/profile-gui/selftest.mjs`, which recomputes both and asserts they match.
+
+Because the two primes agree in the low 32 bits and differ only above them, the published-prime
+variant agrees with the stored field in its last 8 hex digits - an earlier revision of the profile
+GUI hashed with the published prime and reported the decoder's field as inconsistent with the
+bytes next to it. The GUI now uses the engine variant and calls out a stored field only when it
+disagrees. Nothing here is a parity test: the read image is compared against GG's own image, not
+against these fields.
+
+### The macro block is a packed record list (measured 2026-10-19) `[EXPERIMENTAL]`
+
+The block (9600 bytes at 2076, schema B) holds a **packed list of macro records with no stride and
+no length word**: in the reference read 97 bytes are non-zero, they form a 136-byte record stream at
+**2076..2211**, and the block is zero-padded behind it. The engine comment "uint16 length of the
+macro data" (`apex_7.lisp`) describes its in-memory struct, not a word in the payload: bytes
+2020..2075 of this profile are all zero (Rapid Tap off, its ten pairs empty), so nothing in the
+region declares a length. `ssgg` walks the actions and stops at the zero pad.
+
+A record is its header plus its actions, and the next record begins at the next `0x77` byte:
+
+| field | bytes | the two records of the reference read |
+|-------|-------|-----------------------------------|
+| marker | 1 | `0x77` on both. The engine's `macro_function` is `0x71` (the mapping function byte, see below), so why the record header carries `0x77` is **open** |
+| `mode` | 1 | `4` on record 0 = GG's "Repeat every (time interval)"; `1` on record 1 = "Play once" |
+| `id` | u16 LE | 3 and 27 - GG's macro id (the engine's own counter is `+id 1`) |
+| `flags` | u16 LE | `0x0101` on both - named "repeats" in `apex_7.lisp`, meaning open |
+| `interval_ms` | u16 LE | 5000 on the repeat record (matches GG's "every 5000 ms"), 15 on the once record |
+| actions | — | record 0 fills 20 bytes total, record 1 fills 116 and starts at 2096 |
+
+Actions are typed by their first byte with the length the engine states
+(`lisp/base_apex_legacy.lisp:602-625`: a press is 8 bytes, a release 4, a delay 4):
+
+| action | bytes | reading |
+|--------|-------|---------|
+| press | `02 <key u8> 01 01 <word u16 LE> <ms u16 LE>` | engine `(macro-action-press (ord 2) (length 8))`; `word` is 4 in every press seen, unexplained |
+| release | `02 <key u8> 01 00` | engine `(macro-action-release (ord 2) (length 4))` |
+| delay | `04 00 <ms u16 LE>` | engine `(macro-action-delay (ord 4) (length 4))` |
+| random delay | not seen | the engine draws in `[ms, ms+19]` (`:619`); the wire byte is unknown |
+
+`<key>` is the **HID code** of the key: record 1 presses `0x55` = `Ke *`, then `0x5A` = `Ke 2` five
+times, then `0x62` = `Ke 0`, 15 ms apart. Record 0's whole key list is the `4` key - GG's macro on
+this keyboard presses `4` for 1 ms, releases it, and repeats every 5000 ms.
+
+**The index a `0x71` binding names is its third code byte.** `apex_7.lisp:415` reads
+`(key-code 2) == macro id`; META+Insert - the key GG shows bound to the macro - is `71 00 00 00 00`,
+index **0**, and that is record 0, the every-5000 ms press of `4`. (The engine's comment
+`base_apex_legacy.lisp:378`, "0x71 macro: (,ord ,id)", is stale: the byte carries an **index**, not
+GG's id, which is 3 here.) **The index is 7 times the record's position** - measured 2026-10-19 on a
+user's own Config 1 read (`some_rebounds.json`: 5 records at 2104, 14 bindings, no device involved):
+the base keys C, V, X carry indices **0, 7, 14** and bind records 0, 1, 2, whose decoded content is
+`press LCtrl, 20 ms, tap C/V/X, release LCtrl` - the user's description of that profile is "12 keys
+(C, V, X) bound to the macro list indices, aka 0, 7, 14". So a key binds record *n* with any index in
+`7n .. 7n+6`, the record an index names is `floor(index / 7)` (`MACRO_INDEX_STRIDE`), and the same
+read's meta keys at 21 and 25 both land on record 3 and at 28 and 33 on record 4. That is also what
+the reference read's META+Home (`0x4A`, `71 00 05 00 00`, index **5**) means: 5 is in the group of
+indices 0..6, so it binds the **same** record as META+Insert - GG shows one macro on that keyboard,
+and the two keys share it. An index is a **deleted macro** only when its ordinal `floor(index / 7)` is
+past the list: in the user's read 38, 43, 46, 63, 92, 96, 117 have ordinals 5, 6, 9, 13, 16 against 5
+records - the bindings of macros GG deleted, left on the keys. The factor 7 is measured from that
+profile's indices against its records' content; *why* 7 (and not, say, the number of code bytes) is
+open. So `ssgg` writes `macro_index` (the raw byte) and `ordinal` on every record, and the profile GUI
+resolves a binding by floor division and writes `7 x position` when a binding is chosen from the list.
+
+What the JSON carries: `macros[]` with `index` (the binding index of the group, `7 x ordinal`), `ordinal`
+(the position in the packed list), `offset`, `mode`, `mode_name`, `id`, `flags`,
+`interval_ms`, `record_bytes`, `action_count`, `actions[]` (`kind`, `key`, `word`, `ms`) and `raw`
+(the record's own bytes, for comparing with a capture); `macro_index` on the `0x71` entries;
+`macro_note` when a block does not pack cleanly. `macro_data` stays the summary block (offset, len,
+nonzero, FNV, head).
 
 GG's `device-offset-lookup-table` (`lisp/base_apex_legacy.lisp`) maps a key's HID usage to its slot in
 these tables: 120 of the 128 slots, `0xFF` for the 8 slots this device has no key for. Slots 120-127
@@ -199,10 +359,51 @@ belong to the `0xF1..0xF8` function codes - the media cluster - and carry the sh
 itself - and the 12 remaining slots are all zero, which is what GG writes for a key the profile does not
 bind. Only the 4 media-cluster slots hold anything else, and the META layer holds the shipped shortcuts
 (`0x62` meta, `0x71` macro, and combos such as `RAlt+RCtrl+RShift+Esc` on META+M). `decode` reports each
-entry as `binding: "self" | "none" | "custom"`, and the profile summary counts only `custom`.
+entry as `binding: "self" | "none" | "custom"`, and the profile summary counts only `custom`. For a
+`0x71` entry the four code bytes are **not** key codes: they carry the macro record index, and
+`decode` prints `macro: <index>` in its binding line (see §The macro block is a packed record
+list).
 
 Rapid Tap mode nibbles belong to the pairs, not to the mappings: `0x80` report key 1 only, `0x08` key 2,
 `0x04` key 3 (mode 3 = report keys 1 and 2).
+
+## Encode: the decoder run backwards (2026-10-19, software only) `[EXPERIMENTAL]`
+
+`encode_json` (`src/devices/keyboards/apex_legacy_profile.rs`) takes a decode report and writes payload
+bytes: the schema word, the name bytes, the lighting block, the META toggle key, the four mapping tables,
+the OLED pixels, the Rapid Tap pairs, the packed macro records, the GUID and its padding, and last the
+checksum it computes over the prefix - the report's stored word is never copied. Geometry comes from the
+same layout table the decoder reads, so a report that describes a block where this schema does not put it
+is refused, as is a macro block carrying a decode note (the bytes behind a note are not in the report, so
+writing the records alone would drop them), a mapping table whose `offset` fields are not in payload
+order, Rapid Tap on schema `a` or missing on schema `b`, and any hex field of the wrong length. The zero
+pad the reference reads carry behind the name, behind the mapping tables and in the rest of the macro
+block is written as zeros, because that is what the reads have there.
+
+Verified on the 2026-10-18 images in this repo (schema `b`, 11,696-byte payload): `decode` -> JSON ->
+`encode_json` gives back the 11,696 payload bytes **byte for byte** for `config_1.bin`, `config_1_2.bin`
+and `config_3.bin`, `config_1.json` included with its two macro records (58, 56 and 94 raw bytes:
+`onboard write` will send them unchanged). Those files are 12,288-byte read windows from the 12-pull read:
+the 592 bytes behind the payload are device buffer content, not profile bytes - 80 bytes of `FF` then zeros
+behind slot 3, all zeros behind slot 1 - which is why the check compares the payload and says what the tail
+is. Since 2026-10-19 a read's `--bin` is exactly the 11,696-byte payload and the region behind it (the read
+pulls 40,960 bytes) is written to a side file `<out>.extra.bin`, so a `--check` against a current read
+image is payload against payload. Unit tests
+(`encode_writes_back_a_decoded_payload_byte_for_byte` and friends) do the same round trip on the synthetic
+payloads of both schemas, and cover the refusals.
+
+CLI:
+
+```
+ssgg onboard encode config_3.json -o config_3.enc.bin --check config_3.bin
+```
+
+prints the summary of the bytes it wrote (the encoded bytes are read back through `decode` first, so the
+line reports what the file says, not what the JSON claimed), the output path, and the check result.
+
+**No byte from this path has ever been sent to a keyboard**, and the write path that will use it is not
+implemented (§Write path, §Safety): encode inherits the `[EXPERIMENTAL]` status of every offset, stride
+and field width it writes.
 
 ## Reply framing (measured; the anchor is a constant, not a flag)
 
@@ -260,7 +461,7 @@ A pull has **no reply with content**. Three independent lines of evidence:
 2. **Endpoint level of the engine session capture** (the engine's own session, 121 pulls): **121 of 121 pulls are followed,
    1.7-3.7 ms later, by report `0x01`, 63 bytes, every byte zero** - the ordinary input report of an idle
    keyboard. No pull is followed by a report `0x85`, `0x83` or any pull-specific frame; all 72 `0x05`
-   lighting pushes of the write runs behave the same way. The only command answers on the interrupt endpoint
+   push frames of the write runs behave the same way (§Push). The only command answers on the interrupt endpoint
    in the whole capture are report `0x2e` (ASCII firmware version `.16.8`, the answers of the `90` polls)
    and report `0x34` (ASCII serial `464233229222200029`); the all-zero `0x01` stream fills the rest (1649
    reports, median gap 14 ms = the keyboard's own poll interval).
@@ -292,6 +493,31 @@ Timing at that level: a pull is answered in **1.7-3.7 ms**; a read request is an
 interleaved) takes **1.8 s**, i.e. about 15 ms per chunk - its 11 ms pacing plus transfer latency. The kit
 summary's "about 2 s per chunk" is a pairing artifact: it pairs the 42 `0x85` pulls of the write runs with
 the 144 `0x03` payload writes spread over the whole session.
+
+## Push: `0x05` is the pull frame with the direction bit swapped (measured 2026-10-19) `[EXPERIMENTAL]`
+
+The operator's Windows write capture (GG writing a profile through this toolchain) showed the
+write side of the same pair: GG's writes run as `0x05` frames until the paired command of an
+`OnboardPull`-shaped transfer has reached file offset `0x9C`, i.e. `0x9C00`, where the read
+stops at `0x2C00`, and the frame is **byte-identical to the pull with bit 7 of the command byte cleared**:
+
+```
+85 00 | fs_id u16 | file offset u32 | size u16     # pull: fill the resource buffer, read it back with 0x83
+05 00 | fs_id u16 | file offset u16->u32 | size u16  # push: declare the bytes GG then writes into the buffer
+```
+
+Re-decoded the same day from the capture, the 72 `0x05` frames are exactly that shape
+(`fs_id 0x0102`, offsets `0x0..0x2C00` in 1024-byte steps, size 1024, 12 chunks per run, 6 runs; the 2026-10-19
+capture carries 250 pushes reaching `0x9C00`). A push is paced like a pull: the packet after it is the
+keyboard's ordinary all-zero input report, no push-specific reply. The declared bytes themselves travel in
+the report `03 00 <buffer offset u16> <size u16> <payload>` 642-byte feature writes.
+
+What this settles: the `0x05` frame layout is **measured**, not guessed (`CMD_PUSH_PAYLOAD` is named in
+`apex_legacy_profile.rs`, and the `0x85` command builder in `hid_reports` takes the same three fields).
+What it does not settle: **`fs_id 0x0102` is a file no read pulls** (the read walks profile files
+`0x0201..0x0205` and lighting files `0x0301..0x0305`), so which file GG writes with `0x05`, and what a
+push is answered by on the device, are open. Nothing in `ssgg` sends `0x05`, no push byte has been
+replayed on hardware, and there is still no read-back for an on-board write (§Safety).
 
 ## Write path: `write_profile_packet`, not `send_report` (measured in source, 2026-10-18)
 
@@ -388,14 +614,25 @@ was dropped) - it is reverse-engineered protocol code, but it writes request fra
 nothing on the keyboard; `decode` never touches a device. Both write the JSON decode report by default,
 named from the profile name the image carries (`Config 1` -> `config_1.json`, and GG's config number when
 a slot carries no name); `--bin FILE` writes the raw image and `--hex` hex-dumps it. `--profile` takes
-GG's config number `1..5` and addresses slot `N - 1`, the file `0x020N`.
+GG's config number `1..5` and addresses slot `N - 1`, the file `0x020N`. `encode` (2026-10-19,
+§Encode) writes bytes to a **file** and touches no device, and nothing in ssgg sends encoded bytes: the
+write path is not implemented, so this section's prohibition on writing a profile payload stands.
 
 ## What is not settled
 
+- Whether a payload `encode` writes is accepted by a keyboard. The round trip is verified in software on
+  the 2026-10-18 images (§Encode); no encoded byte has been sent, and no code path can send one.
 - ~~Where this platform keeps the profile checksum.~~ Settled 2026-10-18: it is the last word of the
   *payload* (schema A at `11648-4`, schema B at `11696-4`), not of the 12288-byte read image - the image is
   padded with whole resource buffers behind the payload, and reading the image tail as the checksum is what
   made every CRC of the capture disagree.
+- What lives in the file region `0x2C00..0x9C00`. The read pulls it since 2026-10-19 and records it
+  (`extra_len`, `extra_fnv1a_64`, `region:` in the record, `<out>.extra.bin`), and nothing decodes it. The
+  reason it is pulled at all: GG's **writes** declare offsets to `0x9C00` (§Push) while its read walks 12
+  chunks, so the board may keep more macro storage than the 11,696-byte payload the decode walks. The
+  reference reads show device-buffer content there (zeros, 80 bytes of `FF` behind slot 3), which is
+  evidence for "nothing decodable", not a settled answer - and the 40-pull read has not been run on hardware.
+- Which file `fs_id 0x0102` is (the file GG's `0x05` pushes write, §Push), and what answers a push.
 - What `f4 00` and `6c 00 01` do. GG sends them in its opening chain, `f4 00` answers `00 01 00 …` and
   `6c 00 01` is not answered at all; meanings still unknown. **The chain is not needed: measured 2026-10-18,
   `ssgg onboard read` collects a profile slot without any of the six frames** (§Sequences the read does not
