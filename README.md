@@ -346,19 +346,21 @@ ssgg onboard decode /tmp/p0.bin
 ssgg onboard read --profile 1
 ```
 
-Both write the JSON decode report, and the default file name is the profile name the image carries:
-`Config 1` -> `config_1.json` in the current directory (`-o FILE` picks another, an unsaved slot with no
-name falls back to `profile_slot_N.json`). `--bin FILE` additionally writes the raw 12288-byte image, and
-`--hex` hex-dumps it (`decode --hex --hex-from N --hex-len M` for a window).
+Both write the decoded profile as JSON - `read` decodes the image it just pulled and writes the same report
+`decode` writes for it, which is the format `tools/profile-gui` opens. The default file name is the profile
+name the image carries: `Config 1` -> `config_1.json` in the current directory (`-o FILE` picks another, a
+slot with no name in the image falls back to `profile_config_N.json`). `--bin FILE` additionally writes the
+raw 12288-byte image, `--report FILE` the read record (`read` only: per-pull chunk headers, framing stats,
+image hash), and `--hex` hex-dumps the image (`decode --hex --hex-from N --hex-len M` for a window).
 
 On Linux the read needs write access to the keyboard's control-collection `/dev/hidraw` node (the udev
 rule in `assets/99-steelseries.rules` grants it to the `input` group).
 
 The read runs on the `Apex7` device handle when the target is an Apex 7 (or its family), and on the
 candidate collections when `--device /dev/hidrawN` names a node. `--debug` shows every transfer with the
-path it went to. The stats
-block of a read reports `garbage_reads`: pages whose first four bytes are `FF` are counted as unproven and
-stored as zeroes.
+path it went to. The read prints its transfer stats, and
+`--report` writes the same block as JSON; it reports `garbage_reads` - pages whose first four bytes are `FF`
+are counted as unproven and stored as zeroes.
 
 ## Configuration
 

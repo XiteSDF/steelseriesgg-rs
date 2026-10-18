@@ -23,14 +23,14 @@ selectable (`--profile 1..5`, GG's `Config 1` .. `Config 5`: `--profile N` reads
 GG pulls as `0x020N`); the geometry is compile-time constants. The 13-byte "pacing frame" earlier
 versions sent is not in the capture and was removed. GG's six-frame opening chain (`90 00`,
 `90 01`, `f4 00`, `6c 00 01`, `90 00`, `90 01`) was removed on 2026-10-17, restored on 2026-10-18 when a read
-with only the `90 00` poll answered with scrambled payload bytes, and **removed again on 2026-10-19: measured
+with only the `90 00` poll answered with scrambled payload bytes, and **removed again the same day: measured
 on hardware, the read collects a profile slot with no chain and no closing sequence, so ssgg sends neither**
-(§Known facts (2026-10-19, sequences the read does not need)). `f4 00` and `6c 00 01` have no known meaning.
+(§Known facts (2026-10-18, sequences the read does not need)). `f4 00` and `6c 00 01` have no known meaning.
 Every protocol byte in it is `[EXPERIMENTAL]`. **The read changes nothing on the keyboard**: it sends the
 firmware poll, the probe, the pulls and the payload reads. Wire format, layout table and open questions:
 `docs/development/apex-7-onboard-profile-read.md`.
 
-**Read status (2026-10-18, updated 2026-10-19):** `ssgg onboard read --profile N` completes a full slot
+**Read status (2026-10-18):** `ssgg onboard read --profile N` completes a full slot
 read on an Apex 7 under Linux, and the slot-0 read image (`p0.bin`, wired, firmware 4.16.3) **decodes with a
 checksum match** (`AE57B9DC` over 11692 bytes) once the layout was corrected to GG's payload struct: 5-byte
 mapping entries, OLED at 1385, Rapid Tap at 2025/2026 with 5-byte pairs, macro at 2076, GUID at 11676, the
@@ -41,7 +41,7 @@ line from the run here before anything is promoted to confirmed - the label stay
 run had GG's chain and closing sequence in it; the runs have neither, and the chain question
 (step 0b) is closed. Steps 3-5 (slot by slot, the double read, the layout compare with GG) are what is left.
 
-0. **[HW] Opening chain and firmware poll - superseded 2026-10-19, the chain is not sent any more:** the
+0. **[HW] Opening chain and firmware poll - superseded 2026-10-18, the chain is not sent any more:** the
 build described below starts with GG's six-frame
    chain (`90 00`, `90 01`, `f4 00`, `6c 00 01`, `90 00`, `90 01`, 11 ms apart) and prints the firmware version
    answered by the first `90 00` in the `firmware:` line. **Measured 2026-10-17:** an Apex 7 wired answered
@@ -72,8 +72,8 @@ build described below starts with GG's six-frame
    121 pulls as 64-byte "control responses" starting `85 00 …` - those are the requests GG submitted, which is
    why pull replies were earlier described as constant 64-byte frames.
 
-0b. **[HW] Which chain frame arms the resource buffer - closed 2026-10-19: none of them does** (the read
-works with the chain not sent, §Known facts (2026-10-19, sequences the read does not need), and the code no
+0b. **[HW] Which chain frame arms the resource buffer - closed 2026-10-18: none of them does** (the read
+works with the chain not sent, §Known facts (2026-10-18, sequences the read does not need), and the code no
 longer sends it, so this probe is moot). History: drop the chain frames one at a time (a code change
     in `ONBOARD_INIT_CHAIN`) on a run that reads a slot whose contents you know from GG, and record here
     which frame the keyboard needs. Today all six frames are sent, and the answer is what lets the read drop
@@ -137,7 +137,7 @@ capture's replies show - `--reply-header` and the short-read framing sweep are g
    (`0b 00`) with a readable name (`Config 1` .. `Config 5`) behind the report-ID byte is framing 0; anything
    else is recorded here and becomes the constant.
 3. **[HW] Slot by slot, then the checksum line:** the read of one slot works (2026-10-17/18) and its checksum
-matches (2026-10-19, slot 0). Remaining:
+matches (2026-10-18, slot 0). Remaining:
 `--profile 2..5` - every read
    prints that slot's schema word. Schema `0x000A` / `0x000B` means the decode applies; schema `0x0000` is a
    slot GG never saved and `decode` says so. A `checksum: ... match: true` validates the CRC and the
@@ -145,20 +145,20 @@ matches (2026-10-19, slot 0). Remaining:
 4. **[HW] Reproducibility:** `ssgg onboard read --profile 1 --bin /tmp/p1.bin --verify`. Pacing is
    `GG_GAP_MS`, a constant: a gap ladder needs a code change, and whatever the keyboard tolerates is recorded
    there.
-5. **[HW] Layout check:** the offsets are settled (GG's payload struct, hardware-verified by the CRC, 2026-10-19,
+5. **[HW] Layout check:** the offsets are settled (GG's payload struct, hardware-verified by the CRC, 2026-10-18,
    §Payload layout in `docs/development/apex-7-onboard-profile-read.md`). Remaining: compare name, lighting
    colours, key mappings and macro count with what **GG shows** for the same slot in its UI - the field
-   meanings inside the OLED and macro blocks are still unverified, and only GG can say whether the decoded
+   meanings inside the OLED block (whose 640 bytes are a **128 x 40 monochrome bitmap**: 8 px per byte, 16 bytes per row; the decoder writes them whole as `bytes_hex` and `tools/profile-gui` rasterises them - **which bit of the byte is the left pixel is an assumption, never read back**) and the macro block are still unverified, and only GG can say whether the decoded
    colours and mappings are what it displays.
 6. **[HW] Windows:** same read through the hidapi path (no udev rule needed); confirms the interface choice for
    the control collection.
 7. Only after 1-4: extend to the lighting files (`0x0301`-`0x0305`, reply report ID `0x03`), then promote what
    worked to confirmed in `.claude/rules/experimental-protocol.md` with device model and date.
-8. **[HW] Closing sequence - superseded 2026-10-19: the read sends none of it** (measured: the read works
+8. **[HW] Closing sequence - superseded 2026-10-18: the read sends none of it** (measured: the read works
    without it; `Apex7::send_end_sequence` and `onboard_end_sequence` are out of the code). History, including
    why the fourth frame was chosen:
 
-8a. **[HW] Closing sequence (code 2026-10-18, driver-mode close 2026-10-19, never sent on hardware):** the read ends with four frames
+8a. **[HW] Closing sequence (code and driver-mode close 2026-10-18, never sent on hardware):** the read ends with four frames
    (`onboard_end_sequence` in `hid_reports.rs`, sent by `Apex7::send_end_sequence`): `69` (Gamesense OLED off),
    `89 <slot + 1>` (deploy that profile - the engine's deploy id is 1-based, so slot 3 goes out as `89 04`),
    `41 00` (profile not volatile, sent as 0 for every real slot) and `6c 00 00` (**close driver mode**). The
@@ -186,14 +186,14 @@ matches (2026-10-19, slot 0). Remaining:
 
 | Piece | Where |
 |-------|-------|
-| Wire types: `0x85` pull, `0x83` read, `0x90` firmware poll (source byte: `90 00` keyboard firmware, `90 01` LED firmware), the 642-byte read buffer | `src/devices/hid_reports.rs` (`OnboardPullCommand`, `OnboardReadCommand`, `OnboardFirmwareVersionCommand` with its `FirmwareSource` byte, `OnboardDriverModeCommand`, `OnboardLoadProfileCommand`) — not feature-gated, no raw byte arrays outside it. The chain code (`OnboardInitCommand` + `ONBOARD_INIT_CHAIN`) and the closing sequence (`onboard_end_sequence`) are out of the code (2026-10-19, §Known facts (2026-10-19, sequences the read does not need)), and so are the command codes nothing sends (`EngineStatus 0xF4`, `DisableGamesenseOled 0x69`, `SetProfileVolatile 0x41`). `CommandCode::DriverMode` (`0x6C`) and `CommandCode::LoadProfile` (`0x89`) stay, with their named builders, and **nothing in ssgg sends them**. Driver mode is a different frame in the Apex 3 family - `docs/development/apex-7-onboard-profile-read.md` §Driver mode |
+| Wire types: `0x85` pull, `0x83` read, `0x90` firmware poll (source byte: `90 00` keyboard firmware, `90 01` LED firmware), the 642-byte read buffer | `src/devices/hid_reports.rs` (`OnboardPullCommand`, `OnboardReadCommand`, `OnboardFirmwareVersionCommand` with its `FirmwareSource` byte, `OnboardDriverModeCommand`, `OnboardLoadProfileCommand`) — not feature-gated, no raw byte arrays outside it. The chain code (`OnboardInitCommand` + `ONBOARD_INIT_CHAIN`) and the closing sequence (`onboard_end_sequence`) are out of the code (2026-10-18, §Known facts (2026-10-18, sequences the read does not need)), and so are the command codes nothing sends (`EngineStatus 0xF4`, `DisableGamesenseOled 0x69`, `SetProfileVolatile 0x41`). `CommandCode::DriverMode` (`0x6C`) and `CommandCode::LoadProfile` (`0x89`) stay, with their named builders, and **nothing in ssgg sends them**. Driver mode is a different frame in the Apex 3 family - `docs/development/apex-7-onboard-profile-read.md` §Driver mode |
 | Read geometry, reply parsing, assembly, decode | `src/devices/keyboards/apex_legacy_profile.rs` (`PULLS_PER_FILE`, `DEVICE_RESOURCE_BUFFER_LEN`, `PAYLOAD_READ_LEN`, `PROFILE_FILE_BYTES`, `READS_PER_PULL`, `profile_file_id`, `validate_profile`, `parse_read_reply`, `ProfileImage`, `decode`), core code. It was `src/onboard_profile.rs` until 2026-10-17, when it moved into the legacy Apex namespace: its constants are all `apexui.dll` facts of the legacy ("macho") platform - reply framing, resource-buffer size, payload sizes, schema words, struct offsets - and there is nothing there another family can share. The only knob is the profile slot: pull count, buffer size, window size, pacing and reply framing are constants, the read loop builds every frame from the typed commands, and it is also what logs the geometry - the CLI prints none, so no legacy constant appears in `src/main.rs`. Renamed 2026-10-18 so the names say **fact**, not **default**: `DEFAULT_CHUNKS` → `PULLS_PER_FILE`, `READ_LEN` → `PAYLOAD_READ_LEN`, `RESOURCE_BUFFER_LEN` → `DEVICE_RESOURCE_BUFFER_LEN`, `PROFILE_FILE_LEN` → `PROFILE_FILE_BYTES`, `SCHEMA_B_FIRMWARE` → `SCHEMA_B_FIRMWARE_VERSION` (documentation only - the read takes its schema from the word it reads). Deleted as unused: `PROFILE_FS_LEN` (the 0xA000 flash region), `PULL_REPORT_LEN`, `INIT_REPORT_LEN`, `LIGHTING_FS_SHARED` |
 | Packet I/O | `src/devices/keyboards/mod.rs`: `GenericKeyboard` does the profile packet I/O on the `device` handle it already owns - `connected_device` (the one handle accessor, shared with the lighting sends, same "Device not connected" message), no cache, so repeated frames go out; `send_report` runs the hid optimizer, which drops a report identical to one sent in the last 50 ms - see the write-path note in step 0), `send_feature`, `read_profile_feature_packet`, `read_profile_input_packet`, core code; `Apex7` runs the read plan - `read_image`, `firmware_version`, `probe_schema`, `pull_window`, `read_window` - on its own handle on a scoped thread (`std::thread::scope`, 2026-10-18, which replaced `spawn_blocking` fed by an `unsafe` transmute to `&'static` - the scoped borrow is checked, and the read blocks the task's thread for its ~2 s). The plan takes the slot only: `strict` (no flag fed it) and the `deadline` reply-budget plumbing (always `None`) are gone, one payload read has one fixed `REPLY_BUDGET_MS`. No transport type: `OnboardTransport` with its `HandleTransport` and `PathTransport`, and the per-call path-open helpers (`send_feature_report_raw`, `read_feature_report_raw`, `write_output_report_raw`, `read_input_report_raw`) were all removed on 2026-10-17; Apex 7 wired works through hidapi |
 | Keyboard device | `src/devices/keyboards/apex7.rs`: `Apex7` wraps `GenericKeyboard` (its `HidReportBuilder` and the open `HidDevice`) and runs the read on its own handle; `onboard_family(pid)` selects `0x1612`, `0x1614`, `0x1616`, `0x1618` and `discovery::open_keyboard` wraps those PIDs in it - the read path is core code, labelled `[EXPERIMENTAL]`, so a family board keeps standard lighting in every build |
 | Device API | `Keyboard::supports_onboard_profile`, `Keyboard::read_onboard_profile` (`[EXPERIMENTAL]`, core code); every other keyboard answers "not supported" |
-| CLI | `ssgg onboard read / decode` (`src/cli.rs`, `src/main.rs`); `read --profile 1..5` takes GG's config number (`Config 1` .. `Config 5`) and addresses slot `N - 1` - the library API stays 0-based, the read's `--debug` geometry line prints both - and runs on the `Apex7` device (its own handle, `--device vid:pid` selects the keyboard) and takes `-o/--out` (JSON path, default: the profile name it reads - `Config 1` -> `config_1.json`), `--bin` (raw image, only when a path is given), `--hex`, `--verify`; there is no `--yes` (2026-10-19: the read sends request frames only, so no confirmation gate) and no `--json` (the JSON dump is the default output). Every other number of the read is a protocol constant, not a flag, and the CLI prints none of them; the geometry - slot, file id, pulls, payload reads - is logged by the read loop at `info` level, so `ssgg --debug onboard read` shows it before the first transfer; `decode` works on a saved image and touches no device |
+| CLI | `ssgg onboard read / decode` (`src/cli.rs`, `src/main.rs`); `read --profile 1..5` takes GG's config number (`Config 1` .. `Config 5`) and addresses slot `N - 1` - the library API stays 0-based, the read's `--debug` geometry line prints both - and runs on the `Apex7` device (its own handle, `--device vid:pid` selects the keyboard) and takes `-o/--out` (JSON path, default: the profile name it reads - `Config 1` -> `config_1.json`; the file is the **decoded profile**, the same report `decode` writes - 2026-10-18, it used to be the read record, which `tools/profile-gui` could not open), `--bin` (raw image, only when a path is given), `--report` (the per-pull read record as JSON: chunk headers, framing stats, image hash - capture diagnostics), `--hex`, `--verify`; there is no `--yes` (2026-10-18: the read sends request frames only, so no confirmation gate) and no `--json` (the JSON dump is the default output). Every other number of the read is a protocol constant, not a flag, and the CLI prints none of them; the geometry - slot, file id, pulls, payload reads - is logged by the read loop at `info` level, so `ssgg --debug onboard read` shows it before the first transfer; `decode` works on a saved image and touches no device |
 | Capture kit | `scripts/capture-onboard-kit/`: the capture script (explicit device list) and the analysis script that rebuilds a slot from a control transfer and reports its checksum line; see its `README.md` |
-| Profile JSON editor | `tools/profile-gui/`: browser page, no build step, no deps - opens the `read --json` / `decode --json` dumps, edits them on a drawn ANSI board (keys bound through GG's `device-offset-lookup-table`, embedded as `HID2OFF`/`OFF2HID`), classifies every mapping as `self` / `none` / `custom` so a factory profile reads as having no remaps, and saves JSON with unknown fields preserved; `selftest.mjs` (109 checks) and `preview.mjs` run it under node. JSON only: no device access, no checksum recompute; see its `README.md` |
+| Profile JSON editor | `tools/profile-gui/`: browser page, no build step, no deps - opens the JSON dumps `read` and `decode` write by default (the decoded profile), edits them on a drawn ANSI board (keys bound through GG's `device-offset-lookup-table`, embedded as `HID2OFF`/`OFF2HID`), classifies every mapping as `self` / `none` / `custom` so a factory profile reads as having no remaps, and saves JSON with unknown fields preserved. **One profile open at a time** (a new load replaces it); `Save a copy...` prompts for the copy name (prefilled with the loaded file, an empty answer cancels, nothing is written in place). The board scales to its column (never scrolls), carries no offset numbers (they are in the cap tooltip and the key panel), centres legends with a shrink class, draws the arrows as glyphs, labels the numpad without the `Ke ` prefix, prints a sub line only for a remapped key (a factory board prints nothing), draws the two base `wheel_mappings` entries as half caps in the numpad `-` column, top on the function-row line, with a direction glyph over the mapping text inside the cap, and the on-board OLED as a 16:5 rect over the numpad's first three columns **rasterised from `oled.bytes_hex`** (128x40 1bpp; the bit order is switchable because it was never read back); the cap palette is hue-and-lightness separated by checks (neutral states clearly above the cap, macro green vs media magenta apart, legend swatches equal to `FILL_COLORS`), consumer codes read as media keys under function `0x61` (`0xE2` Mute, `0xB5` Next, `0xB6` Previous, `0xCD` Play/Pause, `0xE9` Vol+, `0xEA` Vol-; the same numbers are keyboard usages under other functions, so a code is named by its function byte); `selftest.mjs` (177 checks) and `preview.mjs` run it under node - the preview shims a canvas with a BMP encoder, so `board-preview.svg` carries the bitmap. JSON only: no device access, no checksum recompute; see its `README.md` |
 
 Two facts from the first Linux run (2026-10-15, Apex 7 `the hidraw node`) that shape the transport:
 
@@ -205,9 +205,9 @@ Two facts from the first Linux run (2026-10-15, Apex 7 `the hidraw node`) that s
   pull answers, so `read_interrupt_report` saw none. The read avoids that: `Apex7` does its own packet
   I/O on the handle the device manager opened, and that handle stays open for the whole read.
 
-## Known facts (2026-10-19, sequences the read does not need)
+## Known facts (2026-10-18, sequences the read does not need)
 
-Measured on hardware 2026-10-19 (`ssgg onboard read` on an Apex 7, operator runs):
+Measured on hardware 2026-10-18 (`ssgg onboard read` on an Apex 7, operator runs):
 
 - **GG's opening chain is not needed.** A full profile slot is read with none of `90 00`, `90 01`, `f4 00`,
   `6c 00 01` sent as a chain. The 2026-10-18 "only the `90 00` poll → scrambled payload replies" result is
@@ -217,7 +217,7 @@ Measured on hardware 2026-10-19 (`ssgg onboard read` on an Apex 7, operator runs
   `41 00`, `6c 00 00`. The read therefore **changes nothing on the keyboard**, and step 8's keyboard-effect
   questions stay unanswered (the frames are not sent).
 - **The firmware poll takes a source byte.** `90 00` answers the firmware running the keyboard, `90 01` the
-  LED controller's firmware - both read from an Apex 7 on 2026-10-19. The capture has both forms
+  LED controller's firmware - both read from an Apex 7 on 2026-10-18. The capture has both forms
   on the wire (capture summary rows 97, 115).
 - **A payload read needs ~1 ms after its request is written** before reading the reply back; without the wait
   the read races the device filling its resource buffer and answers with garbage (`Apex7::read_window`).
@@ -228,10 +228,26 @@ Measured on hardware 2026-10-19 (`ssgg onboard read` on an Apex 7, operator runs
 **Not recorded in this repo:** the model, firmware and run log of these runs. The chain and sequence facts are
 reported by the operator and carry the date.
 
-## Known facts (2026-10-19, driver mode)
+## Known facts (2026-10-18, media code names)
 
-- **Driver mode (engine side, superseded 2026-10-19: ssgg sends neither frame, the read needs neither -
-  §Known facts (2026-10-19, sequences the read does not need))** - engine-side reading in
+- **Under function `0x61` (`media_key`) the code bytes are consumer-page usages**, not keyboard usages:
+  `0xE2` Mute, `0xB5` Scan Next Track, `0xB6` Scan Previous Track, `0xCD` Play/Pause,
+  `0xE9` Volume Increment, `0xEA` Volume Decrement. Same numbers under a keyboard function
+  (`0x51` combo) are **keyboard-page** usages - `0xE2` is LAlt - so a code byte is named by its
+  entry's function byte, never by its number alone.
+- Names: supplied by the operator 2026-10-18 for GG's media cluster, and they are the standard
+  consumer-page usages of the USB HID Usage Tables (§10). **Not read back from hardware.**
+- Where they land in a real read (`p0.json`, slot 0, wired Apex 7, firmware 4.16.3):
+  `wheel_mappings` = `0xE9` / `0xEA` (the two wheel caps), and the media cluster keys
+  `0xf1` = `0xE2`, `0xf5` = `0xCD`, `0xf6` = `0xB5`, `0xf7` = `0xB6`, all function `0x61`.
+  Those five keys are the only remaps of the factory base layer.
+- Shown by `tools/profile-gui/` (`MEDIA_NAMES`, `keyName(code, functionByte)`, 6 selftest checks
+  against `p0.json`). The Rust decoder prints code bytes as **hex only** - no key-name table.
+
+## Known facts (2026-10-18, driver mode)
+
+- **Driver mode (engine side, superseded 2026-10-18: ssgg sends neither frame, the read needs neither -
+  §Known facts (2026-10-18, sequences the read does not need))** - engine-side reading in
   `docs/development/apex-7-onboard-profile-read.md` §Driver mode. Driver mode is report 0, command `0x6C`, last
   byte 1 to open and 0 to close; the engine writes the opening frame at device init and the closing frame when it
   closes a session, and the capture shows only the opening frame (`6c 00 01`, the chain's fourth frame) because GG

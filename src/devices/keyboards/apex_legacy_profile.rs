@@ -628,7 +628,8 @@ pub struct RapidTapPair {
     pub reserved: String,
 }
 
-/// Summary of the macro data block (never dumped in full by the JSON writer).
+/// Summary of a payload block. The macro block is only summarised; the OLED block carries
+/// `bytes_hex` as well, because the profile GUI draws it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MacroSummary {
     /// Offset of the block in the payload.
@@ -641,6 +642,11 @@ pub struct MacroSummary {
     pub fnv1a_64: String,
     /// First 16 bytes, hex.
     pub head: String,
+    /// Every byte of the block, hex, space separated. Written only where the whole block is
+    /// worth shipping ([`OLED_LEN`] bytes = a 128x40 1bpp bitmap); `None` elsewhere, and
+    /// `None` skips the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_hex: Option<String>,
 }
 
 /// Decoded on-board profile.
@@ -666,7 +672,9 @@ pub struct OnboardProfile {
     pub button_meta_mappings: Vec<KeyMapping>,
     /// Two wheel meta mappings.
     pub wheel_meta_mappings: Vec<KeyMapping>,
-    /// OLED pixel block summary.
+    /// OLED pixel block, dumped in full: 128 x 40 monochrome pixels at 8 px per byte
+    /// ([`OLED_LEN`] = 640). `[EXPERIMENTAL]` - the bit layout is assumed by the GUI, never
+    /// read back from a keyboard.
     pub oled: MacroSummary,
     /// Rapid Tap block, schema [`SCHEMA_B`] only.
     pub rapid_tap: Option<RapidTap>,
@@ -859,7 +867,17 @@ fn summary_of(data: &[u8], offset: usize, len: usize) -> MacroSummary {
         nonzero: block.iter().filter(|b| **b != 0).count(),
         fnv1a_64: fnv1a_64(block),
         head: hex_of(&block[..block.len().min(16)]),
+        bytes_hex: None,
     }
+}
+
+/// Summary plus the full block bytes: the OLED block is a bitmap, not a blob to summarise.
+fn summary_of_bytes(data: &[u8], offset: usize, len: usize) -> MacroSummary {
+    let mut summary = summary_of(data, offset, len);
+    let start = offset.min(data.len());
+    let end = (offset + len).min(data.len());
+    summary.bytes_hex = Some(hex_of(&data[start..end]));
+    summary
 }
 
 /// Hex of a byte slice, space separated.
@@ -1002,7 +1020,7 @@ pub fn decode(data: &[u8]) -> Result<OnboardProfile> {
         wheel_mappings: key_table(data, WHEEL_MAPPINGS_OFFSET, WHEEL_MAPPING_COUNT)?,
         button_meta_mappings: key_table(data, BUTTON_META_MAPPINGS_OFFSET, BUTTON_MAPPING_COUNT)?,
         wheel_meta_mappings: key_table(data, WHEEL_META_MAPPINGS_OFFSET, WHEEL_MAPPING_COUNT)?,
-        oled: summary_of(data, OLED_OFFSET, OLED_LEN),
+        oled: summary_of_bytes(data, OLED_OFFSET, OLED_LEN),
         rapid_tap,
         macro_data: summary_of(data, macro_offset, MACRO_DATA_LEN),
         guid: hex_of(&data[guid_offset..guid_offset + GUID_LEN]),
@@ -1720,7 +1738,13 @@ mod tests {
         }
         assert_eq!(
             keys_of(&value["oled"]),
-            ["fnv1a_64", "head", "len", "nonzero", "offset"]
+            ["bytes_hex", "fnv1a_64", "head", "len", "nonzero", "offset"]
+        );
+        let oled_bytes = value["oled"]["bytes_hex"].as_str().expect("oled bytes");
+        assert_eq!(oled_bytes.split(' ').count(), OLED_LEN);
+        assert_eq!(
+            value["oled"]["head"].as_str().expect("oled head"),
+            oled_bytes.split(' ').take(16).collect::<Vec<_>>().join(" ").as_str()
         );
         assert_eq!(keys_of(&value["rapid_tap"]), ["enable", "pairs"]);
         assert_eq!(
