@@ -23,30 +23,12 @@
 
 use crate::devices::keyboards::apex_7_profile::{DEVICE_RESOURCE_BUFFER_LEN, PAYLOAD_READ_LEN, PULLS_PER_FILE};
 use crate::error::{Error, Result};
-use serde::Serialize;
 
 pub use crate::devices::keyboards::apex_7_profile::{
     KeyMapping, LightingProfile, MacroAction, MacroSummary, OnboardMacro, OnboardProfile, OnboardWriteFrame,
     OnboardWritePlan, OnboardWriteReportKind, ProfileImage, RapidTap, RapidTapPair, ReadReply, ReadStats, WriteStats,
     write_plan, write_plan_lines, write_stats,
 };
-
-/// The keyboard a read collected profile bytes from, recorded in the read's record and in the decode
-/// report the read writes. The payload layout, what can be encoded back, and which features exist are
-/// all per device, so profile bytes without a product ID do not say which board's codec produced them.
-/// A decode of a file records nothing: the file does not name a keyboard, only the schema word inside it.
-///
-/// Two fields, because that is all a reader needs: every SteelSeries device answers the same vendor ID
-/// `0x1038`, so the product ID identifies the model on its own, and the name is this crate's registry name
-/// for that number - a reader that trusts the number can re-derive it. `[EXPERIMENTAL]`: one keyboard
-/// records a device today (Apex 7).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct OnboardDevice {
-    /// USB product ID: the model selector, and the key of the model-name table.
-    pub product_id: u16,
-    /// Model name this crate lists for the product ID ([`crate::devices::device_name_from_product_id`]).
-    pub product: String,
-}
 
 /// A keyboard family's on-board profile codec: everything the protocol does with bytes, with no device.
 ///

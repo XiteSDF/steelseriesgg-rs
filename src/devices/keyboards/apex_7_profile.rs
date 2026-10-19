@@ -95,7 +95,7 @@ use crate::devices::hid_reports::{
     OnboardBufferWriteCommand, OnboardFileCommitCommand, OnboardFileOpenCommand, OnboardPayloadPushCommand,
 };
 use crate::devices::keyboards::apex_pro_tkl_2023_profile::profile_checksum;
-use crate::devices::keyboards::onboard::{OnboardDevice, OnboardProfileCodec};
+use crate::devices::keyboards::onboard::OnboardProfileCodec;
 // Generic payload helpers live in the interface module since 2026-10-19; re-exported here because this
 // family's decode, encode and read path, and `src/main.rs`'s older call sites, name them through it.
 pub use crate::devices::keyboards::onboard::{hex_dump, hex_of, image_diff, payload_diff, schema_of};
@@ -728,6 +728,17 @@ pub struct ReadStats {
 /// Assembled profile data with its per-pull records.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProfileImage {
+    /// Product ID of the keyboard the read ran on: the model selector. `None` only for an image assembled
+    /// without a device. The three identity fields sit above the profile fields: product ID, model name,
+    /// firmware version say *which keyboard*, and only then do slot, payload and stats say *what it holds*.
+    pub product_id: Option<u16>,
+    /// Model name this crate lists for that product ID ([`crate::devices::device_name_from_product_id`]).
+    /// The name is derived from the number, so a reader that trusts the number can re-derive it; a model
+    /// outside this crate's registry is labelled by its name.
+    pub product: Option<String>,
+    /// Firmware version the read's `90 00` poll answered with (`None` when the poll was refused or the
+    /// keyboard answered nothing: the version is informational, the read does not depend on it).
+    pub firmware: Option<String>,
     /// Profile slot the read ran on.
     pub profile_slot: u8,
     /// Per-pull records, in collection order.
@@ -736,12 +747,6 @@ pub struct ProfileImage {
     pub data: Vec<u8>,
     /// Aggregated reply statistics.
     pub stats: ReadStats,
-    /// Firmware version the read's `90 00` poll answered with (`None` when the poll was refused or the
-    /// keyboard answered nothing: the version is informational, the read does not depend on it).
-    pub firmware: Option<String>,
-    /// The keyboard the read ran on (vendor and product ID plus the model name this crate lists for
-    /// the product ID). `None` only for an image built without a device.
-    pub device: Option<OnboardDevice>,
 }
 
 impl ProfileImage {
@@ -832,9 +837,19 @@ impl ProfileImage {
             },
             chunks,
             data,
+            product_id: None,
+            product: None,
             firmware: None,
-            device: None,
         })
+    }
+
+    /// Stamp a decode report with this image's keyboard identity: product ID, model name, firmware
+    /// version. A read's report names the keyboard it ran on; a decode of a file names none, and a
+    /// report assembled from bytes leaves these fields absent.
+    pub fn stamp_identity(&self, profile: &mut OnboardProfile) {
+        profile.product_id = self.product_id;
+        profile.product = self.product.clone();
+        profile.firmware = self.firmware.clone();
     }
 
     /// Record the firmware version the read's `90 00` poll answered with.
@@ -1219,6 +1234,18 @@ pub fn decode_macros(data: &[u8], offset: usize, len: usize) -> (Vec<OnboardMacr
 /// Decoded on-board profile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OnboardProfile {
+    /// Product ID of the keyboard these bytes were read from, stamped by the read. Absent for a decode of a
+    /// file: bytes alone name no keyboard. Together with [`OnboardProfile::product`] and
+    /// [`OnboardProfile::firmware`] these are the record's first fields - the keyboard first, its profile
+    /// after. `[EXPERIMENTAL]`: one keyboard records an identity today (Apex 7).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub product_id: Option<u16>,
+    /// Model name this crate lists for that product ID; see [`OnboardProfile::product_id`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub product: Option<String>,
+    /// Firmware version the read's `0x90` poll answered with; see [`OnboardProfile::product_id`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub firmware: Option<String>,
     /// Schema word.
     pub schema: u16,
     /// Schema name (`a`, `b` or `unknown`).
@@ -1264,11 +1291,6 @@ pub struct OnboardProfile {
     pub crc_ok: bool,
     /// Length of the checksummed prefix.
     pub crc_region_len: usize,
-    /// The keyboard these bytes were read from, recorded by a read (see [`OnboardDevice`]). `None` for
-    /// a decode of a file: the file names no keyboard. Absent from the JSON when `None`, so a report
-    /// from before this field existed reads unchanged.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub device: Option<OnboardDevice>,
 }
 
 /// Layout of the decoded blocks.
@@ -1594,8 +1616,10 @@ pub fn decode(data: &[u8]) -> Result<OnboardProfile> {
     ]);
 
     Ok(OnboardProfile {
-        // A decode of bytes names no keyboard; the read stamps this field from the device it ran on.
-        device: None,
+        // A decode of bytes names no keyboard; the read stamps the identity fields from the device it ran on.
+        product_id: None,
+        product: None,
+        firmware: None,
         schema,
         schema_name: match schema {
             SCHEMA_A => "a".to_string(),
@@ -1695,12 +1719,14 @@ pub fn to_json(image: &ProfileImage) -> Result<String> {
         json!(null)
     };
     let value = json!({
+        // Identity first: product ID, model name, firmware version - which keyboard this came off.
+        "product_id": image.product_id,
+        "product": image.product,
+        "firmware": image.firmware,
         "profile_slot": image.profile_slot,
         "fs_id": format!("0x{:04X}", profile_file_id(image.profile_slot)),
         "schema": format!("0x{schema:04X}"),
         "schema_decoded": decoded,
-        "firmware": image.firmware,
-        "device": image.device,
         "data_len": payload.len(),
         "sha_like_fnv1a_64": fnv1a_64(payload),
         "stats": image.stats,
@@ -2195,9 +2221,9 @@ fn banner_lines() -> Vec<String> {
 fn image_lines(image: &ProfileImage, label: &str) -> Vec<String> {
     let mut lines = vec![
         format!("read {} profile bytes from {label}", image.data.len()),
-        match image.device.as_ref() {
-            Some(device) => format!("device:  {} (product {:04X})", device.product, device.product_id),
-            None => "device:  not recorded".to_string(),
+        match (image.product_id, image.product.as_deref()) {
+            (Some(product_id), Some(product)) => format!("device:  {product} (product {product_id:04X})"),
+            _ => "device:  not recorded".to_string(),
         },
         match image.firmware.as_deref() {
             Some(firmware) => format!("firmware:  {firmware} (answered the 0x90 firmware poll)"),
@@ -2228,9 +2254,9 @@ fn profile_lines(profile: &OnboardProfile) -> Vec<String> {
     }
 
     let mut lines = vec![
-        match profile.device.as_ref() {
-            Some(device) => format!("device:  {} (product {:04X})", device.product, device.product_id),
-            None => "device:  not recorded (decoded from a file, which names no keyboard)".to_string(),
+        match (profile.product_id, profile.product.as_deref()) {
+            (Some(product_id), Some(product)) => format!("device:  {product} (product {product_id:04X})"),
+            _ => "device:  not recorded (decoded from a file, which names no keyboard)".to_string(),
         },
         format!("schema: {} (0x{:04X})", profile.schema_name, profile.schema),
         format!(
@@ -3468,39 +3494,48 @@ mod tests {
     }
 
     /// A profile file names no keyboard, a read names the one it ran on, and the encoder ignores the
-    /// block: the layout, the encodable fields and the feature set are per device, so the JSON has to
-    /// carry the product ID and the encoder must not be moved by it.
+    /// identity: the layout, the encodable fields and the feature set are per device, so the JSON has to
+    /// carry the product ID, and it comes first - keyboard first, profile after - and moves the encoder
+    /// not at all.
     #[test]
     fn a_stamped_device_is_metadata_the_encoder_ignores() {
         let data = synthetic_payload(SCHEMA_B);
         let profile = decode(&data).expect("the synthetic payload decodes");
         let plain = profile_json(&profile).expect("the decode report serializes");
-        assert!(
-            !plain.contains("\"device\""),
-            "a decode of bytes writes no device block: it names no keyboard"
-        );
+        for key in ["product_id", "product", "firmware"] {
+            assert!(
+                !plain.contains(&format!("\"{key}\"")),
+                "a decode of bytes writes no {key}: bytes name no keyboard"
+            );
+        }
 
         let mut stamped = profile.clone();
-        stamped.device = Some(OnboardDevice {
-            product_id: crate::devices::product_ids::APEX_7,
-            product: crate::devices::device_name_from_product_id(crate::devices::product_ids::APEX_7).to_string(),
-        });
+        stamped.product_id = Some(crate::devices::product_ids::APEX_7);
+        stamped.product =
+            Some(crate::devices::device_name_from_product_id(crate::devices::product_ids::APEX_7).to_string());
+        stamped.firmware = Some("4.16.3".to_string());
         let text = profile_json(&stamped).expect("the stamped report serializes");
         let value: serde_json::Value = serde_json::from_str(&text).expect("the stamped report parses");
-        let keys = value["device"]
-            .as_object()
-            .map(|object| object.keys().cloned().collect::<Vec<_>>());
-        assert_eq!(
-            keys,
-            Some(vec!["product".to_string(), "product_id".to_string()]),
-            "serde_json parses objects sorted"
+        assert_eq!(value["product_id"], serde_json::json!(0x1612));
+        assert_eq!(value["product"], serde_json::json!("Apex 7"));
+        assert_eq!(value["firmware"], serde_json::json!("4.16.3"));
+        let at = |key: &str| text.find(&format!("\"{key}\"")).expect(key);
+        assert!(
+            at("product_id") < at("product"),
+            "product ID before the model name it keys"
         );
-        assert_eq!(value["device"]["product_id"], serde_json::json!(0x1612));
-        assert_eq!(value["device"]["product"], serde_json::json!("Apex 7"));
+        assert!(
+            at("product") < at("firmware"),
+            "model name before the firmware it belongs to"
+        );
+        assert!(
+            at("firmware") < at("schema"),
+            "the identity fields sit above the profile fields: which keyboard, then what it holds"
+        );
         assert_eq!(
-            encode_json(&text).expect("a device block does not stop the encoder"),
+            encode_json(&text).expect("an identity block does not stop the encoder"),
             data,
-            "the device block is metadata: the payload bytes are unchanged"
+            "the identity fields are metadata: the payload bytes are unchanged"
         );
     }
 
@@ -3508,12 +3543,21 @@ mod tests {
     #[test]
     fn the_read_record_carries_the_device_the_image_names() {
         let image = ProfileImage::assemble(0, Vec::new()).expect("an empty assembly is valid");
-        assert!(image.device.is_none(), "assembled without a device");
         assert!(
-            to_json(&image)
-                .expect("the record serializes")
-                .contains("\"device\": null"),
-            "the record states openly that no keyboard is recorded"
+            image.product_id.is_none() && image.product.is_none() && image.firmware.is_none(),
+            "assembled without a device"
+        );
+        let record = to_json(&image).expect("the record serializes");
+        for key in ["product_id", "product", "firmware"] {
+            assert!(
+                record.contains(&format!("\"{key}\": null")),
+                "the record states openly that no {key} is recorded"
+            );
+        }
+        let at = |key: &str| record.find(&format!("\"{key}\"")).expect(key);
+        assert!(
+            at("product_id") < at("profile_slot"),
+            "the keyboard is named before the slot it was read from"
         );
     }
 

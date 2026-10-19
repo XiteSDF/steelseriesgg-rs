@@ -857,7 +857,7 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
                 let json = onboard_json_path(codec, args.out.as_deref(), &first.data, args.profile);
                 let mut profile = codec.decode(&first.data)?;
                 // A read's JSON names the keyboard it ran on; a file decode names none.
-                profile.device = first.device.clone();
+                first.stamp_identity(&mut profile);
                 secure_write_async(json.clone(), codec.profile_json(&profile)?).await?;
                 println!("JSON decode report of the first read written to {}", json.display());
                 write_onboard_report(codec, args.report.as_ref(), &first).await?;
@@ -881,7 +881,7 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
                 }
                 let json = onboard_json_path(codec, args.out.as_deref(), &image.data, args.profile);
                 let mut profile = codec.decode(&image.data)?;
-                profile.device = image.device.clone();
+                image.stamp_identity(&mut profile);
                 secure_write_async(json.clone(), codec.profile_json(&profile)?).await?;
                 println!("JSON decode report written to {}", json.display());
                 write_onboard_report(codec, args.report.as_ref(), &image).await?;

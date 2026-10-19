@@ -34,7 +34,7 @@ use super::apex_7_profile::{
     READS_PER_PULL, ReadReply, SCHEMA_B, WriteStats, hex_of, parse_firmware_version, parse_read_reply_at,
     profile_file_id, reply_mismatch, schema_of, validate_profile,
 };
-use super::onboard::{OnboardDevice, OnboardProfileCodec, OnboardWriteFrame};
+use super::onboard::{OnboardProfileCodec, OnboardWriteFrame};
 use super::{GenericKeyboard, Keyboard};
 use crate::devices::hid_reports::{
     FirmwareSource, HidCommand, ONBOARD_FEATURE_REPORT_SIZE, ONBOARD_OUTPUT_REPORT_SIZE, OnboardBufferReadCommand,
@@ -207,10 +207,8 @@ impl Apex7 {
         // The bytes are stamped with the keyboard they came off: the layout, the encodable fields and
         // the feature set are all per device, so a profile file has to name its model.
         let info = self.info();
-        image.device = Some(OnboardDevice {
-            product_id: info.product_id,
-            product: device_name_from_product_id(info.product_id).to_string(),
-        });
+        image.product_id = Some(info.product_id);
+        image.product = Some(device_name_from_product_id(info.product_id).to_string());
         Ok(image)
     }
 

@@ -159,11 +159,16 @@ per chunk from the typed commands, nothing materialises a transfer list (`Step`,
 writes for the same image (the format `tools/profile-gui` opens); `--report FILE` adds the per-pull read
 record (chunk headers, framing stats, image hash) and `--bin FILE` the raw image bytes.
 
-The decoded report names the keyboard it came from in its `device` block (`product_id`, `product`): a read
-stamps the product ID it ran on, a decode of a file records nothing. Two fields, not four: every SteelSeries
-device answers the same vendor ID `0x1038`, so the product ID identifies the model alone, and the model name is
-derivable from it, so a record that carries both carries no redundancy. A model this crate's registry does not
-list is labelled by that name - a reader trusts the number. The GUI
+**The keyboard identity is three plain fields, written first**: `product_id`, `product` (the model name this
+crate lists for that number) and `firmware` (what the `0x90` poll answered) sit above the profile fields in
+`ProfileImage` and in the decode report - the record says *which keyboard* before it says *what it holds*. A
+read stamps all three; a decode of a file names no keyboard, so it writes none of them (`ProfileImage` writes
+them as `null` in the read record, which states the absence openly). There is no `device` object and no nested
+block: a nested struct of the same three values was one layer of indirection over three fields, and the two
+fields it used to carry are gone with it - every SteelSeries device answers the same vendor ID `0x1038`, so a
+product ID identifies the model on its own, and a model name is derivable from the number it names, so a
+record that carries both carries no redundancy. A model outside this crate's registry is labelled by that name
+and a reader trusts the number. The encoder ignores all three. The GUI
 shows a model **name** for that number, and takes it from Rust rather than from the file:
 `tools/profile-gui/sync-products.mjs` parses `pub mod product_ids`, `device_name_from_product_id` and
 `device_type_from_product_id` (`src/devices/mod.rs`) and the `codecs()`

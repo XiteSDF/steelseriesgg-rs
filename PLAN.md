@@ -657,6 +657,16 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   The decode report's device line reads `Apex 7 (product 1612)`. **Reverted here**: keeping a per-codec product
   ID table as the scope statement, and the registry-known flag as a label on the name.
 
+- 2026-10-19 (no device struct): `OnboardDevice` is deleted and the identity is **three plain fields on the
+  record** - `product_id`, `product` (model name), `firmware` - declared **above** the profile fields in
+  `ProfileImage` and in the decode report, so a record says which keyboard before what it holds (a test asserts
+  that order in the serialized text). A read stamps all three (`ProfileImage::stamp_identity` copies them into
+  the decode report the read writes); a file decode names no keyboard and writes none of them, and the read
+  record writes them as `null` to say so. The encoder ignores them. `Keyboard::supports_onboard_profile`
+  remains the gate, and the `[EXPERIMENTAL]` one-board label moved onto the fields. **Reverted here**: the
+  `device` object itself (three values plus a name for them) and, in the previous step, the `vendor_id` +
+  `known` fields - one vendor ID for the whole brand and a name derivable from its number are not data.
+
 ## Reference projects
 
 - Apex RGB: OpenRGB `SteelSeriesApex8ZoneController`
