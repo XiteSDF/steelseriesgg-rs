@@ -357,7 +357,9 @@ keyboard.
   `0x0, 0x400, …, 0x2C00`, size 1024 - 12 chunks per run, 6 runs. This document called them "72 lighting
   frames" for four days; they are push frames declaring a file transfer, and the bytes travel in the
   `03 00 <buffer offset u16> <size u16> <payload>` 642-byte feature writes (the 144 payload writes).
-- A push is paced like a pull: the packet that follows it is the keyboard's ordinary all-zero input report.
+- A push is paced like a pull: the packet that follows it on the profile collection's endpoint is the same
+  all-zero report the read path drains (`01 00 …`), and the answer (`05 01 …`) comes on that endpoint as
+  well. Keystrokes are on a different endpoint, so the write's answer drain never sees typing traffic.
   The old note in §What answers a pull (`apex-7-onboard-profile-read.md`) about "the 72 `0x05` pushes
   behave the same way" stays true - it is the same pacing token.
 - **`fs_id 0x0102` is a file the read never pulls** (profile files `0x0201..0x0205`, lighting files

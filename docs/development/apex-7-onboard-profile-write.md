@@ -90,6 +90,12 @@ sessions and the frames around them.
 Every answer carries the status byte `01` behind its report id. `ssgg` paces its write at `GG_GAP_MS` = 5 ms,
 the capture's median push-answer latency, which is above its median inter-frame gap of 3 ms.
 
+**Endpoints**: the `05 01` / `88 01` answers arrive on the profile collection's interrupt endpoint - the
+collection at `2.2` of the Apex 7 composite device, `0x82`, the endpoint the read path drains too.
+Keystrokes come from the keyboard collection on the other endpoint (stated by the operator 2026-10-20, not
+measured by me) - so a write path that drains this endpoint is not wading through key reports, and its ack
+filter only has to skip protocol reports (the `01 00 …` ones).
+
 ## Engine side
 
 `base_apex_legacy.lisp:1993-2022` describes this run: `write-onboard-profile-ram-0x600` (`:1995`) opens the
@@ -119,7 +125,9 @@ report), `OnboardPushCommand` (`0x05`), `OnboardCommitCommand` (`0xEB`) and `Onb
 - Pacing is `GG_GAP_MS` (5 ms) between frames, the capture's median.
 - The write waits the answers the capture shows: `88 01` after the open, `05 01` after every push; it does not
   wait on writes or on the commit, which are not answered. A status byte other than `01`, and a frame that is
-  not answered, stop the write.
+  not answered, stop the write. The wait is the read side's own poll primitive
+  (`Apex7::read_protocol_report`, the one the pacing drain and the firmware poll use) with the expected report
+  id as the filter - one drain for the whole transfer, not a second one for the write.
 - The lighting files, driver mode, OLED, volatile, firmware polls and pacing frames are not sent. The write
   touches one profile file and, at the end, deploys that slot (`89 <slot + 1>` right after the commit - the
   engine sleeps 250 ms behind the deploy frame, the write path does not, ONBOARD step 1.4).

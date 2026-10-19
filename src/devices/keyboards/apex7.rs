@@ -92,8 +92,8 @@ const PROBE_PULL_LEN: u16 = 2;
 /// Largest input report a profile collection can return (Apex 7 profile collections report 1024).
 const INPUT_REPORT_MAX_LEN: usize = 1024;
 /// Input-report polls allowed while waiting for the file-open answer (0x88): the write capture
-/// answers it 305 ms after the frame, and the keyboard streams its ordinary input reports in between, all of
-/// which the wait skips (see [`Apex7::await_write_ack`]).
+/// answers it 305 ms after the frame, and this endpoint carries protocol reports in between, which the wait
+/// skips (see [`Apex7::read_protocol_report`]).
 const WRITE_OPEN_ACK_ATTEMPTS: u32 = 40;
 /// Input-report polls allowed while waiting for a push answer (0x05): 5 ms after the frame in the capture.
 const WRITE_PUSH_ACK_ATTEMPTS: u32 = 20;
@@ -385,43 +385,31 @@ impl Apex7 {
     }
 
     /// Waits the answer a write-side frame gets: the capture answers the file open with
-    /// `88 01 …` (305 ms after the frame) and every push with `05 01 …` (5 ms after it), on the interrupt
-    /// endpoint. The keyboard streams its ordinary input reports in between, so the wait skips every report
-    /// that is not the answer it is looking for.
+    /// `88 01 …` (305 ms after the frame) and every push with `05 01 …` (5 ms after it). The answer is the
+    /// next protocol report on the collection's endpoint, so this is [`Apex7::read_protocol_report`] with the
+    /// report number as the filter.
     ///
     /// `[EXPERIMENTAL]`: the status byte is `01` in every answer of that capture. Any other value, and any
     /// frame left unanswered, stops the write - the frames after it build on the one that was refused.
     fn await_write_ack(&self, expected_id: u8, attempts: u32, label: &str) -> Result<usize> {
         let path = self.collection_label();
-        for _ in 0..attempts {
-            match self.read_profile_input_packet(PULL_ACK_LEN, REPLY_POLL_MS) {
-                Ok(report) if report.first() == Some(&expected_id) => {
-                    let status = report.get(1).copied().unwrap_or(0);
-                    if status != WRITE_ACK_STATUS_OK {
-                        return Err(Error::DeviceCommunication(format!(
-                            "onboard write on {path}: {label} answered status {status:#04x}; the 2026-10-20 \
-                             capture only ever shows {WRITE_ACK_STATUS_OK:#04x}, so the write stops here"
-                        )));
-                    }
-                    return Ok(1);
-                }
-                Ok(report) if !report.is_empty() => {
-                    tracing::debug!(
-                        "onboard write on {path}: skipped report {:#04x} while waiting for the {label} answer",
-                        report[0]
-                    );
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::debug!("onboard write: input-report poll on {path}: {e}");
-                }
-            }
+        let answer = self
+            .read_protocol_report(PULL_ACK_LEN, attempts, |report| report.first() == Some(&expected_id))
+            .ok_or_else(|| {
+                Error::DeviceCommunication(format!(
+                    "onboard write on {path}: {label} answered nothing in {} ms; the capture answers every \
+                     frame of this kind, so the write stops here",
+                    u64::from(attempts) * REPLY_POLL_MS
+                ))
+            })?;
+        let status = answer.get(1).copied().unwrap_or(0);
+        if status != WRITE_ACK_STATUS_OK {
+            return Err(Error::DeviceCommunication(format!(
+                "onboard write on {path}: {label} answered status {status:#04x}; the capture only \
+                 ever shows {WRITE_ACK_STATUS_OK:#04x}, so the write stops here"
+            )));
         }
-        Err(Error::DeviceCommunication(format!(
-            "onboard write on {path}: {label} answered nothing in {} ms; the capture answers every frame of \
-             this kind, so the write stops here",
-            u64::from(attempts) * REPLY_POLL_MS
-        )))
+        Ok(1)
     }
 
     /// Runs GG's 2-byte probe in front of the file read and checks the schema word it answers.
@@ -527,7 +515,8 @@ impl Apex7 {
         if GG_GAP_MS > 0 {
             std::thread::sleep(Duration::from_millis(GG_GAP_MS));
         }
-        let answer = self.read_interrupt_report(FIRMWARE_REPLY_LEN, FIRMWARE_REPLY_ATTEMPTS);
+        let answer =
+            self.read_protocol_report(FIRMWARE_REPLY_LEN, FIRMWARE_REPLY_ATTEMPTS, |report| !report.is_empty());
         if answer.is_none() {
             tracing::debug!("onboard firmware poll on {path} answered nothing");
         }
@@ -598,12 +587,11 @@ impl Apex7 {
     }
 
     /// Reads the pacing packet that follows a pull. Its content is not looked at - GG's read specifiers keep
-    /// zero bytes of it - and the pull has no answer of its own: the device keeps streaming its ordinary
-    /// input reports on the interrupt endpoint (report `0x01`, all-zero on an idle keyboard, 1.7-3.7 ms after
-    /// the pull in the capture). The drain is load-bearing: a run on 2026-10-17 that skipped it failed every
-    /// payload read-back.
+    /// zero bytes of it - and the pull has no answer of its own: the device keeps streaming reports on this
+    /// endpoint (report `0x01`, all-zero on an idle keyboard, 1.7-3.7 ms after the pull in the capture). The
+    /// drain is load-bearing: a run on 2026-10-17 that skipped it failed every payload read-back.
     fn read_pull_ack(&self) -> Option<Vec<u8>> {
-        self.read_interrupt_report(PULL_ACK_LEN, PULL_ACK_ATTEMPTS)
+        self.read_protocol_report(PULL_ACK_LEN, PULL_ACK_ATTEMPTS, |report| !report.is_empty())
     }
 
     /// Identity of the collection the read runs on, for logs and read errors.
@@ -615,12 +603,29 @@ impl Apex7 {
         )
     }
 
-    /// Polls the collection for one non-empty report of at most `len` bytes.
-    fn read_interrupt_report(&self, len: usize, attempts: u32) -> Option<Vec<u8>> {
+    /// Polls the collection's interrupt endpoint for the next report this transfer is looking for.
+    ///
+    /// `want` names the report to stop on; a report that arrives and does not match is logged and skipped,
+    /// which is what the read side needs (the device streams all-zero reports on this endpoint, report `0x01`,
+    /// and GG's transfers consume them as pacing) and what lets the write side sit down and wait for the
+    /// answer of a specific frame. `None` when nothing matched within `attempts` polls.
+    ///
+    /// Keystrokes are not on this endpoint: the Apex 7 is a composite device, the profile collection this
+    /// read and write run on is the one at `2.2` (its interrupt endpoint is `0x82`), and the key reports come
+    /// from the keyboard collection on the other endpoint - so the traffic this sees is protocol traffic,
+    /// not typing.
+    fn read_protocol_report(&self, len: usize, attempts: u32, want: impl Fn(&[u8]) -> bool) -> Option<Vec<u8>> {
         let path = self.collection_label();
         for _ in 0..attempts {
             match self.read_profile_input_packet(len, REPLY_POLL_MS) {
-                Ok(report) if !report.is_empty() => return Some(report),
+                Ok(report) if want(&report) => return Some(report),
+                Ok(report) if !report.is_empty() => {
+                    tracing::debug!(
+                        "onboard poll on {path}: skipped report {:#04x} ({} bytes)",
+                        report[0],
+                        report.len()
+                    );
+                }
                 Ok(_) => {}
                 Err(e) => {
                     tracing::debug!("onboard input-report poll on {path}: {e}");
