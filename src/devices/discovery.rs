@@ -476,10 +476,6 @@ impl DeviceManager {
             | APEX_PRO_TKL_2024
             | APEX_PRO_TKL_WIRELESS_2024_DONGLE
             | APEX_PRO_TKL_WIRELESS_2024 => Ok(Box::new(ApexProTkl2023::new(generic_keyboard))),
-            _ if super::keyboards::apex_7::onboard_capable(info.product_id) => {
-                Ok(Box::new(super::keyboards::apex_7::Apex7::new(generic_keyboard)))
-            }
-
             _ => Ok(Box::new(generic_keyboard)),
         }
     }

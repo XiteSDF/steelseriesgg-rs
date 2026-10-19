@@ -617,6 +617,14 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   siblings, `docs/development/devices.md` keeps the registry names) - what is gone is the code that enabled
   boards nobody has read an answer from.
 
+- 2026-10-19 (discovery never asks the on-board question): the catch-all arm in `discovery::open_keyboard`
+  that wrapped an on-board-capable product ID in `Apex7` is deleted, so a keyboard is built from its HID
+  collection and product ID alone and keeps its lighting path whatever it can read off the board. The scope is
+  stated once, on the codec: `Apex7Onboard::knows_product` (`0x1612`, the board the frames are known from),
+  asked by `Apex7::onboard_codec` and reported by `Keyboard::supports_onboard_profile`
+  (`= onboard_codec().is_some()`), which is the gate `open_onboard_keyboard` and `onboard read --device <pid>`
+  use. `onboard_capable` and `Apex7::supports_onboard` are deleted as duplicates of that one report.
+
 ## Reference projects
 
 - Apex RGB: OpenRGB `SteelSeriesApex8ZoneController`

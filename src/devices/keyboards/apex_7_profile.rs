@@ -12,7 +12,7 @@
 //! [`crate::devices::keyboards::apex_pro_tkl_2023_profile`]) and shares none of it. The engine's own
 //! protocol file (`lisp/apex_7.lisp`) covers the whole legacy platform, `lisp/base_apex_legacy.lisp:6`,
 //! and its words apply to the `0x1614` / `0x1616` / `0x1618` siblings as protocol evidence; this crate
-//! enables the path on the board it measured, `Apex7::onboard_capable`.
+//! enables the path on the board it measured (`Apex7Onboard::knows_product`).
 //!
 //! Protocol status: reverse-engineered. The file ids, chunk geometry, frame layouts and the payload
 //! struct layout below are reproduced from the Windows engine's device descriptors, and the wire part of
@@ -2100,12 +2100,20 @@ impl OnboardProfileCodec for Apex7Onboard {
         ]
     }
 
-    /// The product IDs this protocol is known from (`Apex7::onboard_capable`): the board that was captured.
-    /// Every other product ID needs its own codec, its own payload layout and its own encodable feature set -
-    /// including the `0x1614` / `0x1616` / `0x1618` boards GG lists on this platform, which have no hardware
-    /// here and no measured answer.
+    /// The board this protocol is known from: the Apex 7 (`0x1612`), the one it was captured on and measured
+    /// on. This is the on-board scope, and the only place it is stated:
+    /// [`Apex7::onboard_codec`](crate::devices::keyboards::apex_7::Apex7) answers this question and
+    /// [`Keyboard::supports_onboard_profile`](crate::devices::keyboards::Keyboard::supports_onboard_profile)
+    /// reports it, and discovery never asks it - every keyboard discovery builds is a keyboard with its
+    /// lighting path.
+    ///
+    /// GG's firmware registry puts three more boards on this platform (`0x1614` `apex_pro_tkl`, `0x1616`
+    /// `apex_150`, `0x1618` `apex_7_tkl`, `lisp/base_apex_legacy.lisp:6`) and `apex_7.lisp` drives them the
+    /// same way, which is protocol evidence, not support: none of them has hardware here and none has ever
+    /// answered one of our frames, so each needs its own codec, payload layout and encodable feature set
+    /// before it is enabled.
     fn knows_product(&self, product_id: u16) -> bool {
-        crate::devices::keyboards::apex_7::onboard_capable(product_id)
+        product_id == crate::devices::product_ids::APEX_7
     }
 
     fn config_count(&self) -> u8 {
