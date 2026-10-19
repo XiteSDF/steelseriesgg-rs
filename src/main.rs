@@ -149,14 +149,16 @@ async fn main() -> Result<()> {
         }
 
         Commands::Onboard { action } => {
-            match &action {
-                // The device-side subcommands enumerate hardware; a write asked for its plan only does not.
-                OnboardAction::Read(_) | OnboardAction::Load(_) => {
-                    let mut manager = new_device_manager()?;
-                    cmd_onboard(Some(&mut manager), action).await?;
-                }
-                OnboardAction::Write(args) if args.dry_run => cmd_onboard(None, action).await?,
-                _ => cmd_onboard(None, action).await?,
+            // The subcommands that run on a keyboard get the device manager, which is how they get the
+            // keyboard: the selection runs before the command, so `write` reaches the on-board selection
+            // messages (which keyboard answers the protocol, `--device` between two) instead of the
+            // no-keyboard guard below it. `--dry-run` is the flag that makes a write print its plan, and
+            // it is the same fact the dispatch reads.
+            if action.needs_keyboard() {
+                let mut manager = new_device_manager()?;
+                cmd_onboard(Some(&mut manager), action).await?;
+            } else {
+                cmd_onboard(None, action).await?;
             }
         }
 
@@ -1118,11 +1120,17 @@ fn select_onboard_keyboard(
             Some(pid) => format!(
                 "no keyboard with product ID {pid:04X} answers the on-board profile protocol: the {what} runs \
                  on a keyboard's own handle, only keyboards are candidates, and the only keyboard that answers \
-                 the protocol is the Apex 7 (0x1612), the board it was measured on"
+                 the protocol is the Apex 7 (0x1612), the board it was measured on. `ssgg devices` lists what \
+                 was found; a keyboard listed there with no collection opened is a keyboard whose control \
+                 interface another program holds (see the line below)"
             ),
             None => format!(
                 "no connected keyboard answers the on-board profile protocol: the {what} runs on a keyboard's \
-                 own handle, and only keyboards are candidates (a mouse or a headset is not)"
+                 own handle, and only keyboards are candidates (a mouse or a headset is not). A keyboard whose \
+                 control interface is taken is not a candidate either: `ssgg devices -v` prints the claim probe \
+                 - interface 0 is the one the on-board protocol needs, and GG's wingine (Windows), this crate's \
+                 daemon, or an `onboard read` running elsewhere all hold it. Stop what holds it, or read on the \
+                 device path: SSGG_APEX7_DEVICE_PATH=1 ssgg onboard read"
             ),
         })),
         OnboardKeyboard::Ambiguous { keyboards } => {

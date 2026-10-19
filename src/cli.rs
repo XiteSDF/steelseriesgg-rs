@@ -225,6 +225,21 @@ pub(crate) enum OnboardAction {
     Load(OnboardLoadArgs),
 }
 
+impl OnboardAction {
+    /// Whether this subcommand runs on a keyboard, and so has to enumerate hardware **before** it is
+    /// dispatched. A subcommand that works on files (`decode`, `encode`) and a write asked for its plan
+    /// alone (`--dry-run`, which opens nothing) answer false, and the dispatch gives them no device
+    /// manager at all. A real write answers true: it sends frames, so it runs on a keyboard's own handle
+    /// like a read and a deploy do.
+    pub(crate) const fn needs_keyboard(&self) -> bool {
+        match self {
+            Self::Read(_) | Self::Load(_) => true,
+            Self::Write(args) => !args.dry_run,
+            Self::Decode(_) | Self::Encode(_) => false,
+        }
+    }
+}
+
 /// One on-board profile read. The flags pick the keyboard, the config number and what to do with the
 /// result; nothing on the wire is a flag. The geometry is a protocol constant of the keyboard's protocol
 /// (`apex_7_profile`: 12 pulls of the device's 1024-byte resource buffer, each
@@ -860,5 +875,94 @@ pub(crate) fn parse_key_name(name: &str) -> Option<KeyId> {
         "`" | "BACKTICK" => Some(KeyId::Backtick),
 
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn read_args() -> OnboardReadArgs {
+        OnboardReadArgs {
+            profile: 1,
+            device: None,
+            out: None,
+            bin: None,
+            report: None,
+            hex: false,
+            verify: false,
+        }
+    }
+
+    fn load_args() -> OnboardLoadArgs {
+        OnboardLoadArgs {
+            profile: 1,
+            device: None,
+        }
+    }
+
+    fn decode_args() -> OnboardDecodeArgs {
+        OnboardDecodeArgs {
+            file: PathBuf::from("p.bin"),
+            out: None,
+            hex: false,
+            hex_from: 0,
+            hex_len: 64,
+        }
+    }
+
+    fn encode_args() -> OnboardEncodeArgs {
+        OnboardEncodeArgs {
+            file: PathBuf::from("p.json"),
+            out: None,
+            check: None,
+            hex: false,
+            hex_from: 0,
+            hex_len: 64,
+        }
+    }
+
+    fn write_args(dry_run: bool) -> OnboardWriteArgs {
+        OnboardWriteArgs {
+            file: Some(PathBuf::from("p.json")),
+            bin: None,
+            profile: 1,
+            device: None,
+            dry_run,
+        }
+    }
+
+    /// `main` hands a device manager to a subcommand exactly when this says true, so the flag that stops a
+    /// write from sending anything is also what keeps it from opening a keyboard.
+    #[test]
+    fn a_write_needs_a_keyboard_only_when_it_is_asked_to_send() {
+        assert!(
+            OnboardAction::Write(write_args(false)).needs_keyboard(),
+            "a write without --dry-run sends frames and must enumerate the keyboard it sends them on"
+        );
+        assert!(
+            !OnboardAction::Write(write_args(true)).needs_keyboard(),
+            "a dry run prints the plan and opens no keyboard"
+        );
+    }
+
+    #[test]
+    fn the_on_board_subcommands_that_run_on_a_keyboard_are_read_write_and_deploy() {
+        assert!(
+            OnboardAction::Read(read_args()).needs_keyboard(),
+            "a read pulls bytes from a keyboard's handle"
+        );
+        assert!(
+            OnboardAction::Load(load_args()).needs_keyboard(),
+            "a deploy sends a frame to a keyboard"
+        );
+        assert!(
+            !OnboardAction::Decode(decode_args()).needs_keyboard(),
+            "decode works on an image a previous read wrote"
+        );
+        assert!(
+            !OnboardAction::Encode(encode_args()).needs_keyboard(),
+            "encode writes bytes and sends nothing"
+        );
     }
 }
