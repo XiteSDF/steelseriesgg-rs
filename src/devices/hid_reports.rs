@@ -49,24 +49,24 @@ pub enum CommandCode {
     /// (`03 00 | buffer offset u16 | size u16 | payload`), see [`OnboardBufferWriteCommand`].
     ProfileChunk = 0x03,
     /// [EXPERIMENTAL] Legacy Apex (Apex 7, Apex Raw, Apex 2014) resource-buffer pull (0x85), see
-    /// `OnboardPullCommand`: answered by the keyboard's ordinary input report, not by a pull-specific one.
-    OnboardPull = 0x85,
-    /// [EXPERIMENTAL] Legacy Apex resource-buffer push into a profile file (0x05), see [`OnboardPushCommand`]:
+    /// `OnboardPayloadPullCommand`: answered by the keyboard's ordinary input report, not by a pull-specific one.
+    OnboardPayloadPull = 0x85,
+    /// [EXPERIMENTAL] Legacy Apex resource-buffer push into a profile file (0x05), see [`OnboardPayloadPushCommand`]:
     /// the write side of the transfer, answered by the interrupt report `05 01 …`.
-    OnboardPush = 0x05,
+    OnboardPayloadPush = 0x05,
     /// [EXPERIMENTAL] Legacy Apex on-board file open (0x88), see [`OnboardFileOpenCommand`]: the frame the
     /// write API sends before it pushes a file, answered by the interrupt report `88 01 …`.
     OnboardFileOpen = 0x88,
-    /// [EXPERIMENTAL] Legacy Apex profile commit (0xEB), see [`OnboardCommitCommand`]: the frame the write
+    /// [EXPERIMENTAL] Legacy Apex profile commit (0xEB), see [`OnboardFileCommitCommand`]: the frame the write
     /// API sends after the last push of the profile region.
-    OnboardCommit = 0xEB,
-    /// [EXPERIMENTAL] Legacy Apex on-board payload read (0x83), see `OnboardReadCommand`.
-    OnboardPayloadRead = 0x83,
+    OnboardFileCommit = 0xEB,
+    /// [EXPERIMENTAL] Legacy Apex on-board payload read (0x83), see `OnboardBufferReadCommand`.
+    OnboardBufferRead = 0x83,
     /// [EXPERIMENTAL] Legacy Apex firmware-version poll (0x90): `90 <source>`, answered on the interrupt
     /// endpoint with the ASCII firmware version. The source byte selects which firmware answers -
     /// [`FirmwareSource::Keyboard`] (`90 00`) the keyboard's, [`FirmwareSource::Led`] (`90 01`) the LED
     /// controller's. See [`OnboardFirmwareVersionCommand`].
-    FirmwareVersion = 0x90,
+    OnboardFirmwareVersion = 0x90,
     /// `[EXPERIMENTAL]` Legacy Apex driver mode (0x6C): GG's engine writes `6c 00 01` when it opens a
     /// device and `6c 00 00` when it closes a session - same report number 0, same command, one byte
     /// apart. Only the opening frame is in the reference capture (answered `6c 00 01 00…`). **Nothing in
@@ -74,13 +74,13 @@ pub enum CommandCode {
     /// engine also writes on closing) and the Apex 3 family split (`0x03` in a 33-byte report on Apex 3,
     /// `0x6C` with a different opening byte on Apex 3 TKL) is in
     /// `docs/development/apex-7-onboard-profile-read.md` §Driver mode. See [`OnboardDriverModeCommand`].
-    DriverMode = 0x6C,
+    OnboardDriverMode = 0x6C,
     /// `[EXPERIMENTAL]` Legacy Apex profile deploy (0x89): GG's `89 <1-based profile id>`, the
     /// `load_profile` frame seen behind profile-file transfers in the reference capture (slots 0, 1, 2, 4
     /// going out as 1, 2, 3, 5). **This writes to the device** - the keyboard runs the slot named. The
     /// `ssgg onboard write` and `ssgg onboard load` commands send it, on request only; a plain read sends
-    /// nothing. See [`OnboardLoadProfileCommand`].
-    LoadProfile = 0x89,
+    /// nothing. See [`OnboardProfileDeployCommand`].
+    OnboardProfileDeploy = 0x89,
 }
 
 impl fmt::Display for CommandCode {
@@ -95,14 +95,14 @@ impl fmt::Display for CommandCode {
             CommandCode::Apex2023Direct => write!(f, "APEX2023_DIRECT_EXPERIMENTAL"),
             CommandCode::ActuationControl => write!(f, "ACTUATION_CTRL_EXPERIMENTAL"),
             CommandCode::ProfileChunk => write!(f, "PROFILE_CHUNK_EXPERIMENTAL"),
-            CommandCode::OnboardPull => write!(f, "ONBOARD_PULL_EXPERIMENTAL"),
-            CommandCode::OnboardPush => write!(f, "ONBOARD_PUSH_EXPERIMENTAL"),
+            CommandCode::OnboardPayloadPull => write!(f, "ONBOARD_PULL_EXPERIMENTAL"),
+            CommandCode::OnboardPayloadPush => write!(f, "ONBOARD_PUSH_EXPERIMENTAL"),
             CommandCode::OnboardFileOpen => write!(f, "ONBOARD_FILE_OPEN_EXPERIMENTAL"),
-            CommandCode::OnboardCommit => write!(f, "ONBOARD_COMMIT_EXPERIMENTAL"),
-            CommandCode::OnboardPayloadRead => write!(f, "ONBOARD_PAYLOAD_READ_EXPERIMENTAL"),
-            CommandCode::FirmwareVersion => write!(f, "FIRMWARE_VERSION_EXPERIMENTAL"),
-            CommandCode::DriverMode => write!(f, "DRIVER_MODE_EXPERIMENTAL"),
-            CommandCode::LoadProfile => write!(f, "LOAD_PROFILE_EXPERIMENTAL"),
+            CommandCode::OnboardFileCommit => write!(f, "ONBOARD_COMMIT_EXPERIMENTAL"),
+            CommandCode::OnboardBufferRead => write!(f, "ONBOARD_PAYLOAD_READ_EXPERIMENTAL"),
+            CommandCode::OnboardFirmwareVersion => write!(f, "FIRMWARE_VERSION_EXPERIMENTAL"),
+            CommandCode::OnboardDriverMode => write!(f, "DRIVER_MODE_EXPERIMENTAL"),
+            CommandCode::OnboardProfileDeploy => write!(f, "LOAD_PROFILE_EXPERIMENTAL"),
         }
     }
 }
@@ -123,14 +123,14 @@ impl CommandCode {
             0x40 => Some(CommandCode::Apex2023Direct),
             0x2D => Some(CommandCode::ActuationControl),
             0x03 => Some(CommandCode::ProfileChunk),
-            0x85 => Some(CommandCode::OnboardPull),
-            0x05 => Some(CommandCode::OnboardPush),
+            0x85 => Some(CommandCode::OnboardPayloadPull),
+            0x05 => Some(CommandCode::OnboardPayloadPush),
             0x88 => Some(CommandCode::OnboardFileOpen),
-            0xEB => Some(CommandCode::OnboardCommit),
-            0x83 => Some(CommandCode::OnboardPayloadRead),
-            0x90 => Some(CommandCode::FirmwareVersion),
-            0x6C => Some(CommandCode::DriverMode),
-            0x89 => Some(CommandCode::LoadProfile),
+            0xEB => Some(CommandCode::OnboardFileCommit),
+            0x83 => Some(CommandCode::OnboardBufferRead),
+            0x90 => Some(CommandCode::OnboardFirmwareVersion),
+            0x6C => Some(CommandCode::OnboardDriverMode),
+            0x89 => Some(CommandCode::OnboardProfileDeploy),
             _ => None,
         }
     }
@@ -509,14 +509,14 @@ pub const ONBOARD_FEATURE_REPORT_SIZE: usize = 643;
 ///
 /// `[EXPERIMENTAL]` Wire length capture-confirmed on Windows (Apex 7, 2026-10-15); the answering length
 /// measured on Linux the same day.
-pub const ONBOARD_GET_WIRE_BYTES: usize = 642;
+pub const ONBOARD_READ_WIRE_BYTES: usize = 642;
 
 /// Bytes a payload read frame may ask for. A reply report arrives as `[report ID][641 bytes]`, and a
 /// header-echoing reply puts a further 5-byte header (`03 01 01 00 01`, see `READ_REPLY_HEADER_LEN` in
 /// `apex_legacy_profile`) in front of the payload, so the payload a read can ask for tops out at
 /// 642 - 1 - 5 = 636. An earlier version of this constant said 641: it subtracted the report-ID byte but
 /// not the header, which let a read frame ask for a size no reply can carry.
-pub const ONBOARD_MAX_READ_LEN: usize = ONBOARD_GET_WIRE_BYTES - 1 - 5;
+pub const ONBOARD_MAX_READ_LEN: usize = ONBOARD_READ_WIRE_BYTES - 1 - 5;
 
 /// Firmware source byte for [`OnboardFirmwareVersionCommand`]: which firmware the `90` poll asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -573,14 +573,14 @@ impl OnboardFirmwareVersionCommand {
 
 impl HidCommand for OnboardFirmwareVersionCommand {
     fn command_code(&self) -> CommandCode {
-        CommandCode::FirmwareVersion
+        CommandCode::OnboardFirmwareVersion
     }
 
     fn serialize(&self, buffer: &mut [u8], _device_type: HidDeviceType) -> Result<usize> {
         check_report_buffer(buffer, ONBOARD_OUTPUT_REPORT_SIZE)?;
         let report = &mut buffer[..ONBOARD_OUTPUT_REPORT_SIZE];
         report.fill(0);
-        report[1] = CommandCode::FirmwareVersion as u8;
+        report[1] = CommandCode::OnboardFirmwareVersion as u8;
         report[2] = self.source.into();
         Ok(ONBOARD_OUTPUT_REPORT_SIZE)
     }
@@ -633,14 +633,14 @@ pub struct OnboardDriverModeCommand {
 
 impl HidCommand for OnboardDriverModeCommand {
     fn command_code(&self) -> CommandCode {
-        CommandCode::DriverMode
+        CommandCode::OnboardDriverMode
     }
 
     fn serialize(&self, buffer: &mut [u8], _device_type: HidDeviceType) -> Result<usize> {
         check_report_buffer(buffer, ONBOARD_OUTPUT_REPORT_SIZE)?;
         let report = &mut buffer[..ONBOARD_OUTPUT_REPORT_SIZE];
         report.fill(0);
-        report[1] = CommandCode::DriverMode as u8;
+        report[1] = CommandCode::OnboardDriverMode as u8;
         report[3] = self.mode.into();
         Ok(ONBOARD_OUTPUT_REPORT_SIZE)
     }
@@ -665,14 +665,14 @@ pub const ONBOARD_PROFILE_SLOT_COUNT: u8 = 5;
 /// it at the end of a write (after the 250 ms pause the descriptors' deploy API puts behind the frame) and
 /// `ssgg onboard load` sends it on its own; a read sends nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OnboardLoadProfileCommand {
+pub struct OnboardProfileDeployCommand {
     /// Profile slot, 0-based as everywhere in this crate; the wire id is `profile + 1`.
     pub profile: u8,
 }
 
-impl HidCommand for OnboardLoadProfileCommand {
+impl HidCommand for OnboardProfileDeployCommand {
     fn command_code(&self) -> CommandCode {
-        CommandCode::LoadProfile
+        CommandCode::OnboardProfileDeploy
     }
 
     fn serialize(&self, buffer: &mut [u8], _device_type: HidDeviceType) -> Result<usize> {
@@ -680,7 +680,7 @@ impl HidCommand for OnboardLoadProfileCommand {
         check_report_buffer(buffer, ONBOARD_OUTPUT_REPORT_SIZE)?;
         let report = &mut buffer[..ONBOARD_OUTPUT_REPORT_SIZE];
         report.fill(0);
-        report[1] = CommandCode::LoadProfile as u8;
+        report[1] = CommandCode::OnboardProfileDeploy as u8;
         report[2] = self.profile.saturating_add(1);
         Ok(ONBOARD_OUTPUT_REPORT_SIZE)
     }
@@ -710,13 +710,13 @@ impl HidCommand for OnboardLoadProfileCommand {
 /// [`ONBOARD_OUTPUT_REPORT_SIZE`]. **The pull has no reply with content**: GG follows it with one input
 /// read and keeps none of the bytes (its read spec's byte specifier for the pull is zero length), and on the
 /// wire that packet is the keyboard's ordinary input report - report `0x01`, all-zero on an idle keyboard, in
-/// all 121 pulls of the capture. The pull is flow control; the profile bytes come from [`OnboardReadCommand`].
+/// all 121 pulls of the capture. The pull is flow control; the profile bytes come from [`OnboardBufferReadCommand`].
 /// Draining that packet is not optional on Linux - see `Apex7::read_pull_ack`.
 ///
 /// Sizes and frame layout from the 2026-10-15 reference capture (121 pulls of 1024 bytes at file
 /// offsets 0, 4, 8, … 44 for the schema probe and 0..11264 for full files).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OnboardPullCommand {
+pub struct OnboardPayloadPullCommand {
     /// Profile file id: the file base plus the profile index, and the same ids at +0x0100 for the
     /// lighting files.
     pub fs_id: u16,
@@ -726,16 +726,16 @@ pub struct OnboardPullCommand {
     pub size: u16,
 }
 
-impl OnboardPullCommand {
+impl OnboardPayloadPullCommand {
     /// Significant frame bytes behind the report number.
     pub const FRAME_LEN: usize = 10;
     /// Largest pull the capture shows, the size of the keyboard's resource buffer.
     pub const MAX_SIZE: u16 = 1024;
 }
 
-impl HidCommand for OnboardPullCommand {
+impl HidCommand for OnboardPayloadPullCommand {
     fn command_code(&self) -> CommandCode {
-        CommandCode::OnboardPull
+        CommandCode::OnboardPayloadPull
     }
 
     fn serialize(&self, buffer: &mut [u8], _device_type: HidDeviceType) -> Result<usize> {
@@ -743,7 +743,7 @@ impl HidCommand for OnboardPullCommand {
         check_report_buffer(buffer, ONBOARD_OUTPUT_REPORT_SIZE)?;
         let report = &mut buffer[..ONBOARD_OUTPUT_REPORT_SIZE];
         report.fill(0);
-        report[1] = CommandCode::OnboardPull as u8;
+        report[1] = CommandCode::OnboardPayloadPull as u8;
         report[3..5].copy_from_slice(&self.fs_id.to_le_bytes());
         report[5..9].copy_from_slice(&self.file_offset.to_le_bytes());
         report[9..Self::FRAME_LEN + 1].copy_from_slice(&self.size.to_le_bytes());
@@ -777,21 +777,21 @@ impl HidCommand for OnboardPullCommand {
 /// `[EXPERIMENTAL]` The reference capture shows every read answered with the file head (schema word and
 /// profile name) and zeros, never the requested window; the full read has never completed on hardware.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OnboardReadCommand {
+pub struct OnboardBufferReadCommand {
     /// Offset in the resource buffer.
     pub buffer_offset: u16,
     /// Bytes to return.
     pub size: u16,
 }
 
-impl OnboardReadCommand {
+impl OnboardBufferReadCommand {
     /// Significant frame bytes behind the report number.
     pub const FRAME_LEN: usize = 6;
 }
 
-impl HidCommand for OnboardReadCommand {
+impl HidCommand for OnboardBufferReadCommand {
     fn command_code(&self) -> CommandCode {
-        CommandCode::OnboardPayloadRead
+        CommandCode::OnboardBufferRead
     }
 
     fn serialize(&self, buffer: &mut [u8], _device_type: HidDeviceType) -> Result<usize> {
@@ -799,7 +799,7 @@ impl HidCommand for OnboardReadCommand {
         check_report_buffer(buffer, ONBOARD_FEATURE_REPORT_SIZE)?;
         let report = &mut buffer[..ONBOARD_FEATURE_REPORT_SIZE];
         report.fill(0);
-        report[1] = CommandCode::OnboardPayloadRead as u8;
+        report[1] = CommandCode::OnboardBufferRead as u8;
         report[3..5].copy_from_slice(&self.buffer_offset.to_le_bytes());
         report[5..Self::FRAME_LEN + 1].copy_from_slice(&self.size.to_le_bytes());
         Ok(ONBOARD_FEATURE_REPORT_SIZE)
@@ -810,7 +810,7 @@ impl HidCommand for OnboardReadCommand {
             return Err(Error::InvalidConfig(format!(
                 "payload read of {} bytes exceeds the {} bytes a {}-byte reply report carries behind its \
                  5-byte header",
-                self.size, ONBOARD_MAX_READ_LEN, ONBOARD_GET_WIRE_BYTES
+                self.size, ONBOARD_MAX_READ_LEN, ONBOARD_READ_WIRE_BYTES
             )));
         }
         Ok(())
@@ -879,7 +879,7 @@ impl HidCommand for OnboardFileOpenCommand {
 /// `[EXPERIMENTAL]` The engine's write API fills one 1024-byte window of the buffer with two of these,
 /// 512 bytes each, and the Apex 7 write capture shows exactly that: every window is a write at
 /// buffer offset 0 and one at 512, with no reply between them. The frame has no reply of its own; the
-/// [`OnboardPushCommand`] that follows it is answered.
+/// [`OnboardPayloadPushCommand`] that follows it is answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OnboardBufferWriteCommand<'a> {
     /// Offset in the resource buffer.
@@ -948,12 +948,12 @@ impl HidCommand for OnboardBufferWriteCommand<'_> {
 /// Copy the resource buffer into a profile file, `[EXPERIMENTAL]`: `05 | 00 | file id u16 LE |
 /// file offset u32 LE | size u16 LE | 00…` inside [`ONBOARD_OUTPUT_REPORT_SIZE`].
 ///
-/// The write side of [`OnboardPullCommand`]'s file access: same header shape, opposite direction. The
+/// The write side of [`OnboardPayloadPullCommand`]'s file access: same header shape, opposite direction. The
 /// engine's write API pushes one full resource buffer per window, and the Apex 7 write capture
 /// answers every push with the interrupt report `05 01 00…` - the only write-side reply with content in
 /// that capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OnboardPushCommand {
+pub struct OnboardPayloadPushCommand {
     /// Profile file id: the file base plus the profile index.
     pub fs_id: u16,
     /// Offset in the profile file.
@@ -962,16 +962,16 @@ pub struct OnboardPushCommand {
     pub size: u16,
 }
 
-impl OnboardPushCommand {
+impl OnboardPayloadPushCommand {
     /// Significant frame bytes behind the report number.
     pub const FRAME_LEN: usize = 10;
     /// The push size the capture shows, the size of the keyboard's resource buffer.
     pub const MAX_SIZE: u16 = 1024;
 }
 
-impl HidCommand for OnboardPushCommand {
+impl HidCommand for OnboardPayloadPushCommand {
     fn command_code(&self) -> CommandCode {
-        CommandCode::OnboardPush
+        CommandCode::OnboardPayloadPush
     }
 
     fn serialize(&self, buffer: &mut [u8], _device_type: HidDeviceType) -> Result<usize> {
@@ -979,7 +979,7 @@ impl HidCommand for OnboardPushCommand {
         check_report_buffer(buffer, ONBOARD_OUTPUT_REPORT_SIZE)?;
         let report = &mut buffer[..ONBOARD_OUTPUT_REPORT_SIZE];
         report.fill(0);
-        report[1] = CommandCode::OnboardPush as u8;
+        report[1] = CommandCode::OnboardPayloadPush as u8;
         report[3..5].copy_from_slice(&self.fs_id.to_le_bytes());
         report[5..9].copy_from_slice(&self.file_offset.to_le_bytes());
         report[9..Self::FRAME_LEN + 1].copy_from_slice(&self.size.to_le_bytes());
@@ -1017,19 +1017,19 @@ impl HidCommand for OnboardPushCommand {
 ///
 /// `[EXPERIMENTAL]` The capture answers it with no write-specific reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OnboardCommitCommand {
+pub struct OnboardFileCommitCommand {
     /// Profile slot, 0-based as everywhere in this crate; the wire byte is `profile + 1`.
     pub profile: u8,
 }
 
-impl OnboardCommitCommand {
+impl OnboardFileCommitCommand {
     /// Significant frame bytes behind the report number.
     pub const FRAME_LEN: usize = 2;
 }
 
-impl HidCommand for OnboardCommitCommand {
+impl HidCommand for OnboardFileCommitCommand {
     fn command_code(&self) -> CommandCode {
-        CommandCode::OnboardCommit
+        CommandCode::OnboardFileCommit
     }
 
     fn serialize(&self, buffer: &mut [u8], _device_type: HidDeviceType) -> Result<usize> {
@@ -1037,7 +1037,7 @@ impl HidCommand for OnboardCommitCommand {
         check_report_buffer(buffer, ONBOARD_OUTPUT_REPORT_SIZE)?;
         let report = &mut buffer[..ONBOARD_OUTPUT_REPORT_SIZE];
         report.fill(0);
-        report[1] = CommandCode::OnboardCommit as u8;
+        report[1] = CommandCode::OnboardFileCommit as u8;
         report[2] = self.profile.saturating_add(1);
         Ok(ONBOARD_OUTPUT_REPORT_SIZE)
     }
@@ -2148,7 +2148,7 @@ mod tests {
             assert_eq!(size, ONBOARD_OUTPUT_REPORT_SIZE);
             assert_eq!(buffer[0], 0x00, "report number 0, as the capture's wValue 0x0200");
             assert_eq!(&buffer[1..3], &[0x90, expected], "source {}", command.source);
-            assert_eq!(command.command_code(), CommandCode::FirmwareVersion);
+            assert_eq!(command.command_code(), CommandCode::OnboardFirmwareVersion);
             assert!(
                 buffer[3..].iter().all(|b| *b == 0),
                 "the 64-byte data stage is zero padded like the capture's frames"
@@ -2167,7 +2167,7 @@ mod tests {
             );
             assert_eq!(buffer[0], 0x00, "report number 0, as the capture's wValue 0x0200");
             assert_eq!(&buffer[1..4], &[0x6c, 0x00, expected], "mode {mode:?}");
-            assert_eq!(command.command_code(), CommandCode::DriverMode);
+            assert_eq!(command.command_code(), CommandCode::OnboardDriverMode);
             assert!(buffer[4..].iter().all(|b| *b == 0), "zero padded data stage");
         }
     }
@@ -2176,7 +2176,7 @@ mod tests {
     fn load_profile_command_uses_the_1_based_profile_id() {
         let builder = HidReportBuilder::new(HidDeviceType::Keyboard);
         for slot in 0..ONBOARD_PROFILE_SLOT_COUNT {
-            let command = OnboardLoadProfileCommand { profile: slot };
+            let command = OnboardProfileDeployCommand { profile: slot };
             let wire_id = slot.saturating_add(1);
             let mut buffer = [0u8; ONBOARD_OUTPUT_REPORT_SIZE];
             assert_eq!(
@@ -2192,7 +2192,7 @@ mod tests {
             assert!(buffer[3..].iter().all(|b| *b == 0), "zero padded data stage");
         }
         assert!(
-            OnboardLoadProfileCommand {
+            OnboardProfileDeployCommand {
                 profile: ONBOARD_PROFILE_SLOT_COUNT
             }
             .validate()
@@ -2252,7 +2252,7 @@ mod tests {
         }
 
         // The push of window 0: capture `05 00 01 …`, wValue 0x0200 wLength 64.
-        let push = OnboardPushCommand {
+        let push = OnboardPayloadPushCommand {
             fs_id: 0x0201,
             file_offset: 0,
             size: 1024,
@@ -2263,18 +2263,20 @@ mod tests {
             ONBOARD_OUTPUT_REPORT_SIZE
         );
         assert_eq!(
-            &buffer[1..OnboardPushCommand::FRAME_LEN + 2],
+            &buffer[1..OnboardPayloadPushCommand::FRAME_LEN + 2],
             &[0x05, 0x00, 0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00],
             "capture 05 00 | file id u16 | file offset u32 | size u16, all little endian, behind the report number"
         );
         assert!(
-            buffer[OnboardPushCommand::FRAME_LEN + 2..].iter().all(|b| *b == 0),
+            buffer[OnboardPayloadPushCommand::FRAME_LEN + 2..]
+                .iter()
+                .all(|b| *b == 0),
             "zero padded data stage"
         );
 
         // The commit: capture `eb 01 00 …`, wValue 0x0200 wLength 64 - an output report, slot 0 going
         // out as 1.
-        let commit = OnboardCommitCommand { profile: 0 };
+        let commit = OnboardFileCommitCommand { profile: 0 };
         let mut buffer = [0u8; ONBOARD_OUTPUT_REPORT_SIZE];
         assert_eq!(
             commit.serialize(&mut buffer, HidDeviceType::Keyboard).unwrap(),
@@ -2306,7 +2308,7 @@ mod tests {
             "an empty write is not a frame the engine sends"
         );
         assert!(
-            OnboardPushCommand {
+            OnboardPayloadPushCommand {
                 fs_id: 0,
                 file_offset: 0,
                 size: 1024,
@@ -2316,7 +2318,7 @@ mod tests {
             "a push needs a file id"
         );
         assert!(
-            OnboardPushCommand {
+            OnboardPayloadPushCommand {
                 fs_id: 0x0201,
                 file_offset: 0,
                 size: 1025,
@@ -2330,7 +2332,7 @@ mod tests {
             "the write API opens a profile file id, never 0"
         );
         assert!(
-            OnboardCommitCommand {
+            OnboardFileCommitCommand {
                 profile: ONBOARD_PROFILE_SLOT_COUNT
             }
             .validate()
@@ -2341,7 +2343,7 @@ mod tests {
 
     #[test]
     fn pull_frame_matches_the_capture_layout() {
-        let cmd = OnboardPullCommand {
+        let cmd = OnboardPayloadPullCommand {
             fs_id: 0x0201,
             file_offset: 4096,
             size: 1024,
@@ -2353,13 +2355,13 @@ mod tests {
         );
         assert_eq!(buffer[0], 0x00);
         assert_eq!(
-            &buffer[1..OnboardPullCommand::FRAME_LEN + 1],
+            &buffer[1..OnboardPayloadPullCommand::FRAME_LEN + 1],
             [0x85, 0x00, 0x01, 0x02, 0x00, 0x10, 0x00, 0x00, 0x00, 0x04],
             "the capture's frame bytes, behind the report number"
         );
         assert!(buffer[11..].iter().all(|b| *b == 0));
         assert!(
-            OnboardPullCommand {
+            OnboardPayloadPullCommand {
                 fs_id: 0x0201,
                 file_offset: 0,
                 size: 2048,
@@ -2384,7 +2386,7 @@ mod tests {
         assert_eq!(
             builder
                 .build_report(
-                    OnboardPullCommand {
+                    OnboardPayloadPullCommand {
                         fs_id: 0x0201,
                         file_offset: 0,
                         size: 1024,
@@ -2398,7 +2400,7 @@ mod tests {
         assert_eq!(
             builder
                 .build_report(
-                    OnboardReadCommand {
+                    OnboardBufferReadCommand {
                         buffer_offset: 512,
                         size: 512,
                     },
@@ -2413,7 +2415,7 @@ mod tests {
         assert!(
             builder
                 .build_report(
-                    OnboardPullCommand {
+                    OnboardPayloadPullCommand {
                         fs_id: 0x0201,
                         file_offset: 0,
                         size: 4096,
@@ -2427,7 +2429,7 @@ mod tests {
 
     #[test]
     fn read_frame_matches_the_capture_layout() {
-        let cmd = OnboardReadCommand {
+        let cmd = OnboardBufferReadCommand {
             buffer_offset: 512,
             size: 512,
         };
@@ -2437,11 +2439,11 @@ mod tests {
             ONBOARD_FEATURE_REPORT_SIZE
         );
         assert_eq!(
-            &buffer[1..OnboardReadCommand::FRAME_LEN + 1],
+            &buffer[1..OnboardBufferReadCommand::FRAME_LEN + 1],
             [0x83, 0x00, 0x00, 0x02, 0x00, 0x02]
         );
         assert_eq!(
-            OnboardReadCommand {
+            OnboardBufferReadCommand {
                 buffer_offset: 0,
                 size: 2,
             }
@@ -2450,7 +2452,7 @@ mod tests {
             ONBOARD_FEATURE_REPORT_SIZE
         );
         assert_eq!(
-            &buffer[1..OnboardReadCommand::FRAME_LEN + 1],
+            &buffer[1..OnboardBufferReadCommand::FRAME_LEN + 1],
             [0x83, 0x00, 0x00, 0x00, 0x02, 0x00]
         );
         let mut buffer = [0u8; ONBOARD_FEATURE_REPORT_SIZE];
@@ -2461,7 +2463,7 @@ mod tests {
         assert_eq!(buffer[0], 0x00, "report number 0, as the capture's wValue 0x0300");
         assert!(buffer[7..].iter().all(|b| *b == 0));
         assert!(
-            OnboardReadCommand {
+            OnboardBufferReadCommand {
                 buffer_offset: 0,
                 size: 1024,
             }
@@ -2482,10 +2484,10 @@ mod tests {
         // capture's GET wLength. Write side: the kernel strips the report number, so the 643-byte buffer of
         // ONBOARD_FEATURE_REPORT_SIZE goes out as wLength 642. The asymmetry is the kernel's, and the
         // measured lengths are the anchor: 642 answers, 643 never completes (2026-10-15).
-        assert_eq!(ONBOARD_GET_WIRE_BYTES, 642, "the capture's GET wLength and our ask");
+        assert_eq!(ONBOARD_READ_WIRE_BYTES, 642, "the capture's GET wLength and our ask");
         assert_eq!(
             ONBOARD_FEATURE_REPORT_SIZE,
-            ONBOARD_GET_WIRE_BYTES + 1,
+            ONBOARD_READ_WIRE_BYTES + 1,
             "the write buffer carries a report-number byte the wire does not"
         );
         assert_eq!(
@@ -2493,7 +2495,7 @@ mod tests {
             "642 reply bytes minus the report-ID byte and the 5-byte header"
         );
         assert!(
-            OnboardReadCommand {
+            OnboardBufferReadCommand {
                 buffer_offset: 0,
                 size: 636,
             }
@@ -2502,7 +2504,7 @@ mod tests {
             "the largest payload a header-echoing reply can carry is accepted"
         );
         assert!(
-            OnboardReadCommand {
+            OnboardBufferReadCommand {
                 buffer_offset: 0,
                 size: 637,
             }

@@ -43,7 +43,7 @@ eb 01                                                    # commit after the last
 ```
 
 The profile session pushes at file offsets `0, 1024, 2048, …, 39936` - 40 windows, **40,960 bytes of file
-region**, which is the same region the read pulls (§`OnboardPullCommand` of the read note: 40 fills, offsets
+region**, which is the same region the read pulls (§`OnboardPayloadPullCommand` of the read note: 40 fills, offsets
 `0..=0x9C00`). The capture's "250 pushes reaching `0x9C00`" is this geometry (`0x9C00` = 39,936).
 The lighting session is the same shape at 12 windows (12,288 bytes, the size of the lighting files).
 
@@ -132,7 +132,7 @@ other, 4-byte `0x6C` shape the same family uses for driver mode.
 `Apex7::write_profile` (via `Keyboard::write_onboard_profile`) runs the plan; the geometry, the frames and the
 pacing come from `apex_legacy_profile::write_plan` (`OnboardWritePlan`, `OnboardWriteFrame`), and the frames go
 out through the typed commands `OnboardFileOpenCommand` (`0x88`), `OnboardBufferWriteCommand` (`0x03`, feature
-report), `OnboardPushCommand` (`0x05`), `OnboardCommitCommand` (`0xEB`) and `OnboardLoadProfileCommand`
+report), `OnboardPayloadPushCommand` (`0x05`), `OnboardFileCommitCommand` (`0xEB`) and `OnboardProfileDeployCommand`
 (`0x89`), all built in `src/devices/hid_reports.rs`.
 
 - The payload goes through the existing encoder (`encode_json`): decode report → payload, checksum recomputed

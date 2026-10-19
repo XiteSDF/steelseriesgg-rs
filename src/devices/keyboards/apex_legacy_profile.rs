@@ -69,7 +69,7 @@
 //!   **This crate sends none of them**: measured 2026-10-19, the read works without them. They matter as a
 //!   set because `89` **writes** - the keyboard runs the slot named - so a tool that sends them changes the
 //!   keyboard's active profile. The named builders
-//!   [`OnboardLoadProfileCommand`](crate::devices::hid_reports::OnboardLoadProfileCommand) and
+//!   [`OnboardProfileDeployCommand`](crate::devices::hid_reports::OnboardProfileDeployCommand) and
 //!   [`OnboardDriverModeCommand`](crate::devices::hid_reports::OnboardDriverModeCommand) exist for that
 //!   work and nothing in ssgg sends them
 //!   (`docs/development/apex-7-onboard-profile-read.md` §Driver mode).
@@ -88,8 +88,8 @@
 //! the assembled image is [`PROFILE_FILE_BYTES`] bytes with no id byte.
 
 use crate::devices::hid_reports::{
-    HidCommand, ONBOARD_FEATURE_REPORT_SIZE, ONBOARD_GET_WIRE_BYTES, ONBOARD_MAX_READ_LEN, ONBOARD_OUTPUT_REPORT_SIZE,
-    OnboardBufferWriteCommand, OnboardCommitCommand, OnboardFileOpenCommand, OnboardPushCommand,
+    HidCommand, ONBOARD_FEATURE_REPORT_SIZE, ONBOARD_MAX_READ_LEN, ONBOARD_OUTPUT_REPORT_SIZE, ONBOARD_READ_WIRE_BYTES,
+    OnboardBufferWriteCommand, OnboardFileCommitCommand, OnboardFileOpenCommand, OnboardPayloadPushCommand,
 };
 use crate::devices::keyboards::apex_pro_tkl_2023_profile::profile_checksum;
 use crate::devices::keyboards::onboard::{OnboardDevice, OnboardProfileCodec};
@@ -136,7 +136,7 @@ pub const MACRO_DATA_LEN: usize = 9600;
 /// Command byte of the push (profile write); defined for completeness, nothing here sends it. The
 /// read path has no command bytes of its own: they are
 /// [`crate::devices::hid_reports::CommandCode`] variants and every frame is built by a typed command in
-/// [`crate::devices::hid_reports`] (see [`crate::devices::hid_reports::OnboardPullCommand`]).
+/// [`crate::devices::hid_reports`] (see [`crate::devices::hid_reports::OnboardPayloadPullCommand`]).
 pub const CMD_PUSH_PAYLOAD: u8 = 0x05;
 /// Report ID of every request frame.
 pub const REQUEST_REPORT_ID: u8 = 0x00;
@@ -147,12 +147,12 @@ pub const READ_REPLY_REPORT_ID: u8 = 0x83;
 pub const PULL_REPLY_REPORT_ID: u8 = 0x85;
 /// Report ID of a lighting-config payload-read reply.
 pub const LIGHTING_READ_REPLY_REPORT_ID: u8 = 0x03;
-/// Buffer size to ask the transport for when reading a payload read back: [`ONBOARD_GET_WIRE_BYTES`] (642).
+/// Buffer size to ask the transport for when reading a payload read back: [`ONBOARD_READ_WIRE_BYTES`] (642).
 /// The read side sends this number to the device as `wLength` verbatim, which is the capture's
 /// `GET_REPORT wValue 0x0300 wIndex 1 wLength 642`; asking 643 makes the transfer never complete
 /// (`Connection timed out`, measured 2026-10-15). The kernel lands the device's report-ID byte in buffer[0],
 /// so the reply arrives as `[report ID][641 bytes]`.
-pub const READ_REPORT_LEN: usize = ONBOARD_GET_WIRE_BYTES;
+pub const READ_REPORT_LEN: usize = ONBOARD_READ_WIRE_BYTES;
 /// Data-stage length of the 64-byte output reports of this protocol (`SET_REPORT wValue 0x0200
 /// wIndex 1 wLength 64`): the firmware poll and every pull. The report number the transport prefixes
 /// is not part of it.
@@ -181,7 +181,7 @@ pub const READ_REPLY_FRAMING_LEN: usize = 0;
 /// this read replays none of them. `--gap-ms` is gone, so this constant is the pacing.)
 pub const GG_GAP_MS: u64 = 5;
 
-/// Firmware version a [`crate::devices::hid_reports::CommandCode::FirmwareVersion`] answer carries: the printable
+/// Firmware version a [`crate::devices::hid_reports::CommandCode::OnboardFirmwareVersion`] answer carries: the printable
 /// ASCII run
 /// from the first byte, which the capture shows NUL padded (`34 2e 31 …` = `4.16.8`).
 /// Returns `None` when the answer starts with non-printable bytes, which is how a keyboard that frames
@@ -298,13 +298,13 @@ impl OnboardWriteFrame {
                 fs_id,
                 file_offset,
                 size,
-            } => OnboardPushCommand {
+            } => OnboardPayloadPushCommand {
                 fs_id: *fs_id,
                 file_offset: *file_offset,
                 size: *size,
             }
             .serialize(buffer, device),
-            Self::Commit { profile } => OnboardCommitCommand { profile: *profile }.serialize(buffer, device),
+            Self::Commit { profile } => OnboardFileCommitCommand { profile: *profile }.serialize(buffer, device),
         }
     }
 
@@ -2448,7 +2448,8 @@ fn check_lines(encoded: &[u8], reference: &[u8], path: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::devices::hid_reports::{
-        CommandCode, HidCommand, HidDeviceType, ONBOARD_FEATURE_REPORT_SIZE, OnboardPullCommand, OnboardReadCommand,
+        CommandCode, HidCommand, HidDeviceType, ONBOARD_FEATURE_REPORT_SIZE, OnboardBufferReadCommand,
+        OnboardPayloadPullCommand,
     };
 
     /// The significant frame bytes a typed command serializes, behind its report-ID byte.
@@ -2602,29 +2603,29 @@ mod tests {
     #[test]
     fn pull_and_read_frames_come_from_the_typed_commands() {
         let pull = frame_of(
-            OnboardPullCommand {
+            OnboardPayloadPullCommand {
                 fs_id: profile_file_id(0),
                 file_offset: 0,
                 size: DEVICE_RESOURCE_BUFFER_LEN as u16,
             },
-            OnboardPullCommand::FRAME_LEN,
+            OnboardPayloadPullCommand::FRAME_LEN,
         );
-        assert_eq!(pull[0], CommandCode::OnboardPull as u8);
+        assert_eq!(pull[0], CommandCode::OnboardPayloadPull as u8);
         assert_eq!(
             u16::from_le_bytes([pull[2], pull[3]]),
             PROFILE_FS_BASE,
             "the file id sits behind the header"
         );
-        assert_eq!(pull.len(), OnboardPullCommand::FRAME_LEN);
+        assert_eq!(pull.len(), OnboardPayloadPullCommand::FRAME_LEN);
         let read = frame_of(
-            OnboardReadCommand {
+            OnboardBufferReadCommand {
                 buffer_offset: 0,
                 size: PAYLOAD_READ_LEN as u16,
             },
-            OnboardReadCommand::FRAME_LEN,
+            OnboardBufferReadCommand::FRAME_LEN,
         );
-        assert_eq!(read[0], CommandCode::OnboardPayloadRead as u8);
-        assert_eq!(read.len(), OnboardReadCommand::FRAME_LEN);
+        assert_eq!(read[0], CommandCode::OnboardBufferRead as u8);
+        assert_eq!(read.len(), OnboardBufferReadCommand::FRAME_LEN);
     }
 
     #[test]
@@ -2633,12 +2634,12 @@ mod tests {
         assert_eq!(profile_file_id(slot), 0x0204);
         for n in 0..PULLS_PER_FILE {
             let pull = frame_of(
-                OnboardPullCommand {
+                OnboardPayloadPullCommand {
                     fs_id: profile_file_id(slot),
                     file_offset: (n * DEVICE_RESOURCE_BUFFER_LEN) as u32,
                     size: DEVICE_RESOURCE_BUFFER_LEN as u16,
                 },
-                OnboardPullCommand::FRAME_LEN,
+                OnboardPayloadPullCommand::FRAME_LEN,
             );
             assert_eq!(
                 u16::from_le_bytes([pull[2], pull[3]]),
@@ -2658,11 +2659,11 @@ mod tests {
         }
         for n in 0..READS_PER_PULL {
             let read = frame_of(
-                OnboardReadCommand {
+                OnboardBufferReadCommand {
                     buffer_offset: (n * PAYLOAD_READ_LEN) as u16,
                     size: PAYLOAD_READ_LEN as u16,
                 },
-                OnboardReadCommand::FRAME_LEN,
+                OnboardBufferReadCommand::FRAME_LEN,
             );
             assert_eq!(
                 u16::from_le_bytes([read[2], read[3]]),

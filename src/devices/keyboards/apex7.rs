@@ -37,9 +37,9 @@ use super::apex_legacy_profile::{
 use super::onboard::{OnboardDevice, OnboardProfileCodec, OnboardWriteFrame};
 use super::{GenericKeyboard, Keyboard};
 use crate::devices::hid_reports::{
-    FirmwareSource, HidCommand, ONBOARD_FEATURE_REPORT_SIZE, ONBOARD_OUTPUT_REPORT_SIZE, OnboardBufferWriteCommand,
-    OnboardCommitCommand, OnboardFileOpenCommand, OnboardFirmwareVersionCommand, OnboardLoadProfileCommand,
-    OnboardPullCommand, OnboardPushCommand, OnboardReadCommand,
+    FirmwareSource, HidCommand, ONBOARD_FEATURE_REPORT_SIZE, ONBOARD_OUTPUT_REPORT_SIZE, OnboardBufferReadCommand,
+    OnboardBufferWriteCommand, OnboardFileCommitCommand, OnboardFileOpenCommand, OnboardFirmwareVersionCommand,
+    OnboardPayloadPullCommand, OnboardPayloadPushCommand, OnboardProfileDeployCommand,
 };
 use crate::devices::key_mapping::{KeyId, KeyMapping};
 use crate::devices::product_ids;
@@ -298,7 +298,7 @@ impl Apex7 {
                     file_offset,
                     size,
                 } => {
-                    self.write_output_command(OnboardPushCommand {
+                    self.write_output_command(OnboardPayloadPushCommand {
                         fs_id: *fs_id,
                         file_offset: *file_offset,
                         size: *size,
@@ -313,7 +313,7 @@ impl Apex7 {
                 }
                 OnboardWriteFrame::Commit { profile } => {
                     // The capture answers the commit with nothing of its own, so the write does not wait.
-                    self.write_output_command(OnboardCommitCommand { profile: *profile })
+                    self.write_output_command(OnboardFileCommitCommand { profile: *profile })
                         .map_err(|e| self.frame_error("commit", &format!("slot {profile}"), e))?;
                     stats.frames_sent += 1;
                 }
@@ -345,7 +345,7 @@ impl Apex7 {
     /// `[EXPERIMENTAL]`: the engine's deploy API sleeps 250 ms behind this frame; the capture shows no frame
     /// and no reply after it, so this sends the frame and returns.
     fn deploy_frame(&self, profile: u8) -> Result<()> {
-        self.write_output_command(OnboardLoadProfileCommand { profile })
+        self.write_output_command(OnboardProfileDeployCommand { profile })
             .map_err(|e| self.frame_error("deploy", &format!("slot {profile}"), e))
     }
 
@@ -414,7 +414,7 @@ impl Apex7 {
     /// arrived, which is logged, not an error - see [`Self::read_pull_ack`]).
     fn pull_window(&self, fs_id: u16, file_offset: u32, size: u16) -> Result<(u8, String)> {
         let path = self.collection_label();
-        self.write_output_command(OnboardPullCommand {
+        self.write_output_command(OnboardPayloadPullCommand {
             fs_id,
             file_offset,
             size,
@@ -439,7 +439,7 @@ impl Apex7 {
     /// ([`GG_GAP_MS`] between transfers).
     fn read_window(&self, label: &str, buffer_offset: u16, read_len: u16) -> Result<ReadReply> {
         let path = self.collection_label();
-        self.write_feature_command(OnboardReadCommand {
+        self.write_feature_command(OnboardBufferReadCommand {
             buffer_offset,
             size: read_len,
         })

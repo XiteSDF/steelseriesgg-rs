@@ -10,8 +10,8 @@ decoded over a 12284-byte region and never matched. The read
 sends no frames that change anything on the keyboard: GG's opening chain and its closing sequence turned out
 not to be needed (2026-10-18, §Sequences the read does not need). Code: `src/devices/hid_reports.rs` (the command codes
 and every report buffer: `OnboardFirmwareVersionCommand`
-with its `FirmwareSource` byte, `OnboardDriverModeCommand`, `OnboardLoadProfileCommand`,
-`OnboardPullCommand`, `OnboardReadCommand`), `src/devices/keyboards/apex_legacy_profile.rs` (reply framing, payload geometry, reply parsing, decode - the module moved there on 2026-10-17, from `src/onboard_profile.rs`, because everything in it is specific to this legacy platform),
+with its `FirmwareSource` byte, `OnboardDriverModeCommand`, `OnboardProfileDeployCommand`,
+`OnboardPayloadPullCommand`, `OnboardBufferReadCommand`), `src/devices/keyboards/apex_legacy_profile.rs` (reply framing, payload geometry, reply parsing, decode - the module moved there on 2026-10-17, from `src/onboard_profile.rs`, because everything in it is specific to this legacy platform),
 `src/devices/keyboards/apex7.rs` (`Apex7`: the keyboard device of the legacy Apex family, which wraps
 `GenericKeyboard`, and the read plan, reply assembly and polling - its own `read_profile` /
 `read_image` / `firmware_version` / `probe_schema` / `pull_window` / `read_window` methods; the
@@ -588,7 +588,7 @@ hardware on 2026-10-18: `90 00` answers the firmware running the keyboard, `90 0
 capture already had both forms on the wire (capture summary rows 97 and 115 show `90 01`).
 
 `DriverMode` (`0x6C`) and `LoadProfile` (`0x89`) stay in `hid_reports` as named commands
-(`OnboardDriverModeCommand`, `OnboardLoadProfileCommand`); **nothing in ssgg sends them** - the frames are
+(`OnboardDriverModeCommand`, `OnboardProfileDeployCommand`); **nothing in ssgg sends them** - the frames are
 kept as the typed way to do the driver-mode and deploy work later, per hard constraint 1 (no hand-built byte
 arrays). `LoadProfile` is a device write: it makes the keyboard run the slot named.
 
@@ -626,7 +626,7 @@ byte-identical to the opening frame.
 The engine's session close in the legacy family writes three frames (`base_apex_legacy.lisp:299-304`):
 `reset_all_illumination` (command `0x3B`, `:692`), `disable_gamesense_oled` (command `0x69`, `:724`) and
 `end_driver_mode` (`0x6C` with the last byte 0, `:570`). The read sends none of
-them (`OnboardLoadProfileCommand` is the named builder for `89 <profile + 1>`, and nothing in ssgg sends it).
+them (`OnboardProfileDeployCommand` is the named builder for `89 <profile + 1>`, and nothing in ssgg sends it).
 
 The deploy pair behind every profile file in the capture is `load_profile` (command `0x89`, `profile_id` typed
 `(range 1 5)`, sent as `succ index` by `switch_to_onboard_config`, `:2280`, `:2300`) with the engine's own sleep
@@ -645,7 +645,7 @@ The read's transfers are reads: it sends the firmware poll, the pulls and the pa
 **nothing that changes anything on the keyboard** - GG's opening chain and closing sequence are not sent
 (2026-10-18, §Sequences the read does not need). The closing sequence is where the read's only device
 *writes* used to live, and `89 <slot + 1>` in it is the frame that makes the keyboard run the slot read;
-`OnboardLoadProfileCommand` names it and nothing in ssgg sends it. No profile payload is written either:
+`OnboardProfileDeployCommand` names it and nothing in ssgg sends it. No profile payload is written either:
 do not add profile writes - the profile blob contains blocks this layout does not explain, and writing a
 synthetic blob can put the keyboard in a state GG itself cannot repair. `read` needs no confirmation flag (2026-10-18: `--yes`
 was dropped; 2026-10-20 the write-side `--yes` went the same way) - it is reverse-engineered protocol code, but it writes request frames only and changes
