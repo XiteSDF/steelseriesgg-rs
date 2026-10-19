@@ -160,33 +160,17 @@ impl Apex7 {
     /// GG names the same slots `Config 1` .. `Config 5`, and `ssgg onboard read --profile N` passes
     /// `N - 1` here.
     ///
-    /// The read plan polls the device and sleeps for GG's inter-frame pacing, so it runs on a scoped
-    /// thread and blocks this task's thread until the read finishes (about 2 s for a slot on the
-    /// reference capture's cadence). Nothing in it changes the keyboard's state.
+    /// The read polls the device and sleeps for GG's inter-frame pacing, so it blocks the calling thread
+    /// for about 2 s per slot. It is a plain blocking call: nothing runs concurrently with it, and nothing
+    /// in it changes the keyboard's state - GG's opening chain and closing sequence are not sent, measured
+    /// 2026-10-19, the read works without them (see
+    /// `docs/development/apex-7-onboard-profile-read.md` §Sequences the read does not need).
     ///
     /// # Errors
     ///
     /// Returns an error when the slot is out of range, the collection rejects a frame, it answers a schema
     /// this read cannot decode, or it never answers a payload read.
-    pub async fn read_profile(&self, profile: u8) -> Result<ProfileImage> {
-        // The read plan blocks on reply polls and GG's inter-frame pacing, so it runs on its own thread. A
-        // scoped thread borrows this device and the scope is joined before this returns, which is the whole
-        // reason to use `std::thread::scope`: the borrow is checked, not asserted.
-        std::thread::scope(|scope| {
-            scope
-                .spawn(|| self.read_image(profile))
-                .join()
-                .map_err(|_| Error::Other("onboard read worker panicked".to_string()))?
-        })
-    }
-
-    /// Runs one read: the firmware poll, the schema probe, then [`PULLS_PER_FILE`] pulls, each with its
-    /// pacing read and payload reads.
-    ///
-    /// The read **changes nothing on the keyboard**: GG's opening chain and closing sequence are not sent -
-    /// measured 2026-10-19, the read works without them (see
-    /// `docs/development/apex-7-onboard-profile-read.md` §Sequences the read does not need).
-    fn read_image(&self, profile: u8) -> Result<ProfileImage> {
+    pub fn read_profile(&self, profile: u8) -> Result<ProfileImage> {
         validate_profile(profile)?;
         let fs_id = profile_file_id(profile);
         let read_len = PAYLOAD_READ_LEN as u16;
@@ -252,8 +236,8 @@ impl Apex7 {
 
     /// Writes one on-board profile slot with `payload` bytes, then deploys the slot.
     ///
-    /// The write blocks on the keyboard's answers, so it runs on a scoped thread the way the read does: a
-    /// scoped thread borrows this device and the scope is joined before this returns.
+    /// The write blocks on the keyboard's answers and on GG's pacing, so it blocks the calling thread for
+    /// its whole duration. Nothing runs concurrently with it.
     ///
     /// **This changes the keyboard**: it rewrites the profile file of the slot and then makes the keyboard
     /// run that slot. Lighting, audio and the other slots are untouched, and the write sends nothing else.
@@ -267,31 +251,7 @@ impl Apex7 {
     /// Returns an error when the payload cannot be framed for the slot, a frame is refused, or a frame the
     /// capture shows answered is not answered here. The write stops at the first such frame, leaving the
     /// slot as the frames already sent left it.
-    pub async fn write_profile(&self, profile: u8, payload: &[u8]) -> Result<WriteStats> {
-        std::thread::scope(|scope| {
-            scope
-                .spawn(|| self.write_image(profile, payload))
-                .join()
-                .map_err(|_| Error::Other("onboard write worker panicked".to_string()))?
-        })
-    }
-
-    /// Makes the keyboard run one on-board profile slot: GG's profile deploy frame (0x89).
-    ///
-    /// **This changes what the keyboard is running right now.** The capture shows GG sending the
-    /// frame with no answer of its own, so this sends it and reads nothing back.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the slot is out of range or the device refuses the frame.
-    pub async fn deploy_profile(&self, profile: u8) -> Result<()> {
-        validate_profile(profile)?;
-        self.deploy_frame(profile)
-    }
-
-    /// Runs the write: every frame of the plan in wire order with GG's pacing between them, then the deploy
-    /// frame.
-    fn write_image(&self, profile: u8, payload: &[u8]) -> Result<WriteStats> {
+    pub fn write_profile(&self, profile: u8, payload: &[u8]) -> Result<WriteStats> {
         let codec = &LegacyApexOnboard;
         let plan = codec.write_plan(profile, payload)?;
         for line in codec.write_banner_lines() {
@@ -367,6 +327,19 @@ impl Apex7 {
         Ok(stats)
     }
 
+    /// Makes the keyboard run one on-board profile slot: GG's profile deploy frame (0x89).
+    ///
+    /// **This changes what the keyboard is running right now.** The capture shows GG sending the frame with
+    /// no answer of its own, so this sends the frame and reads nothing back. It runs as part of
+    /// [`Self::write_profile`] and as `ssgg onboard load`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the slot is out of range or the device refuses the frame.
+    pub fn deploy_profile(&self, profile: u8) -> Result<()> {
+        validate_profile(profile)?;
+        self.deploy_frame(profile)
+    }
     /// Sends the profile deploy frame (0x89) and reads nothing back.
     ///
     /// `[EXPERIMENTAL]`: the engine's deploy API sleeps 250 ms behind this frame; the capture shows no frame
@@ -726,15 +699,15 @@ crate::impl_keyboard_with_delegation!(Apex7, {
     }
 
     async fn read_onboard_profile(&self, profile: u8) -> Result<ProfileImage> {
-        self.read_profile(profile).await
+        self.read_profile(profile)
     }
 
     async fn write_onboard_profile(&self, profile: u8, payload: &[u8]) -> Result<WriteStats> {
-        self.write_profile(profile, payload).await
+        self.write_profile(profile, payload)
     }
 
     async fn load_onboard_profile(&self, profile: u8) -> Result<()> {
-        self.deploy_profile(profile).await
+        self.deploy_profile(profile)
     }
 });
 
