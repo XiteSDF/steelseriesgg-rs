@@ -276,29 +276,21 @@ impl Apex7 {
         })
     }
 
-    /// Makes the keyboard run one on-board profile slot: GG's profile deploy frame (0x89), then the pause
-    /// the engine's deploy API puts behind it.
+    /// Makes the keyboard run one on-board profile slot: GG's profile deploy frame (0x89).
     ///
     /// **This changes what the keyboard is running right now.** The capture shows GG sending the
-    /// frame with no answer of its own, so this sends it and waits; it reads nothing back.
+    /// frame with no answer of its own, so this sends it and reads nothing back.
     ///
     /// # Errors
     ///
     /// Returns an error when the slot is out of range or the device refuses the frame.
     pub async fn deploy_profile(&self, profile: u8) -> Result<()> {
-        std::thread::scope(|scope| {
-            scope
-                .spawn(|| {
-                    validate_profile(profile)?;
-                    self.deploy_frame(profile)
-                })
-                .join()
-                .map_err(|_| Error::Other("onboard deploy worker panicked".to_string()))?
-        })
+        validate_profile(profile)?;
+        self.deploy_frame(profile)
     }
 
     /// Runs the write: every frame of the plan in wire order with GG's pacing between them, then the deploy
-    /// frame and its pause.
+    /// frame.
     fn write_image(&self, profile: u8, payload: &[u8]) -> Result<WriteStats> {
         let codec = &LegacyApexOnboard;
         let plan = codec.write_plan(profile, payload)?;
@@ -375,13 +367,13 @@ impl Apex7 {
         Ok(stats)
     }
 
-    /// Sends the profile deploy frame and waits the engine's pause behind it.
+    /// Sends the profile deploy frame (0x89) and reads nothing back.
+    ///
+    /// `[EXPERIMENTAL]`: the engine's deploy API sleeps 250 ms behind this frame; the capture shows no frame
+    /// and no reply after it, so this sends the frame and returns.
     fn deploy_frame(&self, profile: u8) -> Result<()> {
-        let codec = &LegacyApexOnboard;
         self.write_output_command(OnboardLoadProfileCommand { profile })
-            .map_err(|e| self.frame_error("deploy", &format!("slot {profile}"), e))?;
-        std::thread::sleep(Duration::from_millis(codec.write_deploy_pause_ms()));
-        Ok(())
+            .map_err(|e| self.frame_error("deploy", &format!("slot {profile}"), e))
     }
 
     /// A frame refusal, named with the frame and the collection it went out on.

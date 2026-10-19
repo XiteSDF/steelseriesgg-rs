@@ -21,9 +21,7 @@
 //! layout, extending these types where its profile has fields this one has, and registering its codec
 //! in [`codecs`]. `src/main.rs` is written against these interfaces and names no keyboard family.
 
-use crate::devices::keyboards::apex_legacy_profile::{
-    DEVICE_RESOURCE_BUFFER_LEN, PAYLOAD_READ_LEN, PULLS_PER_FILE, WRITE_DEPLOY_PAUSE_MS,
-};
+use crate::devices::keyboards::apex_legacy_profile::{DEVICE_RESOURCE_BUFFER_LEN, PAYLOAD_READ_LEN, PULLS_PER_FILE};
 use crate::error::{Error, Result};
 use serde::Serialize;
 
@@ -142,13 +140,6 @@ pub trait OnboardProfileCodec: Send + Sync {
     #[must_use]
     fn write_ack_report_ids(&self) -> [u8; 2] {
         [0x88, 0x05]
-    }
-
-    /// Milliseconds to wait after the profile deploy frame (0x89), the engine's own pause
-    /// (`onboard-load-pause-ms`).
-    #[must_use]
-    fn write_deploy_pause_ms(&self) -> u64 {
-        WRITE_DEPLOY_PAUSE_MS
     }
 
     /// A read image as the JSON read record `ssgg onboard read --report` writes.

@@ -232,9 +232,6 @@ pub const WRITE_CHUNK_BYTES: usize = 512;
 pub const WRITE_PUSH_BYTES: usize = DEVICE_RESOURCE_BUFFER_LEN;
 /// Write windows in the profile region: profile size divided by the resource buffer, 40 in the capture.
 pub const WRITE_WINDOW_COUNT: usize = PROFILE_REGION_BYTES / WRITE_PUSH_BYTES;
-/// Milliseconds the engine waits after the profile deploy frame (`onboard-load-pause-ms`); the 2026-10-20
-/// capture shows a gap of that size after the `89` frame.
-pub const WRITE_DEPLOY_PAUSE_MS: u64 = 250;
 
 /// One frame of the on-board profile write, in the order the engine sends them. The shape is the write
 /// API's and the byte pattern the Apex 7 write capture shows. `[EXPERIMENTAL]`.
@@ -380,8 +377,8 @@ impl OnboardWritePlan {
 /// The engine pads the payload out to the whole profile region with zeros, so a write covers the region,
 /// not only the payload: the capture shows all 40 windows, the last 28 of them all zero.
 ///
-/// The deploy frame (0x89) is not part of the plan; the write path sends it after [`WRITE_DEPLOY_PAUSE_MS`],
-/// and `ssgg onboard load` sends it on its own.
+/// The deploy frame (0x89) is not part of the plan; the write path sends it right after the commit, and
+/// `ssgg onboard load` sends it on its own.
 ///
 /// `[EXPERIMENTAL]` Geometry capture-confirmed on Apex 7, never sent to a keyboard by `ssgg`.
 ///
@@ -540,10 +537,9 @@ pub fn write_plan_lines(plan: &OnboardWritePlan) -> Vec<String> {
             .map(|(n, frame)| format!("  frame {:>3}  {}", n + 1, frame.line())),
     );
     lines.push(format!(
-        "then 89 {:02X} (deploy slot {}) after a {} ms pause",
+        "then 89 {:02X} (deploy slot {}) - the engine sleeps 250 ms behind this frame, the write path does not",
         plan.profile + 1,
-        plan.profile,
-        WRITE_DEPLOY_PAUSE_MS
+        plan.profile
     ));
     lines
 }
@@ -2095,10 +2091,9 @@ impl OnboardProfileCodec for LegacyApexOnboard {
             "  answers: 88 01 … after the open, 05 01 … after every push; the writes and the commit are not \
              answered"
                 .to_string(),
-            format!(
-                "  89 <slot + 1> deploys the slot after a {WRITE_DEPLOY_PAUSE_MS} ms pause; no 6c driver-mode \
-                 frame and no HIDCONFIG pacing write is sent"
-            ),
+            "  89 <slot + 1> deploys the slot right after the commit (the engine sleeps 250 ms behind it, \
+             the write path does not); no 6c driver-mode frame and no HIDCONFIG pacing write is sent"
+                .to_string(),
         ]
     }
 

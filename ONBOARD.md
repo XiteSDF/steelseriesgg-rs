@@ -32,10 +32,12 @@ Task: implement `ssgg onboard write` and `ssgg onboard load` commands.
 **Result (2026-10-20, software part done, hardware part open).** `ssgg onboard write` takes the decode report by
 default, `--bin` takes the payload bytes as they are, `--profile N` is mandatory (no default: a write names the slot
 it rewrites) and the frames are the capture's: `88 00 01 02` open, 40 windows of `03 00` buffer 0 +
-`03 00` buffer 512 + `05 00 01 02 <file offset> 00 04` push, `eb 01` commit, then `89 01` deploy after 250 ms.
+`03 00` buffer 512 + `05 00 01 02 <file offset> 00 04` push, `eb 01` commit, then `89 01` deploy (GG sleeps 250 ms
+behind that frame; the write path does not).
 The geometry is the keyboard family's (`OnboardProfileCodec::write_plan`, `FILE_BLOCKS` of `apex_7.lisp:217` and the
 engine write API `base_apex_legacy.lisp:1993-2022`), the pacing is the capture's (7.1 ms average per frame, the
-100 ms the engine inserts every 32 frames, 5 ms of answer drain after each push, 250 ms before the deploy), and a
+100 ms the engine inserts every 32 frames, 5 ms of answer drain after each push; the engine's 250 ms sleep behind
+the deploy frame is not slept), and a
 write answers `88 01 …` after the open and `05 01 …` after every push (202/202 in the capture; buffer writes and the
 commit are not answered). 1.6 is met: the plan of `config_1.json` byte-equals the capture's frames, its frame 103 is
 the capture's frame 103 (`05 00 01 …`, file offset 33792), and a 12,288-byte image plans the

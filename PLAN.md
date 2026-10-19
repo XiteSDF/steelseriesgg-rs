@@ -56,7 +56,9 @@ read-back question stays open (the engine's own `83`/`85` read path is what `onb
 - **[HW] write → read → decode → diff:** prove the payload the board holds matches the JSON the write took, twice
   (the ONBOARD.md acceptance).
 - **[HW] Deploy behaviour:** `onboard load` makes the board run a slot. Keyboard effects of `89` (and of the lighting
-  reset `0x3B` the engine sends at session end) have never been tested from this crate.
+  reset `0x3B` the engine sends at session end) have never been tested from this crate. The write path sends `89`
+  right after the commit with no sleep and reads nothing back (2026-10-20); whether the board needs the engine's
+  250 ms pause behind the frame is a hardware question.
 - **[HW] Pacing on hardware:** the capture's 7.1 ms average frame spacing, the engine's 100 ms every 32 frames, the
   250 ms deploy pause and the 20 s deploy timeout (engine `SetProfileToBoard`: 250 ms sleep, 40 × 500 ms poll)
   are engine/capture facts, never measured from `ssgg`.
