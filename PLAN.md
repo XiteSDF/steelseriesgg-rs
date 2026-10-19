@@ -32,9 +32,9 @@ Protocol facts for the Apex Pro TKL 2023 are in `AGENTS.md` ("Protocol research 
 
 ---
 
-## P0 (onboard). Apex 7 on-board write: software done, hardware open
+## P0 (onboard). Apex 7 on-board write: ran on hardware (2026-10-20)
 
-Implemented 2026-10-20 from the operator's Windows capture (GG write capture, Apex 7 `0x1612`,
+Implemented 2026-10-19 from the operator's Windows capture (GG write capture, Apex 7 `0x1612`,
 firmware 4.16.3, 122 frames): `ssgg onboard write` (JSON by default, `--bin` for payload bytes, `--profile N`
 mandatory, `--dry-run`) and `ssgg onboard load` (`--profile N` mandatory). The sequence is the
 capture's: `88 00 <file id>` open, 40 windows of two 512-byte `03 00 <buffer offset> <size>` feature writes
@@ -47,17 +47,22 @@ answer to a push is `05 01 …` (202/202) and to the open `88 01 …`. Frame bui
 path `Apex7::write_profile` / `Apex7::deploy_profile` behind `Keyboard::write_onboard_profile` /
 `Keyboard::load_onboard_profile`, fixture
 `tests/fixtures/onboard-write-apex7.manifest.txt` (generator `scripts/gg-write-frames.py`) asserted
-frame for frame by `apex_legacy_profile::tests::the_write_plan_of_the_read_report_is_the_capture_write_sequence`.
+frame for frame by `apex_7_profile::tests::the_write_plan_frames_are_the_capture_sequence` (self-contained: index,
+report kind, wire length and header bytes of all 122 frames, byte-identical digests for the 42 frames that carry no
+payload) and by the `#[ignore]`d byte-exact comparison of all 122 frames (`cargo test -- --ignored` against the
+read's `--bin` image: 120 of 122, frames 3 and 35 being GG's own image byte and its own checksum word).
 `onboard decode` of the capture's image answers `Config 1`, schema `0x000B`, stored checksum `0EB1C3D1` equals
-the one `encode` computes. **No test touches a keyboard and no write frame has been replayed on hardware**; the
-read-back question stays open (the engine's own `83`/`85` read path is what `onboard read` uses). Write-up:
-`docs/development/apex-7-onboard-profile-write.md`; task and open steps: `ONBOARD.md` §Apex 7 on-board profile write.
+the one `encode` computes. **No test touches a keyboard.** The family's write ran on hardware on 2026-10-20 (Config 1
+from a read's bytes, Config 4 from the encoder's, Config 4 read back byte-identical - see the Done entry); what stays
+open is the read-back *question* (the engine's own `83`/`85` read path is what `onboard read` uses), the region behind
+the payload, and the pacing numbers below. Write-up: `docs/development/apex-7-onboard-profile-write.md`; task and
+open steps: `ONBOARD.md` §Apex 7 on-board profile write.
 
-- **[HW] First write (user-approved, model and date recorded):** read the target slot back
-  (`onboard read --profile N --bin …`), write the slot with `onboard write --profile N`, report what the
-  keyboard does.
-- **[HW] write → read → decode → diff:** prove the payload the board holds matches the JSON the write took, twice
-  (the ONBOARD.md acceptance).
+- **[HW] First write (user-approved, model and date recorded):** done 2026-10-20 on Apex 7 `0x1612` - Config 1 from
+  the payload bytes a read wrote, Config 4 from a payload the encoder wrote.
+- **[HW] write → read → decode → diff:** done for the encoder path on 2026-10-20: a read of Config 4 returned the
+  bytes the encoder wrote, byte for byte. Extend it to a profile edited in the GUI (`tools/profile-gui`), the case the
+  encoder path has not been on hardware with.
 - **[HW] Deploy behaviour:** `onboard load` makes the board run a slot. Keyboard effects of `89` (and of the lighting
   reset `0x3B` the engine sends at session end) have never been tested from this crate. The write path sends `89`
   right after the commit with no sleep and reads nothing back (2026-10-20); whether the board needs the engine's
@@ -697,6 +702,63 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   never the broken part. The named-product message now also says which keyboard answers the protocol.
   **Reverted here**: re-adding a product-ID predicate (`onboard_capable` under any name) as a second copy of the
   rule - the class decision is the rule, and a predicate on a codec is a second place to say it.
+
+- 2026-10-19 (the macro block's bytes are what the write sends; the parsed list is display only): the engine
+  declares the field `(field macro_data bytearray (size (macro-data-size)))` = 9600 and parses nothing inside it
+  (`apex_7.lisp:62, 101`, `base_apex_legacy.lisp:109`), so a write sends **those bytes**. Our record grammar
+  (`0x77` header + `0x02`/`0x04` actions) is a display view and a partial one: a user's own profile (581 non-zero
+  block bytes) walks as 5 records - 108 bytes - and stops at the byte at `+109`, a `03` after a zero byte, no
+  marker we know, which is what made `ssgg onboard write` refuse to write it. `decode` now reports
+  `macro_data.bytes_hex` (all 9600 bytes, like `oled.bytes_hex`), `encode_json` writes the block verbatim from it,
+  and `macros[]` + `macro_note` are never consulted for bytes when the report carries them. A noted block is
+  refused only in a report that carries **neither** its bytes nor a clean list (a read older than this change -
+  re-read the slot; the bytes behind its note are not in the file and are not invented). New test
+  `a_real_macro_block_the_grammar_rejects_writes_back_verbatim` (`GG_MACRO_BYTES`: that block's record runs, the
+  zero byte, the `0x03` and a standing-in tail); `profile_json_keeps_the_documented_report_layout` and
+  `encode_refuses_a_macro_block_the_decoder_could_not_walk` follow the new shape. **The capture parity test moved
+  off the repo-root file**: it read `config_1.json`, which no checkout has (CI's `cargo test` panicked on it) and
+  which is the operator's live report, where an edit legitimately breaks the "120 of 122 byte-identical" claim. Now
+  `the_write_plan_frames_are_the_capture_sequence` is self-contained (index, report kind, wire length and header
+  bytes of all 122 frames, byte-identical digests for the 42 frames that carry no payload bytes) and the byte-exact
+  comparison of all 122 frames is `#[ignore]`d, run on the reference keyboard with
+  `ssgg onboard read --config 1 --bin config_1.bin` (the payload bytes the
+  capture's write carried, framed with no encode step) then `cargo test -- --ignored`: on the reference image 120 of
+  122 frames are byte-identical, frames 3 and 35 being GG's own image byte and its own checksum word. The GUI mirrors
+  `MACRO_DATA_LEN` (compared with Rust by the constant check), carries the block's bytes through the Macro panel,
+  prints a decode note as the limit of the list and not of the profile, and says what a report without bytes needs;
+  `examples/sample-macros.json` now carries a **real** block's bytes (the 5 record runs, the zero byte at `+108`
+  and the `0x03` at `+109` as the decode note names them, plus an eight-byte stand-in tail), so the fixtures hold a
+  block the grammar rejects and the page writes back byte for byte. `selftest.mjs` is 192 checks.
+  **Reverted here**: refusing a write because the record list stopped (the list is our view, never the source of
+  the block's bytes), and the GUI's old "the writer never dumps this block in full" line.
+
+- 2026-10-20 (**the family's write ran on hardware**, user-reported, Apex 7 `0x1612`): `onboard write` rewrote
+  Config 1 from the payload bytes a read wrote, and Config 4 from a payload the encoder wrote, and a later
+  `onboard read` of Config 4 returned the encoder's bytes **byte for byte** - the write plan, the ack framing and
+  the file geometry work on a real keyboard. The frame-by-frame equality with the capture was measured on the
+  operator's machine the day before: the read's report + `--bin` + `onboard write --profile 1 --bin config_1.bin
+  --dry-run` printed 122 frames on Windows with GG's `wingine.exe` running. Backlog 1.1 (write->read->decode->diff)
+  and 1.4 (deploy after a write) are met; 1.2 is met on hardware: the 592-byte region behind the payload is inside
+  the 40 windows, in no schema, and not part of the checksum, so a `--bin` write of the 12,288-byte image carries
+  that region back to the device and an encoder-written payload leaves it zeros. **Reverted here**: keeping "no
+  frame has ever been replayed on a keyboard" in the prose after the family's write ran.
+
+- 2026-10-19 (a write that sends frames never reached the keyboard): `ssgg onboard write` without `--dry-run`
+  answered `an on-board profile write needs a keyboard: --dry-run prints the plan without one` **with the keyboard
+  connected**. The dispatch in `main` built a `DeviceManager` only for `Read` and `Load`, so `cmd_onboard` received
+  `None` for a real write and its no-keyboard guard fired before any enumeration - the same shape as the 2026-10-19
+  `DeviceNotFound` report that day: the guard was right, the state behind it was never built. The rule now lives in
+  the CLI type, `OnboardAction::needs_keyboard()` (`Read`/`Load` true, `Write` -> `!dry_run`, `Decode`/`Encode`
+  false), the dispatch reads it, and two bin tests pin it, including that `--dry-run` is the flag that keeps a write
+  off a keyboard. The on-board selection's no-candidate message now names the state that produces it on a machine
+  where the keyboard *is* listed - **a keyboard whose control interface is taken is not a candidate** - points at
+  `ssgg devices -v` (the claim probe), names the holders (GG's wingine, this crate's daemon, a concurrent read) and
+  the read escape `SSGG_APEX7_DEVICE_PATH=1`. Measured here: on a box whose Apex 7 `ssgg devices` lists with
+  interface 0 busy, `onboard read`, `onboard write --bin` and `onboard load` all answer that message, and
+  `write ... --dry-run` still prints its 122 frames. The claim probe is not the write path's gate - **the
+  2026-10-20 writes ran through an `open_keyboard` created before the probe existed**, and the probe is a debug
+  build's probe. **Reverted here**: a guard message that reads "needs a keyboard" when nothing was enumerated - the
+  guard belongs to the dry-run state and now says so.
 
 ## Reference projects
 

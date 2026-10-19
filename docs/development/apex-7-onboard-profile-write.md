@@ -1,14 +1,19 @@
 # Apex 7 on-board profile write
 
-`[EXPERIMENTAL]` - every byte here is reverse-engineered, and **nothing of this write has been sent to a
-keyboard**. The frames are the Windows capture's, the shapes are the engine's own descriptors, and
-the implementation is compared with the capture in software only. Command-code status:
+`[EXPERIMENTAL]` - every byte here is reverse-engineered. The frames are the Windows capture's, the shapes are the
+engine's own descriptors, and the implementation was compared with the capture in software; **the family's write ran
+on hardware on 2026-10-20** (user-reported, Apex 7 `0x1612`: Config 1 written from the payload bytes a read wrote,
+Config 4 from a payload the encoder wrote, and a later read of Config 4 returned the encoder's bytes byte for byte).
+Command-code status:
 `.claude/rules/experimental-protocol.md`; the read side:
 [apex-7-onboard-profile-read.md](apex-7-onboard-profile-read.md).
 
-The capture: **GG write capture in the repo root** (untracked, 102,380 bytes, sha256
-<digest recorded outside the repo>, 440 pcapng EP packets over 11.34 s; USBPcap
-header of 28 bytes, `packet[0]` is its length) - a Windows capture of official GG writing a profile. Its write
+The capture: **GG's write session, captured on Windows with USBPcap** (102,380 bytes, 440 pcapng EP packets over 11.34 s; USBPcap
+header of 28 bytes, `packet[0]` is its length) - official GG writing a profile. **The capture file is not in the
+repository and is no longer on disk** (2026-10-19: it lived on the Windows side, and the session that decoded it left
+the manifest behind; its sha256 and the 174-byte header line of the reassembly were recorded in that session, outside
+the repo). The manifest fixture is the durable record of what was decoded from it, and the frames below are quoted
+from that fixture. Its write
 session is decoded by `scripts/gg-write-frames.py` into
 `tests/fixtures/onboard-write-apex7.manifest.txt` (122 frames).
 
@@ -174,24 +179,31 @@ frame for frame in report kind, wire length, order and content:
 
 `tests/fixtures/onboard-write-apex7.manifest.txt` (frame index, kind, wire length, FNV-1a-64 digest,
 head bytes, and `full=` data stage for frames 3 and 35) is the capture-derived fixture;
-`apex_7_profile::tests::the_write_plan_of_the_read_report_is_the_capture_write_sequence` compares the plan
-against it frame by frame - report kind, wire length, head bytes, serializability, the 120 byte-identical
-frames, and the exact five payload bytes named above. The acceptance frame (window 11's push, ONBOARD 1.6's
+`apex_7_profile::tests::the_write_plan_frames_are_the_capture_sequence` compares the plan against it self-contained -
+report kind, wire length and head bytes for all 122 frames, and byte-identical digests for the 42 frames that carry no
+payload bytes - and `apex_7_profile::tests::the_write_plan_of_the_read_report_is_the_capture_write_sequence` (`#[ignore]`d,
+`cargo test -- --ignored`) does the byte-exact comparison of all 122 frames against the payload image of the read that
+ran on the keyboard of the capture: 120 of 122, the five payload bytes named above and the checksum word being the
+differences. The acceptance frame (window 11's push, ONBOARD 1.6's
 "that frame" - that number counts the capture's control frames from the session start, its bytes are
 `05 00 01 …`, file offset `0x2C00`) is asserted byte-identical.
 
-**Availability of the capture (2026-10-20):** GG write capture is not in the repository and was not kept on disk
-after the decode - the fixture is the durable record, and the checksum number above (`0EB1C3D1`) is recorded in the
+**Availability of the capture (2026-10-20, restated 2026-10-19):** GG write capture is not in the repository and is
+no longer on disk - the fixture is the durable record, the capture's own digest is not recorded in the repo, and the
+checksum number above (`0EB1C3D1`) is recorded in the
 fixture header and asserted by the test. The decode line (`Config 1`, schema `0x000B`) and the lighting-session
 measurements were read from the reassembled image in the session that built the fixture. Anyone who re-captures the
 same session should regenerate the manifest from the capture and diff it against the fixture.
 
 ## Not settled
 
-- **No read-back.** A write cannot be verified from the device: the read path is the only way to see a written
-  profile, and a written slot has never been read back from hardware.
-- **Nothing of this has been sent to a keyboard.** Not one frame of the write plan - not the open, not a
-  buffer write, not a push, not the commit, not the deploy - has been replayed on hardware.
+- **Read-back is the only check, and the encoder path passed it once.** A written profile is seen through the read
+  path: on 2026-10-20 a slot written from encoder-written payload bytes read back byte for byte. A slot written from a
+  report edited in `tools/profile-gui` has not been read back, nor has the byte-exact `--bin` write of a slot that
+  carries its own region bytes.
+- **Sent to a keyboard, not measured frame by frame.** The write frames ran on hardware 2026-10-20; the write path
+  reads only the `88 01 …` and `05 01 …` answers it counts, and the per-frame latency of our own pacing (7.1 ms, the
+  100 ms every 32 frames) has never been measured from `ssgg`.
 - The status byte `01` is what every write answer of the capture carries; what it means, and what a refusal
   looks like, is not known. The 305 ms latency of the open answer is measured, its reason is not.
 - The lighting file's write (12,288-byte region, deployed without a commit) carries a 4-byte word at region end
