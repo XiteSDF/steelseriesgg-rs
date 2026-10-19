@@ -36,7 +36,7 @@ Protocol facts for the Apex Pro TKL 2023 are in `AGENTS.md` ("Protocol research 
 
 Implemented 2026-10-20 from the operator's Windows capture (GG write capture, Apex 7 `0x1612`,
 firmware 4.16.3, 122 frames): `ssgg onboard write` (JSON by default, `--bin` for payload bytes, `--profile N`
-mandatory, `--dry-run`, `--yes`) and `ssgg onboard load` (`--profile N` mandatory, `--yes`). The sequence is the
+mandatory, `--dry-run`) and `ssgg onboard load` (`--profile N` mandatory). The sequence is the
 capture's: `88 00 <file id>` open, 40 windows of two 512-byte `03 00 <buffer offset> <size>` feature writes
 (642 wire bytes) plus one `05 00 <file id> <file offset> 1024` push, `eb <slot + 1>` commit, then `89 <slot + 1>`
 deploy after 250 ms. Geometry comes from the keyboard family (`OnboardProfileCodec::write_plan`); the capture's
@@ -51,7 +51,7 @@ read-back question stays open (the engine's own `83`/`85` read path is what `onb
 `docs/development/apex-7-onboard-profile-write.md`; task and open steps: `ONBOARD.md` §Apex 7 on-board profile write.
 
 - **[HW] First write (user-approved, model and date recorded):** read the target slot back
-  (`onboard read --profile N --bin …`), write the slot with `onboard write --profile N --yes`, report what the
+  (`onboard read --profile N --bin …`), write the slot with `onboard write --profile N`, report what the
   keyboard does.
 - **[HW] write → read → decode → diff:** prove the payload the board holds matches the JSON the write took, twice
   (the ONBOARD.md acceptance).
@@ -475,7 +475,8 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   `SetProfileVolatile 0x41`). This supersedes the entry above (the four-frame closing sequence, never sent on
   hardware) and the 2026-10-18 chain result: the read now sends request frames only and **changes nothing on the
   keyboard**, and `read` needs no confirmation flag: 2026-10-19 dropped `--yes` (with `require_yes`, its last
-  user) because the read sends request frames only. `CommandCode::DriverMode` (`0x6C`) and `CommandCode::LoadProfile` (`0x89`, a device write - it makes the
+  user); 2026-10-20 dropped it on the write side too - asking for `onboard write` / `onboard load` is the
+  authorisation, and `--dry-run` is the mode that sends nothing. `CommandCode::DriverMode` (`0x6C`) and `CommandCode::LoadProfile` (`0x89`, a device write - it makes the
   keyboard run the slot) stay in `hid_reports` as named builders, sent by nothing. `OnboardFirmwareVersionCommand`
   is typed with a source byte - `FirmwareSource::Keyboard` (`90 00`) answers the firmware running the keyboard,
   `FirmwareSource::Led` (`90 01`) the LED controller's; both read on an Apex 7, and the capture has both

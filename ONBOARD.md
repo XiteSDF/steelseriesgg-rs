@@ -41,8 +41,9 @@ the deploy frame is not slept), and a
 write answers `88 01 …` after the open and `05 01 …` after every push (202/202 in the capture; buffer writes and the
 commit are not answered). 1.6 is met: the plan of `config_1.json` byte-equals the capture's frames, its frame 103 is
 the capture's frame 103 (`05 00 01 …`, file offset 33792), and a 12,288-byte image plans the
-same 122 frames, padded past its end with zeros. `--dry-run` prints the plan and opens no keyboard; `--yes` is what
-authorises sending, and `onboard write`/`onboard load` without it print what they would send and send nothing.
+same 122 frames, padded past its end with zeros. `--dry-run` prints the plan and opens no keyboard; without it
+`onboard write` and `onboard load` send - there is no `--yes` gate (dropped 2026-10-20: asking for the command is
+the authorisation, `--dry-run` is the safe mode).
 `onboard decode` of the capture's own image answers `Config 1`, schema `0x000B`, and its stored checksum equals the
 one `encode` computes (`0EB1C3D1`). Fixture: `tests/fixtures/onboard-write-apex7.manifest.txt`
 (generator `scripts/gg-write-frames.py`), asserted frame for frame by

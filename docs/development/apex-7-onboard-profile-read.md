@@ -612,7 +612,7 @@ The read's transfers are reads: it sends the firmware poll, the pulls and the pa
 `OnboardLoadProfileCommand` names it and nothing in ssgg sends it. No profile payload is written either:
 do not add profile writes - the profile blob contains blocks this layout does not explain, and writing a
 synthetic blob can put the keyboard in a state GG itself cannot repair. `read` needs no confirmation flag (2026-10-18: `--yes`
-was dropped) - it is reverse-engineered protocol code, but it writes request frames only and changes
+was dropped; 2026-10-20 the write-side `--yes` went the same way) - it is reverse-engineered protocol code, but it writes request frames only and changes
 nothing on the keyboard; `decode` never touches a device. Both write the JSON decode report by default,
 named from the profile name the image carries (`Config 1` -> `config_1.json`, and GG's config number when
 a slot carries no name); `--bin FILE` writes the raw image and `--hex` hex-dumps it. `--profile` takes
@@ -624,7 +624,8 @@ write path is not implemented, so this section's prohibition on writing a profil
 
 - Whether a payload `encode` writes is accepted by a keyboard. The round trip is verified in software on
   the 2026-10-18 images (§Encode); no encoded byte has been sent. Since 2026-10-20 a code path **can** send one
-  (`ssgg onboard write`, behind `--yes`), and it never has been: `docs/development/apex-7-onboard-profile-write.md`.
+  (`ssgg onboard write` - it sends when asked, `--dry-run` prints the frames first), and it never has been:
+  `docs/development/apex-7-onboard-profile-write.md`.
 - ~~Where this platform keeps the profile checksum.~~ Settled 2026-10-18: it is the last word of the
   *payload* (schema A at `11648-4`, schema B at `11696-4`), not of the 12288-byte read image - the image is
   padded with whole resource buffers behind the payload, and reading the image tail as the checksum is what

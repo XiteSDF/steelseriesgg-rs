@@ -131,6 +131,8 @@ report), `OnboardPushCommand` (`0x05`), `OnboardCommitCommand` (`0xEB`) and `Onb
 - The lighting files, driver mode, OLED, volatile, firmware polls and pacing frames are not sent. The write
   touches one profile file and, at the end, deploys that slot (`89 <slot + 1>` right after the commit - the
   engine sleeps 250 ms behind the deploy frame, the write path does not, ONBOARD step 1.4).
+- There is no confirmation gate: `onboard write` and `onboard load` send when asked (`--yes` was dropped
+  2026-10-20; asking for the command is the authorisation). `--dry-run` is the mode that sends nothing.
 
 CLI: `ssgg onboard write <report.json> --profile N [--bin <file>] [--dry-run]` and
 `ssgg onboard load --profile N`; `--profile N` is GG's 1-based config number, `--dry-run` prints the plan and

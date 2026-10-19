@@ -199,7 +199,8 @@ pub(crate) enum Commands {
 /// `decode` and `encode` work on files only and never touch a device. `read` talks to a keyboard: it is
 /// reverse-engineered protocol code that writes request frames to a raw device node, and it changes nothing
 /// on the keyboard (measured 2026-10-19: the read works without GG's opening chain and closing sequence, so
-/// neither is sent). There is no `--yes` gate for the same reason.
+/// neither is sent). `write` and `load` change what the keyboard stores and are sent when asked; the flag
+/// that asks for the plan alone is `--dry-run`.
 #[derive(Subcommand)]
 pub(crate) enum OnboardAction {
     /// Read one profile from a keyboard that answers the on-board profile protocol. Read-only: it writes
@@ -341,7 +342,8 @@ pub(crate) struct OnboardEncodeArgs {
 /// keyboard family's (see
 /// [`OnboardProfileCodec::write_plan`](crate::devices::keyboards::onboard::OnboardProfileCodec::write_plan))
 /// and the frames are the write capture's. `[EXPERIMENTAL]`: the geometry is capture-confirmed on
-/// Apex 7 (`0x1612`); the sequence has never been sent to a keyboard by this crate.
+/// Apex 7 (`0x1612`); the sequence has never been sent to a keyboard by this crate. Without `--dry-run` the
+/// frames are sent.
 #[derive(clap::Args)]
 pub(crate) struct OnboardWriteArgs {
     /// Profile JSON as written by `ssgg onboard decode` (or `onboard read --out`): encoded to payload bytes
@@ -369,12 +371,6 @@ pub(crate) struct OnboardWriteArgs {
     /// sent
     #[arg(long)]
     pub(crate) dry_run: bool,
-
-    /// Send the write. The frame sequence is capture-derived and has never been replayed on a keyboard by
-    /// this crate, so a write to persistent device state needs this flag: without it the command prints the
-    /// plan and sends nothing
-    #[arg(long)]
-    pub(crate) yes: bool,
 }
 
 /// One on-board profile deploy: make the keyboard run the slot GG's config number names.
@@ -389,11 +385,6 @@ pub(crate) struct OnboardLoadArgs {
     /// the on-board profile protocol
     #[arg(short, long, value_name = "PID", value_parser = parse_product_id)]
     pub(crate) device: Option<u16>,
-
-    /// Send the deploy frame. It makes the keyboard run a slot, so it needs this flag: without it the
-    /// command says what it would send and sends nothing
-    #[arg(long)]
-    pub(crate) yes: bool,
 }
 
 #[derive(Subcommand)]

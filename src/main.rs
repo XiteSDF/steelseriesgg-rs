@@ -155,11 +155,7 @@ async fn main() -> Result<()> {
                     let mut manager = new_device_manager()?;
                     cmd_onboard(Some(&mut manager), action).await?;
                 }
-                OnboardAction::Write(args) if args.dry_run || !args.yes => cmd_onboard(None, action).await?,
-                OnboardAction::Write(_) => {
-                    let mut manager = new_device_manager()?;
-                    cmd_onboard(Some(&mut manager), action).await?;
-                }
+                OnboardAction::Write(args) if args.dry_run => cmd_onboard(None, action).await?,
                 _ => cmd_onboard(None, action).await?,
             }
         }
@@ -966,38 +962,28 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
                 }
             };
 
-            if args.dry_run || !args.yes {
+            let slot = file_codec.slot_for_config(args.profile)?;
+            let plan = file_codec
+                .write_plan(slot, &payload)
+                .map_err(|e| Error::Other(format!("frame the write of {source}: {e}")))?;
+
+            if args.dry_run {
                 for line in file_codec.write_banner_lines() {
                     println!("{line}");
                 }
                 println!();
-                let slot = file_codec.slot_for_config(args.profile)?;
-                let plan = file_codec
-                    .write_plan(slot, &payload)
-                    .map_err(|e| Error::Other(format!("frame the write of {source}: {e}")))?;
                 for line in onboard::write_plan_lines(&plan) {
                     println!("{line}");
                 }
                 println!();
-                if args.dry_run {
-                    println!(
-                        "dry run: no keyboard was opened and nothing was sent; the plan of {} payload bytes is \
-                         {} frames for slot {} (GG config {})",
-                        payload.len(),
-                        plan.frames.len(),
-                        slot,
-                        args.profile
-                    );
-                } else {
-                    println!(
-                        "nothing sent: this is the plan for slot {slot} (GG config {}) of {} payload bytes, \
-                         {} frames; the sequence is capture-derived and has never been replayed on a keyboard, \
-                         so re-running with --yes is what authorises the write",
-                        args.profile,
-                        payload.len(),
-                        plan.frames.len()
-                    );
-                }
+                println!(
+                    "dry run: no keyboard was opened and nothing was sent; the plan of {} payload bytes is {} \
+                     frames for slot {} (GG config {})",
+                    payload.len(),
+                    plan.frames.len(),
+                    slot,
+                    args.profile
+                );
                 return Ok(());
             }
 
@@ -1080,15 +1066,6 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
             };
             let slot = codec.slot_for_config(args.profile)?;
             let label = onboard_device_label(keyboard.as_ref());
-            if !args.yes {
-                println!(
-                    "nothing sent: slot {slot} (GG config {}) would be deployed on the {label}, making the \
-                     keyboard run it; the deploy frame is capture-derived and untested on hardware, so re-run \
-                     with --yes",
-                    args.profile
-                );
-                return Ok(());
-            }
             keyboard.load_onboard_profile(slot).await?;
             println!(
                 "slot {slot} (GG config {}) deployed on the {label}: the keyboard now runs it",

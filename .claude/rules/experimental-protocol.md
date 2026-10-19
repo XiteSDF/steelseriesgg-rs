@@ -57,15 +57,16 @@ feature flag was removed on 2026-10-15; experimental paths are labelled in code 
 Writes that could change persistent device state (the on-board profile) stay unwired until a read-back exists and the
 user approves the first write. The same rule covers the legacy Apex family: `ssgg onboard` writes **no profile
 payload** — `CMD_PUSH_PAYLOAD` stays unsent and no `03 00` block is sent. The `--yes` confirmation gate on
-`read` was dropped 2026-10-19. Since 2026-10-19
+`read` was dropped 2026-10-19 and the one on `write`/`load` 2026-10-20: asking for the command is the
+authorisation, `--dry-run` is the mode that sends nothing. Since 2026-10-19
 the read writes **nothing** to the keyboard: GG's opening chain and closing sequence are not sent (measured not
 needed). The engine's deploy frame `0x89` is the one frame in that family that would change device state, it
 stays a named builder sent by nothing, and `ONBOARD.md` step 8 keeps its untested keyboard-effect questions.
 
-**Changed 2026-10-20 (write path):** the legacy Apex family now has a write path in code — `ssgg onboard write` and
-`ssgg onboard load` build and (with `--yes`) send the profile-file open, the buffer writes, the pushes, the commit and
-the deploy. The gate is the rule above applied to a keyboard: **without `--yes` both commands print the plan and send
-nothing**, and `--dry-run` prints it without opening a keyboard. The sentence "`CMD_PUSH_PAYLOAD` stays unsent" and
+**Changed 2026-10-20 (write path):** the legacy Apex family now has a write path in code — `ssgg onboard write`
+and `ssgg onboard load` build and send the profile-file open, the buffer writes, the pushes, the commit and
+the deploy. **There is no `--yes` gate** (dropped the same day): asking for the command is the authorisation,
+and `--dry-run` prints the frames without opening a keyboard. The sentence "`CMD_PUSH_PAYLOAD` stays unsent" and
 "`0x89` is sent by nothing" above describe the state before that change and are no longer literally true; what is true
 is that **no byte of the write path has ever been sent to a keyboard** — no test runs the device path, and the first
 hardware write is `ONBOARD.md` step 5, user-approved, after the target slot has been read back. The read path still
