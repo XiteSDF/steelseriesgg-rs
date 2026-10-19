@@ -870,6 +870,7 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
                         bin.display(),
                         second_path.display()
                     );
+                    write_onboard_extra(bin, &first).await?;
                 }
             } else {
                 let image = keyboard.read_onboard_profile(slot).await?;
@@ -888,6 +889,7 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
                 if let Some(bin) = args.bin.as_ref() {
                     secure_write_async(bin.clone(), image.data.clone()).await?;
                     println!("profile image written to {}", bin.display());
+                    write_onboard_extra(bin, &image).await?;
                 }
             }
         }
@@ -1155,6 +1157,26 @@ fn onboard_json_path(
         || std::path::PathBuf::from(codec.dump_name(data, config)),
         std::path::PathBuf::from,
     )
+}
+
+/// The region a read image carries behind its payload, written beside the image as `<out>.extra.bin`.
+/// The read fills the whole profile region, and only the payload is decoded; this file is the rest of the
+/// region, recorded for a read against GG's capture. Nothing in ssgg decodes these bytes.
+async fn write_onboard_extra(
+    bin: &std::path::Path,
+    image: &steelseries_gg::devices::keyboards::onboard::ProfileImage,
+) -> Result<()> {
+    let Some(region) = steelseries_gg::devices::keyboards::apex_7_profile::extra_region(&image.data) else {
+        return Ok(());
+    };
+    let extra_path = bin.with_extension("extra.bin");
+    secure_write_async(extra_path.clone(), image.data[region.offset..].to_vec()).await?;
+    println!(
+        "the {} bytes behind the payload written to {} (recorded, decoded by nothing)",
+        region.len,
+        extra_path.display()
+    );
+    Ok(())
 }
 
 /// The per-pull read record as the family codec writes it: chunk headers, framing stats, the image hash.

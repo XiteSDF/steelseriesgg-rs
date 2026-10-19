@@ -657,8 +657,24 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   The decode report's device line reads `Apex 7 (product 1612)`. **Reverted here**: keeping a per-codec product
   ID table as the scope statement, and the registry-known flag as a label on the name.
 
+- 2026-10-19 (the region behind the payload is recorded, and a read report names its slot): the decode report
+  carries `payload_len` (the length its own schema word needs) and, when the image is longer than that payload,
+  `extra_len` + `extra_fnv1a_64` + `extra_head` - the region GG's write windows cover behind the profile, which
+  **nothing decodes** ([`apex_7_profile::extra_region`]). The read's record carries the same block as `region`,
+  `image_lines` prints `region:` per read, and `--bin` writes those bytes beside the image as `<out>.extra.bin`.
+  `ProfileImage::stamp_identity` stamps the fourth identity field, `slot`, from the slot the read ran on. Every
+  new decode field is `#[serde(default)]`, so a saved report (which may carry none of them) reads back through
+  `encode_json`. The GUI mirrors `PAYLOAD_LEN_A` / `PAYLOAD_LEN_B` / `PROFILE_REGION_BYTES` (a check compares the
+  three line by line against Rust), prints the **Extra region** row only when `extra_len` is non-zero, and puts the
+  `payload <n> + extra region <m>` split in the status line. Rapid Tap pairs print their `reserved` bytes read-only,
+  so a save writes them back unchanged. **Fixtures regenerated** from a fresh decode of the stock slot with the
+  identity fields and slot stamped as a read stamps them; `selftest.mjs` is 189 checks.
+  **Reverted here**: the GUI's earlier `extra_keys` / `extra_keys_sha256` / `extra_keys_len` / `extra_keys_head`
+  naming and a nested `extra` block - the field names the docs list are the ones the code writes.
+
 - 2026-10-19 (no device struct): `OnboardDevice` is deleted and the identity is **three plain fields on the
-  record** - `product_id`, `product` (model name), `firmware` - declared **above** the profile fields in
+  record** (four since the same day: `slot` joins them, stamped by a read, absent for a file decode) -
+  `product_id`, `product` (model name), `firmware` - declared **above** the profile fields in
   `ProfileImage` and in the decode report, so a record says which keyboard before what it holds (a test asserts
   that order in the serialized text). A read stamps all three (`ProfileImage::stamp_identity` copies them into
   the decode report the read writes); a file decode names no keyboard and writes none of them, and the read

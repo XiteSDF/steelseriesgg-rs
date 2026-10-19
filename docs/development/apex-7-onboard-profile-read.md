@@ -159,16 +159,17 @@ per chunk from the typed commands, nothing materialises a transfer list (`Step`,
 writes for the same image (the format `tools/profile-gui` opens); `--report FILE` adds the per-pull read
 record (chunk headers, framing stats, image hash) and `--bin FILE` the raw image bytes.
 
-**The keyboard identity is three plain fields, written first**: `product_id`, `product` (the model name this
-crate lists for that number) and `firmware` (what the `0x90` poll answered) sit above the profile fields in
-`ProfileImage` and in the decode report - the record says *which keyboard* before it says *what it holds*. A
-read stamps all three; a decode of a file names no keyboard, so it writes none of them (`ProfileImage` writes
+**The keyboard identity is four plain fields, written first**: `product_id`, `product` (the model name this
+crate lists for that number), `firmware` (what the `0x90` poll answered) and `slot` (the 0-based profile slot
+the read ran on) sit above the profile fields in `ProfileImage` and in the decode report - the record says
+*which keyboard, which slot* before it says *what it holds*. A read stamps all four; a decode of a file names
+no keyboard and no slot, so it writes none of them (`ProfileImage` writes
 them as `null` in the read record, which states the absence openly). There is no `device` object and no nested
 block: a nested struct of the same three values was one layer of indirection over three fields, and the two
 fields it used to carry are gone with it - every SteelSeries device answers the same vendor ID `0x1038`, so a
 product ID identifies the model on its own, and a model name is derivable from the number it names, so a
 record that carries both carries no redundancy. A model outside this crate's registry is labelled by that name
-and a reader trusts the number. The encoder ignores all three. The GUI
+and a reader trusts the number. The encoder ignores all four. The GUI
 shows a model **name** for that number, and takes it from Rust rather than from the file:
 `tools/profile-gui/sync-products.mjs` parses `pub mod product_ids`, `device_name_from_product_id` and
 `device_type_from_product_id` (`src/devices/mod.rs`) and the `codecs()`
@@ -247,7 +248,7 @@ Block layout, in the order the Windows engine's decoder walks the payload:
 | 735 | 128 button META mappings, 5-byte entries | engine struct, verified on hardware |
 | 1375 | 2 wheel META mappings, 5-byte entries | engine struct |
 | 1385 | OLED pixel block, 640 bytes (`oled_settings: bytearray (size 640)`) | engine struct, verified on hardware |
-| 2025 / 2026 | Rapid Tap (schema B only): 1 enable byte + 10 **5-byte** `onboard_rapid_tap_pair` (`hid1`, `hid2`, `mode`, 2 reserved bytes) | engine struct, verified on hardware |
+| 2025 / 2026 | Rapid Tap (schema B only): 1 enable byte + 10 **5-byte** `onboard_rapid_tap_pair` (`hid1`, `hid2`, `mode`, 2 reserved bytes, printed as the hex pair `reserved` in the decode JSON) | engine struct, verified on hardware |
 | 2025 / 2076 | macro data, 9600 bytes (`uint16` count + bytes) (schema A / schema B). `2025` is the **length word** (2210) of the packed **macro record list** the block holds - see §The macro block is a packed record list | engine struct, verified on hardware |
 | 11625 / 11676 | profile GUID, 16 bytes (schema A / schema B) | engine struct, verified on hardware |
 | 11641 | 3 padding bytes (schema A only - schema B has none) | engine struct |
@@ -256,7 +257,10 @@ Block layout, in the order the Windows engine's decoder walks the payload:
 ### The META toggle is a byte and a binding (measured 2026-10-19) `[EXPERIMENTAL]`
 
 Payload offset 84 (`meta_toggle_hid`) is one byte naming the key GG switches META mode with. The
-binding GG marks a slot with lives in the META-layer table: `function 0x62` with **code 1 = 0x05**.
+binding GG marks a slot with lives in the META-layer table: `function 0x62` with **code 1 = 0x05**. Code 1
+is the meta **action** byte: `0x62` runs a meta action and code 1 says which one - the `MetaAction` enum
+in `apex_7.lisp`, ordered `1,2,3,4,5,10` = Lock Win, Lock Game, Lock Switch, Lock All, Perf, Rapid Tap
+(five enum slots, and the sixth written as its number `0x0A` by `MetaActionToKeystroke`).
 The reads decoded so far carry the pair the same way:
 
 | file | byte 84 | the META entry marked `62 / 05` | that slot's base entry |
@@ -275,6 +279,16 @@ Four facts come off that:
   The user profile above binds slot 93 to `0x65` - the cap types the Context Menu - while its byte
   names the M key, so the cap's binding, the slot and the byte are three separable things. Every other
   key the byte names is named by its own usage.
+- **What the action bytes mean (2026-10-20, Apex 7 `0x1612` wired, GG 3.20.2527.0, firmware 4.16.8;
+  7 stock slot reads, 2 user profiles, GG's per-key JSON, GG's 3.20 UI strings).** The marker `0x05` is
+  GG's **Lock Win** action: 7/7 stock reads carry `62 05 00 00 00` on slot 13 = LWin, and 6 of the 19
+  slots GG's own JSON marks carry byte `05`. `0x0A` is **Rapid Tap**: slot 14 = PrtSc carries
+  `62 0A 00 00 00` in the slot-0 read, in the user profile, and in GG's JSON, which marks 19 slots that
+  byte-match that layer byte for byte. The key this page marks as META - slot 93, GG's code `0xF0` -
+  binds `62 01 00 00 00`: the plain **Meta action (LCtrl)**, with the marker byte (`0xF0`) pointing at
+  it, and GG's own name for that keybind is **Menu**, not Meta, in the 3.20 UI. So the action byte is a
+  meta action, not a "is bound" flag: `05` is the mark GG leaves when the key it marks is bound to Lock
+  Win, and the marked key of these reads is LWin, the key a meta action acts on.
 - **`0x05` at code 1 is the toggle's marker, not a general "is bound" byte.** The five `0x62` entries
   of a stock META layer write `01`, `02`, `03`, `04` at code 1 on GG's four defaults and `05` **only**
   on the slot the byte names, and no read decoded so far carries a `0x62` entry on the base layer at

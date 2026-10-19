@@ -749,6 +749,12 @@ pub struct ProfileImage {
     pub data: Vec<u8>,
     /// Aggregated reply statistics.
     pub stats: ReadStats,
+    /// The image bytes **behind** the payload, as a block summary, in the read's record. The read fills the
+    /// whole profile region ([`PROFILE_FILE_BYTES`]) and only its head is the payload; the rest is recorded
+    /// and decoded by nothing. `None` skips the field (an image no longer than the payload).
+    /// `[EXPERIMENTAL]`: no byte of this region is understood; see `ONBOARD.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<MacroSummary>,
 }
 
 impl ProfileImage {
@@ -826,6 +832,7 @@ impl ProfileImage {
 
         Ok(Self {
             profile_slot,
+            region: extra_region(&data),
             stats: ReadStats {
                 chunks_read: chunks.len(),
                 reads_read,
@@ -852,6 +859,7 @@ impl ProfileImage {
         profile.product_id = self.product_id;
         profile.product = self.product.clone();
         profile.firmware = self.firmware.clone();
+        profile.slot = Some(self.profile_slot);
     }
 
     /// Record the firmware version the read's `90 00` poll answered with.
@@ -1248,6 +1256,10 @@ pub struct OnboardProfile {
     /// Firmware version the read's `0x90` poll answered with; see [`OnboardProfile::product_id`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub firmware: Option<String>,
+    /// Profile slot the read ran on (0-based), stamped by the read. Absent for a decode of a file:
+    /// bytes alone say which slot they came from only if a reader already knows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<u8>,
     /// Schema word.
     pub schema: u16,
     /// Schema name (`a`, `b` or `unknown`).
@@ -1293,6 +1305,20 @@ pub struct OnboardProfile {
     pub crc_ok: bool,
     /// Length of the checksummed prefix.
     pub crc_region_len: usize,
+    /// Payload length the decode used for this schema ([`PAYLOAD_LEN_A`] / [`PAYLOAD_LEN_B`]).
+    pub payload_len: usize,
+    /// Bytes the image carries **behind** the payload. The read fills the whole profile region
+    /// ([`PROFILE_REGION_BYTES`]) and only its head is the payload: what sits behind it is recorded here
+    /// and decoded by nothing. `0` skips the field, so a payload-only image (a saved `.bin`) says nothing.
+    /// `[EXPERIMENTAL]`: no byte of this region is understood; see `ONBOARD.md`.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub extra_len: usize,
+    /// 64-bit FNV-1a of that region, hex, for identity between reads. Absent when there is no region.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_fnv1a_64: Option<String>,
+    /// First 16 bytes of that region, hex. Absent when there is no region.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_head: Option<String>,
 }
 
 /// Layout of the decoded blocks.
@@ -1622,6 +1648,7 @@ pub fn decode(data: &[u8]) -> Result<OnboardProfile> {
         product_id: None,
         product: None,
         firmware: None,
+        slot: None,
         schema,
         schema_name: match schema {
             SCHEMA_A => "a".to_string(),
@@ -1651,7 +1678,29 @@ pub fn decode(data: &[u8]) -> Result<OnboardProfile> {
         crc_computed: computed,
         crc_ok: stored == computed,
         crc_region_len: crc_offset,
+        payload_len: expected,
+        extra_len: data.len().saturating_sub(expected),
+        extra_fnv1a_64: (data.len() > expected).then(|| fnv1a_64(&data[expected..])),
+        extra_head: (data.len() > expected).then(|| hex_of(&data[expected..data.len().min(expected + 16)])),
     })
+}
+
+/// serde helper: `extra_len` is written only when the image is longer than the payload.
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+/// Summary of the image bytes **behind** the payload: the region GG's write windows cover
+/// ([`PROFILE_FILE_BYTES`] with the payload cut off the front). `None` when the image is no longer than
+/// the payload, which is the case for every saved `.bin` file. An unknown schema word also answers `None`:
+/// there is no payload length to cut at.
+#[must_use]
+pub fn extra_region(data: &[u8]) -> Option<MacroSummary> {
+    let payload_len = payload_len_for_schema(schema_of(data)).ok()?;
+    if data.len() <= payload_len {
+        return None;
+    }
+    Some(summary_of(data, payload_len, data.len() - payload_len))
 }
 
 /// One-line human summary of a decoded profile.
@@ -2230,6 +2279,13 @@ fn image_lines(image: &ProfileImage, label: &str) -> Vec<String> {
         match image.firmware.as_deref() {
             Some(firmware) => format!("firmware:  {firmware} (answered the 0x90 firmware poll)"),
             None => "firmware:  no answer to the 0x90 firmware poll".to_string(),
+        },
+        match image.region.as_ref() {
+            Some(region) => format!(
+                "region:  {} bytes behind the payload at {} ({} non-zero, fnv1a {}, head {}): recorded, decoded by nothing",
+                region.len, region.offset, region.nonzero, region.fnv1a_64, region.head
+            ),
+            None => "region:  none behind the payload".to_string(),
         },
         format!(
             "transfers: {} payload reads over {} pulls; {} bytes covered, {} short read(s)",
@@ -2980,6 +3036,52 @@ mod tests {
     }
 
     #[test]
+    fn the_region_behind_the_payload_is_recorded_by_a_read_image() {
+        // The read fills the whole profile region; the payload is the head of it. The decode report names
+        // what sits behind the payload as a block summary, and a payload-only file names nothing.
+        let mut image = vec![0u8; PROFILE_FILE_BYTES];
+        let payload = synthetic_payload(SCHEMA_B);
+        image[..payload.len()].copy_from_slice(&payload);
+        image[PAYLOAD_LEN_B] = 0xFE;
+        let with_region = decode(&image).expect("an image is a payload with a padded tail");
+        assert_eq!(with_region.payload_len, PAYLOAD_LEN_B);
+        assert_eq!(with_region.extra_len, PROFILE_FILE_BYTES - PAYLOAD_LEN_B);
+        assert_eq!(
+            with_region.extra_head.expect("the region has bytes"),
+            format!("FE{}", " 00".repeat(15))
+        );
+        assert_eq!(
+            with_region.extra_fnv1a_64.as_deref(),
+            Some(fnv1a_64(&image[PAYLOAD_LEN_B..]).as_str())
+        );
+        let payload_only = decode(&payload).expect("a payload alone decodes");
+        assert_eq!(payload_only.extra_len, 0, "a payload-only report records no region");
+        assert_eq!(payload_only.extra_fnv1a_64, None);
+        let region = extra_region(&image).expect("an image longer than its payload has a region");
+        assert_eq!(region.offset, PAYLOAD_LEN_B);
+        assert_eq!(region.len, PROFILE_FILE_BYTES - PAYLOAD_LEN_B);
+        assert_eq!(
+            extra_region(&payload),
+            None,
+            "a payload-only image has no region to record"
+        );
+        assert_eq!(
+            extra_region(&[0u8; PROFILE_FILE_BYTES]),
+            None,
+            "an unsaved slot (schema word 0) names no payload length, so no region"
+        );
+    }
+
+    #[test]
+    fn a_read_stamps_the_slot_it_ran_on() {
+        let image = ProfileImage::assemble(2, Vec::new()).expect("an empty record set assembles an empty image");
+        let mut profile = decode(&synthetic_payload(SCHEMA_B)).unwrap();
+        assert_eq!(profile.slot, None, "a decode of bytes names no slot");
+        image.stamp_identity(&mut profile);
+        assert_eq!(profile.slot, Some(2), "the read's report names the slot it read");
+    }
+
+    #[test]
     fn decode_schema_b_payload_carries_rapid_tap() {
         let data = synthetic_payload(SCHEMA_B);
         let profile = decode(&data).unwrap();
@@ -3114,6 +3216,9 @@ mod tests {
                 "crc_computed",
                 "crc_ok",
                 "crc_region_len",
+                // A decode of bytes stamps no identity, no slot and no region: those fields are skipped.
+                // The payload length it used is always named.
+                "payload_len",
             ]
         );
 
