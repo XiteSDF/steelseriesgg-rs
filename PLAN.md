@@ -268,6 +268,26 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
 
 ## Done or dropped (do not redo)
 
+- 2026-10-20: **`examples/sample-macros.json` is out of the repo (operator request: it carries their
+  macros).** The file moved to the repo root as `sample-macros.json`, joined `config_*.json` and
+  `some_rebounds*.json` under a `.gitignore` block that keeps the operator's captures from being
+  committed, and the commit that added it (`aabd9b4`) was amended, so the bytes never enter history.
+  The suite now reads it through `rootText` and gates the 10 macro checks and the macro-bound key panel
+  check on it (`okMacros`): **197/197 with the file, 197/197 with 13 skips without it** (the OLED
+  invert and META mask checks are in that 13 - they measure the root captures too). The validator
+  check and the stock-docs check run on the tracked fixtures alone and use the macros decode when it
+  is present.
+- 2026-10-20: **the OLED panel gains `Invert every pixel`, and `tools/profile-gui` is committed.**
+  The button flips every bit of `oled.bytes_hex` (128 x 40 = 640 bytes, 5120 pixels): lit becomes off
+  and off becomes lit, bit 7 stays the left pixel of its byte, so the picture is mirrored in colour
+  only and never moved; `len`, `nonzero`, `fnv1a_64` and `head` are recomputed through the same
+  `setOledBitmap` the blank button uses, inverting twice is the identity, and a block with no
+  `bytes_hex` inverts to every pixel lit. The suite checks the flip byte-for-byte against the stored
+  bytes, the recomputed summary fields, the raster (every pixel is the old pixel inverted), the
+  identity after two clicks, and that `serializeDoc` carries the bytes. The suite is 197 checks; the
+  three that measure the profile JSONs in the repo root (the operator's captures, not files of the
+  repo) now report `skip` in a checkout without them instead of failing on a missing file, so
+  `node tools/profile-gui/selftest.mjs` runs clean on a fresh clone.
 - 2026-10-20: **the META mapping mask is derived, measured, and read-only in the GUI.**
   `lighting.meta_mapped_elements` (32 bytes at payload `42`) is a 256-bit mask whose bit index is a key's
   own HID usage: set for every key whose META-layer entry carries a binding (function byte != 0), not set

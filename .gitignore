@@ -53,3 +53,11 @@ apexctl/
 *.etl
 *.etl.csv
 tools/profile-gui/board-preview.svg
+
+# preview.mjs output (tools/profile-gui)
+tools/profile-gui/board-preview.svg
+
+# the operator's profile captures (kept out of the repo; the GUI suite skips the checks that measure them)
+sample-macros.json
+config_*.json
+some_rebounds*.json
