@@ -1115,7 +1115,8 @@ fn select_onboard_keyboard(
         OnboardKeyboard::NotFound { product_id } => Err(Error::DeviceNotFound(match product_id {
             Some(pid) => format!(
                 "no keyboard with product ID {pid:04X} answers the on-board profile protocol: the {what} runs \
-                 on a keyboard's own handle, and only keyboards are candidates"
+                 on a keyboard's own handle, only keyboards are candidates, and the only keyboard that answers \
+                 the protocol is the Apex 7 (0x1612), the board it was measured on"
             ),
             None => format!(
                 "no connected keyboard answers the on-board profile protocol: the {what} runs on a keyboard's \

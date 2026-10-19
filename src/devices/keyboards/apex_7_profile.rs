@@ -12,7 +12,9 @@
 //! [`crate::devices::keyboards::apex_pro_tkl_2023_profile`]) and shares none of it. The engine's own
 //! protocol file (`lisp/apex_7.lisp`) covers the whole legacy platform, `lisp/base_apex_legacy.lisp:6`,
 //! and its words apply to the `0x1614` / `0x1616` / `0x1618` siblings as protocol evidence; this crate
-//! enables the path on the board it measured (`Apex7Onboard::knows_product`).
+//! enables the path on the board it measured: the scope is the device class, and discovery builds
+//! [`Apex7`](crate::devices::keyboards::apex_7::Apex7) for `0x1612` alone
+//! ([`discovery::keyboard_class`](crate::devices::discovery::keyboard_class)).
 //!
 //! Protocol status: reverse-engineered. The file ids, chunk geometry, frame layouts and the payload
 //! struct layout below are reproduced from the Windows engine's device descriptors, and the wire part of

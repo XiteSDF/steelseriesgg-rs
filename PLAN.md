@@ -667,6 +667,21 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   `device` object itself (three values plus a name for them) and, in the previous step, the `vendor_id` +
   `known` fields - one vendor ID for the whole brand and a name derivable from its number are not data.
 
+- 2026-10-19 (the class rule is where the scope lives, and it went missing): `ssgg onboard read` answered
+  `DeviceNotFound` on a connected Apex 7 that `ssgg devices` lists. `Keyboard::supports_onboard_profile` is
+  `onboard_codec().is_some()`, and `Apex7` is the only class that answers a codec - so the read runs only on a
+  keyboard discovery built as `Apex7`. Deleting the `open_keyboard` arm that built it (with the `onboard_capable`
+  predicate it keyed on) left `0x1612` in the catch-all arm: the keyboard opened as `GenericKeyboard`, answered no
+  codec, and the selection found no candidate. The gate was intact and the class behind it was not, which is why
+  the symptom is "not found" and not "not supported". The rule is now `discovery::keyboard_class(product_id)`,
+  a pure function `open_keyboard` switches on: `0x1612` -> `Apex7`, the Apex Pro family -> `ApexProTkl2023`,
+  `0x1A01` -> `Apex3Tkl`, everything else -> `Generic`. Two tests pin it: one names the board the on-board path
+  is enabled on, one names the platform siblings it refuses (`0x1614`, `0x1616`, `0x1618`) - the refusal is the
+  scope, not a bug. `open_onboard_keyboard`, `onboard_choice` and `--device` are untouched: the selection was
+  never the broken part. The named-product message now also says which keyboard answers the protocol.
+  **Reverted here**: re-adding a product-ID predicate (`onboard_capable` under any name) as a second copy of the
+  rule - the class decision is the rule, and a predicate on a codec is a second place to say it.
+
 ## Reference projects
 
 - Apex RGB: OpenRGB `SteelSeriesApex8ZoneController`

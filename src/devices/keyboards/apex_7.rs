@@ -121,10 +121,10 @@ const _: () = assert!(MAX_READ_LEN + READ_REPLY_FRAMING_LEN < READ_REPLY_BUFFER_
 
 /// Apex 7 keyboard device, with the on-board profile read on its own handle.
 ///
-/// Discovery builds this class for the Apex 7 collection (`discovery::open_keyboard`), which never asks the
-/// on-board question: every keyboard discovery builds is a keyboard. The on-board scope is
-/// [`Apex7Onboard::knows_product`], answered through
-/// [`Keyboard::supports_onboard_profile`](crate::devices::keyboards::Keyboard::supports_onboard_profile).
+/// Discovery builds this class for product ID `0x1612` and for nothing else (`discovery::open_keyboard`),
+/// so the on-board scope is the class itself: [`Keyboard::onboard_codec`] answers it, and
+/// [`Keyboard::supports_onboard_profile`](crate::devices::keyboards::Keyboard::supports_onboard_profile)
+/// reports that answer for the keyboard the manager opened. No product-ID table is consulted.
 pub struct Apex7 {
     inner: GenericKeyboard,
 }
