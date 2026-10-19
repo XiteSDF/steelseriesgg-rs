@@ -30,6 +30,37 @@ Protocol facts for the Apex Pro TKL 2023 are in `AGENTS.md` ("Protocol research 
 
 ---
 
+---
+
+## P0 (onboard). Apex 7 on-board write: software done, hardware open
+
+Implemented 2026-10-20 from the operator's Windows capture (GG write capture, Apex 7 `0x1612`,
+firmware 4.16.3, 122 frames): `ssgg onboard write` (JSON by default, `--bin` for payload bytes, `--profile N`
+mandatory, `--dry-run`, `--yes`) and `ssgg onboard load` (`--profile N` mandatory, `--yes`). The sequence is the
+capture's: `88 00 <file id>` open, 40 windows of two 512-byte `03 00 <buffer offset> <size>` feature writes
+(642 wire bytes) plus one `05 00 <file id> <file offset> 1024` push, `eb <slot + 1>` commit, then `89 <slot + 1>`
+deploy after 250 ms. Geometry comes from the keyboard family (`OnboardProfileCodec::write_plan`); the capture's
+answer to a push is `05 01 …` (202/202) and to the open `88 01 …`. Frame builders in `hid_reports`
+(`OnboardFileOpenCommand`, `OnboardBufferWriteCommand`, `OnboardPushCommand`, `OnboardCommitCommand`), the device
+path `Apex7::write_onboard_profile` / `Apex7::deploy_onboard_profile`, fixture
+`tests/fixtures/onboard-write-apex7.manifest.txt` (generator `scripts/gg-write-frames.py`) asserted
+frame for frame by `apex_legacy_profile::tests::the_write_plan_of_the_read_report_is_the_capture_write_sequence`.
+`onboard decode` of the capture's image answers `Config 1`, schema `0x000B`, stored checksum `0EB1C3D1` equals
+the one `encode` computes. **No test touches a keyboard and no write frame has been replayed on hardware**; the
+read-back question stays open (the engine's own `83`/`85` read path is what `onboard read` uses). Write-up:
+`docs/development/apex-7-onboard-profile-write.md`; task and open steps: `ONBOARD.md` §Apex 7 on-board profile write.
+
+- **[HW] First write (user-approved, model and date recorded):** read the target slot back
+  (`onboard read --profile N --bin …`), write the slot with `onboard write --profile N --yes`, report what the
+  keyboard does.
+- **[HW] write → read → decode → diff:** prove the payload the board holds matches the JSON the write took, twice
+  (the ONBOARD.md acceptance).
+- **[HW] Deploy behaviour:** `onboard load` makes the board run a slot. Keyboard effects of `89` (and of the lighting
+  reset `0x3B` the engine sends at session end) have never been tested from this crate.
+- **[HW] Pacing on hardware:** the capture's 7.1 ms average frame spacing, the engine's 100 ms every 32 frames, the
+  250 ms deploy pause and the 20 s deploy timeout (engine `SetProfileToBoard`: 250 ms sleep, 40 × 500 ms poll)
+  are engine/capture facts, never measured from `ssgg`.
+
 ## P0 (onboard). Apex 7 on-board read: first hardware run on the device path
 
 Code is in place (2026-10-17, `onboard-configs-dev`): `Apex7` in `src/devices/keyboards/apex7.rs` wraps

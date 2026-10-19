@@ -1,5 +1,6 @@
 //! On-board profile protocol interface. `[EXPERIMENTAL]`: every protocol fact behind it is
-//! reverse-engineered from official GG captures and read from keyboards; nothing here writes a profile.
+//! reverse-engineered from official GG captures and read from keyboards. The read path runs on hardware;
+//! the write path builds and prints the frames a write needs and sends them only when asked to.
 //!
 //! Two interfaces, one per side of the work:
 //!
@@ -9,8 +10,9 @@
 //!   pulls one slot on the handle the device manager opened. A keyboard that has no on-board profile
 //!   says so by leaving both defaults.
 //! - [`OnboardProfileCodec`] is that family's codec: the file-side work - decode, encode, report JSON,
-//!   dump file names, the text a read prints - which needs no device, so `ssgg onboard decode` and
-//!   `ssgg onboard encode` run it on files with no keyboard connected.
+//!   dump file names, the text a read and a write plan print - which needs no device, so `ssgg onboard
+//!   decode`, `ssgg onboard encode` and `ssgg onboard write --dry-run` run it on files with no keyboard
+//!   connected.
 //!
 //! One family implements them today: `apex_legacy_profile` (the legacy Apex family, `0x1612`), through
 //! [`LegacyApexOnboard`](crate::devices::keyboards::apex_legacy_profile::LegacyApexOnboard), which
@@ -19,12 +21,16 @@
 //! layout, extending these types where its profile has fields this one has, and registering its codec
 //! in [`codecs`]. `src/main.rs` is written against these interfaces and names no keyboard family.
 
-use crate::error::Result;
+use crate::devices::keyboards::apex_legacy_profile::{
+    DEVICE_RESOURCE_BUFFER_LEN, PAYLOAD_READ_LEN, PULLS_PER_FILE, WRITE_DEPLOY_PAUSE_MS,
+};
+use crate::error::{Error, Result};
 use serde::Serialize;
 
 pub use crate::devices::keyboards::apex_legacy_profile::{
-    KeyMapping, LightingProfile, MacroAction, MacroSummary, OnboardMacro, OnboardProfile, ProfileImage, RapidTap,
-    RapidTapPair, ReadReply, ReadStats,
+    KeyMapping, LightingProfile, MacroAction, MacroSummary, OnboardMacro, OnboardProfile, OnboardWriteFrame,
+    OnboardWritePlan, OnboardWriteReportKind, ProfileImage, RapidTap, RapidTapPair, ReadReply, ReadStats, WriteStats,
+    write_plan, write_plan_lines, write_stats,
 };
 
 /// The keyboard a read collected profile bytes from, recorded in the read's record and in the decode
@@ -95,6 +101,55 @@ pub trait OnboardProfileCodec: Send + Sync {
     ///
     /// Propagates a serde failure.
     fn profile_json(&self, profile: &OnboardProfile) -> Result<String>;
+
+    /// Frames to send, in wire order, to write one slot's payload, `[EXPERIMENTAL]`: a family that knows a
+    /// write sequence returns the engine's frames (see [`write_plan`]); the default says the family has no
+    /// write sequence known.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::Error::Unsupported`] for a family with no write sequence, and
+    /// [`crate::error::Error::InvalidConfig`] for a payload the family's geometry cannot frame.
+    fn write_plan(&self, profile: u8, payload: &[u8]) -> Result<OnboardWritePlan> {
+        let _ = (profile, payload);
+        Err(Error::Other(
+            "this device family has no known on-board profile write sequence".to_string(),
+        ))
+    }
+
+    /// The lines describing the family's write geometry, printed before a write plan and before a write is
+    /// sent. A family without a write sequence says so and quotes what it does know.
+    #[must_use]
+    fn write_banner_lines(&self) -> Vec<String> {
+        vec![
+            "this family has no on-board profile write sequence known; its read geometry is:".to_string(),
+            format!(
+                "{} pulls of {} bytes per profile file, {} bytes per read",
+                PULLS_PER_FILE, DEVICE_RESOURCE_BUFFER_LEN, PAYLOAD_READ_LEN
+            ),
+        ]
+    }
+
+    /// Tally of a write plan's frames: the counts `ssgg onboard write` reports after a finished write.
+    #[must_use]
+    fn write_stats(&self, plan: &OnboardWritePlan) -> WriteStats {
+        write_stats(plan)
+    }
+
+    /// Interrupt report ids the write path waits an answer on: the file-open answer and one answer per
+    /// push. The capture answers `88 01 …` and `05 01 …`; what the status byte means is
+    /// observed, not proven.
+    #[must_use]
+    fn write_ack_report_ids(&self) -> [u8; 2] {
+        [0x88, 0x05]
+    }
+
+    /// Milliseconds to wait after the profile deploy frame (0x89), the engine's own pause
+    /// (`onboard-load-pause-ms`).
+    #[must_use]
+    fn write_deploy_pause_ms(&self) -> u64 {
+        WRITE_DEPLOY_PAUSE_MS
+    }
 
     /// A read image as the JSON read record `ssgg onboard read --report` writes.
     ///

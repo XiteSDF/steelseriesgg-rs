@@ -45,11 +45,21 @@ pub enum CommandCode {
     /// NOTE: This command code is experimental based on hardware research.
     ActuationControl = 0x2D,
     /// [EXPERIMENTAL] Apex Pro TKL 2023 on-board profile chunk (0x03, header `03 01 80`), see
-    /// `ProfileChunkCommand`.
+    /// `ProfileChunkCommand`. The legacy Apex family uses the same command code with a different header
+    /// (`03 00 | buffer offset u16 | size u16 | payload`), see [`OnboardBufferWriteCommand`].
     ProfileChunk = 0x03,
     /// [EXPERIMENTAL] Legacy Apex (Apex 7, Apex Raw, Apex 2014) resource-buffer pull (0x85), see
     /// `OnboardPullCommand`: answered by the keyboard's ordinary input report, not by a pull-specific one.
     OnboardPull = 0x85,
+    /// [EXPERIMENTAL] Legacy Apex resource-buffer push into a profile file (0x05), see [`OnboardPushCommand`]:
+    /// the write side of the transfer, answered by the interrupt report `05 01 …`.
+    OnboardPush = 0x05,
+    /// [EXPERIMENTAL] Legacy Apex on-board file open (0x88), see [`OnboardFileOpenCommand`]: the frame the
+    /// write API sends before it pushes a file, answered by the interrupt report `88 01 …`.
+    OnboardFileOpen = 0x88,
+    /// [EXPERIMENTAL] Legacy Apex profile commit (0xEB), see [`OnboardCommitCommand`]: the frame the write
+    /// API sends after the last push of the profile region.
+    OnboardCommit = 0xEB,
     /// [EXPERIMENTAL] Legacy Apex on-board payload read (0x83), see `OnboardReadCommand`.
     OnboardPayloadRead = 0x83,
     /// [EXPERIMENTAL] Legacy Apex firmware-version poll (0x90): `90 <source>`, answered on the interrupt
@@ -67,9 +77,9 @@ pub enum CommandCode {
     DriverMode = 0x6C,
     /// `[EXPERIMENTAL]` Legacy Apex profile deploy (0x89): GG's `89 <1-based profile id>`, the
     /// `load_profile` frame seen behind profile-file transfers in the reference capture (slots 0, 1, 2, 4
-    /// going out as 1, 2, 3, 5). **This writes to the device** - the keyboard runs the slot named - and
-    /// **nothing in ssgg sends it**: ssgg never changes the keyboard's active profile. See
-    /// [`OnboardLoadProfileCommand`].
+    /// going out as 1, 2, 3, 5). **This writes to the device** - the keyboard runs the slot named. The
+    /// `ssgg onboard write` and `ssgg onboard load` commands send it, on request only; a plain read sends
+    /// nothing. See [`OnboardLoadProfileCommand`].
     LoadProfile = 0x89,
 }
 
@@ -86,6 +96,9 @@ impl fmt::Display for CommandCode {
             CommandCode::ActuationControl => write!(f, "ACTUATION_CTRL_EXPERIMENTAL"),
             CommandCode::ProfileChunk => write!(f, "PROFILE_CHUNK_EXPERIMENTAL"),
             CommandCode::OnboardPull => write!(f, "ONBOARD_PULL_EXPERIMENTAL"),
+            CommandCode::OnboardPush => write!(f, "ONBOARD_PUSH_EXPERIMENTAL"),
+            CommandCode::OnboardFileOpen => write!(f, "ONBOARD_FILE_OPEN_EXPERIMENTAL"),
+            CommandCode::OnboardCommit => write!(f, "ONBOARD_COMMIT_EXPERIMENTAL"),
             CommandCode::OnboardPayloadRead => write!(f, "ONBOARD_PAYLOAD_READ_EXPERIMENTAL"),
             CommandCode::FirmwareVersion => write!(f, "FIRMWARE_VERSION_EXPERIMENTAL"),
             CommandCode::DriverMode => write!(f, "DRIVER_MODE_EXPERIMENTAL"),
@@ -111,6 +124,9 @@ impl CommandCode {
             0x2D => Some(CommandCode::ActuationControl),
             0x03 => Some(CommandCode::ProfileChunk),
             0x85 => Some(CommandCode::OnboardPull),
+            0x05 => Some(CommandCode::OnboardPush),
+            0x88 => Some(CommandCode::OnboardFileOpen),
+            0xEB => Some(CommandCode::OnboardCommit),
             0x83 => Some(CommandCode::OnboardPayloadRead),
             0x90 => Some(CommandCode::FirmwareVersion),
             0x6C => Some(CommandCode::DriverMode),
@@ -645,9 +661,9 @@ pub const ONBOARD_PROFILE_SLOT_COUNT: u8 = 5;
 /// report - GG's `load_profile`. Seen in the capture behind profile-file transfers (rows 83,
 /// 85, 111, 121: slots 0, 1, 2, 4 going out as 1, 2, 3, 5).
 ///
-/// **This writes to the device**: it makes the keyboard run the slot it names. **Nothing in ssgg sends
-/// it** - the on-board profile read was measured on 2026-10-19 to work without it, and ssgg never changes
-/// the keyboard's active profile.
+/// **This writes to the device**: it makes the keyboard run the slot it names. `ssgg onboard write` sends
+/// it at the end of a write (after the 250 ms pause the descriptors' deploy API puts behind the frame) and
+/// `ssgg onboard load` sends it on its own; a read sends nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OnboardLoadProfileCommand {
     /// Profile slot, 0-based as everywhere in this crate; the wire id is `profile + 1`.
@@ -804,6 +820,244 @@ impl HidCommand for OnboardReadCommand {
         format!(
             "On-board payload read: buffer offset {} size {}",
             self.buffer_offset, self.size
+        )
+    }
+}
+
+/// [EXPERIMENTAL] Legacy Apex on-board file open: `88 | 00 | file id u16 LE | 00…` inside
+/// [`ONBOARD_OUTPUT_REPORT_SIZE`], answered by the interrupt report `88 01 …`.
+///
+/// `[EXPERIMENTAL]` The engine's write API opens the profile file it is about to push (an output report
+/// followed by one input read), and the Apex 7 write capture shows it as
+/// `wValue 0x0200 wIndex 1 wLength 64` answered 305 ms later with `88 01 00…`. The file ids are the same
+/// as on the read side: `PROFILE_FS_BASE + slot` for the profile file. Descriptor and capture facts:
+/// `docs/development/apex-7-onboard-profile-write.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OnboardFileOpenCommand {
+    /// Profile file id.
+    pub fs_id: u16,
+}
+
+impl OnboardFileOpenCommand {
+    /// Significant frame bytes behind the report number.
+    pub const FRAME_LEN: usize = 4;
+}
+
+impl HidCommand for OnboardFileOpenCommand {
+    fn command_code(&self) -> CommandCode {
+        CommandCode::OnboardFileOpen
+    }
+
+    fn serialize(&self, buffer: &mut [u8], _device_type: HidDeviceType) -> Result<usize> {
+        self.validate()?;
+        check_report_buffer(buffer, ONBOARD_OUTPUT_REPORT_SIZE)?;
+        let report = &mut buffer[..ONBOARD_OUTPUT_REPORT_SIZE];
+        report.fill(0);
+        report[1] = CommandCode::OnboardFileOpen as u8;
+        report[3..Self::FRAME_LEN + 1].copy_from_slice(&self.fs_id.to_le_bytes());
+        Ok(ONBOARD_OUTPUT_REPORT_SIZE)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.fs_id == 0 {
+            return Err(Error::InvalidConfig(
+                "the on-board file id is zero: the write API opens a profile file id, never 0".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn description(&self) -> String {
+        format!("On-board file open: 88 00 {:04X}", self.fs_id)
+    }
+}
+
+/// Copy payload bytes into the keyboard's resource buffer, `[EXPERIMENTAL]`:
+/// `03 | 00 | buffer offset u16 LE | size u16 LE | payload bytes` inside
+/// [`ONBOARD_FEATURE_REPORT_SIZE`] (the 642-wire-byte feature report the write capture shows).
+///
+/// `[EXPERIMENTAL]` The engine's write API fills one 1024-byte window of the buffer with two of these,
+/// 512 bytes each, and the Apex 7 write capture shows exactly that: every window is a write at
+/// buffer offset 0 and one at 512, with no reply between them. The frame has no reply of its own; the
+/// [`OnboardPushCommand`] that follows it is answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnboardBufferWriteCommand<'a> {
+    /// Offset in the resource buffer.
+    pub buffer_offset: u16,
+    /// Bytes to place there.
+    pub data: &'a [u8],
+}
+
+impl OnboardBufferWriteCommand<'_> {
+    /// Significant frame bytes behind the report number, before the payload.
+    pub const FRAME_LEN: usize = 6;
+    /// Payload bytes a write frame can carry: the feature report behind the report number and the header.
+    pub const MAX_DATA_LEN: usize = ONBOARD_FEATURE_REPORT_SIZE - 1 - Self::FRAME_LEN;
+}
+
+impl HidCommand for OnboardBufferWriteCommand<'_> {
+    fn command_code(&self) -> CommandCode {
+        CommandCode::ProfileChunk
+    }
+
+    fn serialize(&self, buffer: &mut [u8], _device_type: HidDeviceType) -> Result<usize> {
+        self.validate()?;
+        check_report_buffer(buffer, ONBOARD_FEATURE_REPORT_SIZE)?;
+        let report = &mut buffer[..ONBOARD_FEATURE_REPORT_SIZE];
+        report.fill(0);
+        report[1] = CommandCode::ProfileChunk as u8;
+        let size = u16::try_from(self.data.len()).map_err(|_| {
+            Error::InvalidConfig(format!(
+                "a resource-buffer write of {} bytes does not fit the frame's u16 size field",
+                self.data.len()
+            ))
+        })?;
+        report[3..5].copy_from_slice(&self.buffer_offset.to_le_bytes());
+        report[5..Self::FRAME_LEN + 1].copy_from_slice(&size.to_le_bytes());
+        report[Self::FRAME_LEN + 1..Self::FRAME_LEN + 1 + self.data.len()].copy_from_slice(self.data);
+        Ok(ONBOARD_FEATURE_REPORT_SIZE)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.data.is_empty() {
+            return Err(Error::InvalidConfig(
+                "a resource-buffer write carries at least one byte".to_string(),
+            ));
+        }
+        if self.data.len() > Self::MAX_DATA_LEN {
+            return Err(Error::InvalidConfig(format!(
+                "resource-buffer write of {} bytes exceeds the {} bytes a {}-byte feature report carries \
+                 behind its header",
+                self.data.len(),
+                Self::MAX_DATA_LEN,
+                ONBOARD_FEATURE_REPORT_SIZE
+            )));
+        }
+        Ok(())
+    }
+
+    fn description(&self) -> String {
+        format!(
+            "On-board buffer write: {} bytes at buffer offset {}",
+            self.data.len(),
+            self.buffer_offset
+        )
+    }
+}
+
+/// Copy the resource buffer into a profile file, `[EXPERIMENTAL]`: `05 | 00 | file id u16 LE |
+/// file offset u32 LE | size u16 LE | 00…` inside [`ONBOARD_OUTPUT_REPORT_SIZE`].
+///
+/// The write side of [`OnboardPullCommand`]'s file access: same header shape, opposite direction. The
+/// engine's write API pushes one full resource buffer per window, and the Apex 7 write capture
+/// answers every push with the interrupt report `05 01 00…` - the only write-side reply with content in
+/// that capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OnboardPushCommand {
+    /// Profile file id: the file base plus the profile index.
+    pub fs_id: u16,
+    /// Offset in the profile file.
+    pub file_offset: u32,
+    /// Bytes to copy out of the resource buffer.
+    pub size: u16,
+}
+
+impl OnboardPushCommand {
+    /// Significant frame bytes behind the report number.
+    pub const FRAME_LEN: usize = 10;
+    /// The push size the capture shows, the size of the keyboard's resource buffer.
+    pub const MAX_SIZE: u16 = 1024;
+}
+
+impl HidCommand for OnboardPushCommand {
+    fn command_code(&self) -> CommandCode {
+        CommandCode::OnboardPush
+    }
+
+    fn serialize(&self, buffer: &mut [u8], _device_type: HidDeviceType) -> Result<usize> {
+        self.validate()?;
+        check_report_buffer(buffer, ONBOARD_OUTPUT_REPORT_SIZE)?;
+        let report = &mut buffer[..ONBOARD_OUTPUT_REPORT_SIZE];
+        report.fill(0);
+        report[1] = CommandCode::OnboardPush as u8;
+        report[3..5].copy_from_slice(&self.fs_id.to_le_bytes());
+        report[5..9].copy_from_slice(&self.file_offset.to_le_bytes());
+        report[9..Self::FRAME_LEN + 1].copy_from_slice(&self.size.to_le_bytes());
+        Ok(ONBOARD_OUTPUT_REPORT_SIZE)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.fs_id == 0 {
+            return Err(Error::InvalidConfig(
+                "the on-board file id is zero: a push copies into a profile file id, never 0".to_string(),
+            ));
+        }
+        if self.size > Self::MAX_SIZE {
+            return Err(Error::InvalidConfig(format!(
+                "push of {} bytes exceeds the {}-byte resource buffer",
+                self.size,
+                Self::MAX_SIZE
+            )));
+        }
+        Ok(())
+    }
+
+    fn description(&self) -> String {
+        format!(
+            "On-board push: file {:04X} offset {} size {}",
+            self.fs_id, self.file_offset, self.size
+        )
+    }
+}
+
+/// [EXPERIMENTAL] Legacy Apex profile commit after the last push: `eb | 1-based profile id | 00…` inside
+/// [`ONBOARD_OUTPUT_REPORT_SIZE`] - an **output** report, the shape the write capture shows
+/// (`wValue 0x0200 wLength 64`). The engine's write API reads one input report after the frame, and that
+/// report is the keyboard's ordinary idle report `01 00…`, not a commit answer.
+///
+/// `[EXPERIMENTAL]` The capture answers it with no write-specific reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OnboardCommitCommand {
+    /// Profile slot, 0-based as everywhere in this crate; the wire byte is `profile + 1`.
+    pub profile: u8,
+}
+
+impl OnboardCommitCommand {
+    /// Significant frame bytes behind the report number.
+    pub const FRAME_LEN: usize = 2;
+}
+
+impl HidCommand for OnboardCommitCommand {
+    fn command_code(&self) -> CommandCode {
+        CommandCode::OnboardCommit
+    }
+
+    fn serialize(&self, buffer: &mut [u8], _device_type: HidDeviceType) -> Result<usize> {
+        self.validate()?;
+        check_report_buffer(buffer, ONBOARD_OUTPUT_REPORT_SIZE)?;
+        let report = &mut buffer[..ONBOARD_OUTPUT_REPORT_SIZE];
+        report.fill(0);
+        report[1] = CommandCode::OnboardCommit as u8;
+        report[2] = self.profile.saturating_add(1);
+        Ok(ONBOARD_OUTPUT_REPORT_SIZE)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.profile >= ONBOARD_PROFILE_SLOT_COUNT {
+            return Err(Error::InvalidConfig(format!(
+                "profile slot {} out of range (GG accepts 0..{})",
+                self.profile,
+                ONBOARD_PROFILE_SLOT_COUNT - 1
+            )));
+        }
+        Ok(())
+    }
+
+    fn description(&self) -> String {
+        format!(
+            "On-board commit: eb {:02X} (slot {})",
+            self.profile.saturating_add(1),
+            self.profile
         )
     }
 }
@@ -1944,6 +2198,144 @@ mod tests {
             .validate()
             .is_err(),
             "the engine accepts five slots"
+        );
+    }
+
+    /// The four write-side frames, byte for byte as the Apex 7 write capture shows them
+    /// (GG write capture, device 8, firmware 4.16.3: the wire bytes there are the data stage, i.e. this
+    /// crate's report buffer without its report number).
+    #[test]
+    fn the_write_frames_are_the_2026_10_20_capture_shape() {
+        // The profile-file open: capture `88 00 01 02`, wValue 0x0200 wLength 64.
+        let open = OnboardFileOpenCommand { fs_id: 0x0201 };
+        let mut buffer = [0u8; ONBOARD_OUTPUT_REPORT_SIZE];
+        assert_eq!(
+            open.serialize(&mut buffer, HidDeviceType::Keyboard).unwrap(),
+            ONBOARD_OUTPUT_REPORT_SIZE
+        );
+        assert_eq!(
+            &buffer[..OnboardFileOpenCommand::FRAME_LEN + 1],
+            &[0x00, 0x88, 0x00, 0x01, 0x02],
+            "88 00 | file id 0x0201 little endian"
+        );
+        assert!(buffer[5..].iter().all(|b| *b == 0), "zero padded data stage");
+
+        // The two buffer fills of one window: capture `03 00 00 …` (buffer 0) and
+        // `03 00 00 …` (buffer 512), each 512 bytes, wValue 0x0300 wLength 642.
+        let mut head = vec![0u8; 512];
+        head[0] = 0x0b;
+        head[2..10].copy_from_slice(b"Config 1");
+        for (buffer_offset, expect_offset) in [(0u16, [0x00u8, 0x00]), (512, [0x00, 0x02])] {
+            let write = OnboardBufferWriteCommand {
+                buffer_offset,
+                data: &head,
+            };
+            let mut feature = [0u8; ONBOARD_FEATURE_REPORT_SIZE];
+            assert_eq!(
+                write.serialize(&mut feature, HidDeviceType::Keyboard).unwrap(),
+                ONBOARD_FEATURE_REPORT_SIZE,
+                "the write goes in the 643-byte report (642 on the wire) the capture shows"
+            );
+            assert_eq!(feature[0], 0x00, "report number 0");
+            assert_eq!(&feature[1..3], &[0x03, 0x00], "header 03 00, not the 2023 chunk header");
+            assert_eq!(&feature[3..5], &expect_offset, "buffer offset {buffer_offset}");
+            assert_eq!(&feature[5..7], &[0x00, 0x02], "size 512 little endian");
+            assert_eq!(
+                &feature[7..7 + head.len()],
+                &head[..],
+                "payload bytes start behind the header"
+            );
+            assert!(
+                feature[7 + head.len()..].iter().all(|b| *b == 0),
+                "the rest of the report is padding"
+            );
+        }
+
+        // The push of window 0: capture `05 00 01 …`, wValue 0x0200 wLength 64.
+        let push = OnboardPushCommand {
+            fs_id: 0x0201,
+            file_offset: 0,
+            size: 1024,
+        };
+        let mut buffer = [0u8; ONBOARD_OUTPUT_REPORT_SIZE];
+        assert_eq!(
+            push.serialize(&mut buffer, HidDeviceType::Keyboard).unwrap(),
+            ONBOARD_OUTPUT_REPORT_SIZE
+        );
+        assert_eq!(
+            &buffer[1..OnboardPushCommand::FRAME_LEN + 2],
+            &[0x05, 0x00, 0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00],
+            "capture 05 00 | file id u16 | file offset u32 | size u16, all little endian, behind the report number"
+        );
+        assert!(
+            buffer[OnboardPushCommand::FRAME_LEN + 2..].iter().all(|b| *b == 0),
+            "zero padded data stage"
+        );
+
+        // The commit: capture `eb 01 00 …`, wValue 0x0200 wLength 64 - an output report, slot 0 going
+        // out as 1.
+        let commit = OnboardCommitCommand { profile: 0 };
+        let mut buffer = [0u8; ONBOARD_OUTPUT_REPORT_SIZE];
+        assert_eq!(
+            commit.serialize(&mut buffer, HidDeviceType::Keyboard).unwrap(),
+            ONBOARD_OUTPUT_REPORT_SIZE
+        );
+        assert_eq!(&buffer[..3], &[0x00, 0xEB, 0x01], "eb | 1-based profile id");
+        assert!(buffer[3..].iter().all(|b| *b == 0), "zero padded data stage");
+    }
+
+    #[test]
+    fn write_frames_are_validated_before_they_reach_a_keyboard() {
+        let big = vec![0u8; OnboardBufferWriteCommand::MAX_DATA_LEN + 1];
+        assert!(
+            OnboardBufferWriteCommand {
+                buffer_offset: 0,
+                data: &big,
+            }
+            .validate()
+            .is_err(),
+            "a write frame carries what one feature report holds"
+        );
+        assert!(
+            OnboardBufferWriteCommand {
+                buffer_offset: 0,
+                data: &[],
+            }
+            .validate()
+            .is_err(),
+            "an empty write is not a frame the engine sends"
+        );
+        assert!(
+            OnboardPushCommand {
+                fs_id: 0,
+                file_offset: 0,
+                size: 1024,
+            }
+            .validate()
+            .is_err(),
+            "a push needs a file id"
+        );
+        assert!(
+            OnboardPushCommand {
+                fs_id: 0x0201,
+                file_offset: 0,
+                size: 1025,
+            }
+            .validate()
+            .is_err(),
+            "a push copies at most one resource buffer"
+        );
+        assert!(
+            OnboardFileOpenCommand { fs_id: 0 }.validate().is_err(),
+            "the write API opens a profile file id, never 0"
+        );
+        assert!(
+            OnboardCommitCommand {
+                profile: ONBOARD_PROFILE_SLOT_COUNT
+            }
+            .validate()
+            .is_err(),
+            "the engine commits five slots"
         );
     }
 

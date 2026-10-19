@@ -15,6 +15,43 @@ Ghidra running MCP server with SteelSeries Engine Windows executable and device 
 
 Moved from `PLAN.md`:
 
+## Apex 7 on-board profile write
+
+Task: implement `ssgg onboard write` and `ssgg onboard load` commands.
+
+1. `ssgg onboard write` mirrors the current state of `ssgg onboard read` command and writes the onboad config to the keyboard. Input is decoded json by default, profile slot is mandatory, --bin optionally allow to upload a binary dump instead.
+1.1. The shape of write is inverted compared to read - do two Write commands then Push command in a loop. Write command and Push commad have a similar signature to Read command and Pull command. Their codes are `0x03` and `0x05`, respectively.
+1.2. The engine writes more than it reads. This is observable in packet dumps and may be observable in list files. However, the specifics are unknown at the time, so in this version we write what we have.
+1.3. Verify implementation against lisp files and Ghidra disassembly.
+1.4. After writing, a LoadProfile command should be issued to the newly written profile.
+1.5. Command should support a `--dry-run` option where it prints all commands that it issues to write the profile to keyboard without actually issuing these commands.
+1.6. Acceptance is `ssgg onboard write --dry-run config_1.json --profile 1` issuing the same write sequence as the GG write capture until the `05 00 01 …` packet.
+
+2. `ssgg onboard load` issues a LoadProfile command to load a profile slot specified by user. Same restrictions apply to profile slot as `ssgg onboard write`.
+
+**Result (2026-10-20, software part done, hardware part open).** `ssgg onboard write` takes the decode report by
+default, `--bin` takes the payload bytes as they are, `--profile N` is mandatory (no default: a write names the slot
+it rewrites) and the frames are the capture's: `88 00 01 02` open, 40 windows of `03 00` buffer 0 +
+`03 00` buffer 512 + `05 00 01 02 <file offset> 00 04` push, `eb 01` commit, then `89 01` deploy after 250 ms.
+The geometry is the keyboard family's (`OnboardProfileCodec::write_plan`, `FILE_BLOCKS` of `apex_7.lisp:217` and the
+engine write API `base_apex_legacy.lisp:1993-2022`), the pacing is the capture's (7.1 ms average per frame, the
+100 ms the engine inserts every 32 frames, 5 ms of answer drain after each push, 250 ms before the deploy), and a
+write answers `88 01 …` after the open and `05 01 …` after every push (202/202 in the capture; buffer writes and the
+commit are not answered). 1.6 is met: the plan of `config_1.json` byte-equals the capture's frames, its frame 103 is
+the capture's frame 103 (`05 00 01 …`, file offset 33792), and a 12,288-byte image plans the
+same 122 frames, padded past its end with zeros. `--dry-run` prints the plan and opens no keyboard; `--yes` is what
+authorises sending, and `onboard write`/`onboard load` without it print what they would send and send nothing.
+`onboard decode` of the capture's own image answers `Config 1`, schema `0x000B`, and its stored checksum equals the
+one `encode` computes (`0EB1C3D1`). Fixture: `tests/fixtures/onboard-write-apex7.manifest.txt`
+(generator `scripts/gg-write-frames.py`), asserted frame for frame by
+`apex_legacy_profile::tests::the_write_plan_of_the_read_report_is_the_capture_write_sequence`; fixture bytes are the
+wire data stage (no USBPcap header, no report-ID byte). **No test touches a keyboard and no write, open, buffer
+write, push, commit or deploy frame has been replayed on a keyboard** - 1.2 ("write what we have": 11,696/12,288
+payload bytes padded to the 40-window region, the region behind the payload never written), 1.4 (deploy after a write)
+and 1.5 (`--dry-run`) are implemented, the write→read→decode→diff cycle and every hardware claim stay open with the
+user's keyboard, and the first hardware write is a deliberate, user-approved act reported with the model and date.
+Write-up: `docs/development/apex-7-onboard-profile-write.md`.
+
 ## Apex 7 on-board profile read (`ssgg onboard`, hardware validation)
 
 Implemented 2026-10-15 from the GG capture: a `0x90` firmware-version poll, `0x85` pulls,

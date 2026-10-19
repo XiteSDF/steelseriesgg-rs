@@ -150,8 +150,13 @@ async fn main() -> Result<()> {
 
         Commands::Onboard { action } => {
             match &action {
-                // Only the two device-reading subcommands enumerate hardware.
-                OnboardAction::Read(_) => {
+                // The device-side subcommands enumerate hardware; a write asked for its plan only does not.
+                OnboardAction::Read(_) | OnboardAction::Load(_) => {
+                    let mut manager = new_device_manager()?;
+                    cmd_onboard(Some(&mut manager), action).await?;
+                }
+                OnboardAction::Write(args) if args.dry_run || !args.yes => cmd_onboard(None, action).await?,
+                OnboardAction::Write(_) => {
                     let mut manager = new_device_manager()?;
                     cmd_onboard(Some(&mut manager), action).await?;
                 }
@@ -822,30 +827,7 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
             let Some(manager) = manager.as_mut() else {
                 return Err(Error::Other("the on-board profile read needs a device".to_string()));
             };
-            let keyboard = match manager
-                .open_onboard_keyboard(args.device)
-                .map_err(|e| Error::Other(format!("select the on-board profile keyboard: {e}")))?
-            {
-                steelseries_gg::devices::discovery::OnboardKeyboard::Keyboard(keyboard) => keyboard,
-                steelseries_gg::devices::discovery::OnboardKeyboard::NotFound { product_id } => {
-                    return Err(Error::DeviceNotFound(match product_id {
-                        Some(pid) => format!(
-                            "no keyboard with product ID {pid:04X} answers the on-board profile protocol: the read runs on a keyboard's own handle, and only keyboards are candidates"
-                        ),
-                        None => "no connected keyboard answers the on-board profile protocol: the read runs on a keyboard's own handle, and only keyboards are candidates (a mouse or a headset is not)".to_string(),
-                    }));
-                }
-                steelseries_gg::devices::discovery::OnboardKeyboard::Ambiguous { keyboards } => {
-                    let listed = keyboards
-                        .iter()
-                        .map(|(pid, name)| format!("{name} ({pid:04X})"))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    return Err(Error::InvalidConfig(format!(
-                        "more than one connected keyboard answers the on-board profile protocol: {listed} - name one with --device <pid>"
-                    )));
-                }
-            };
+            let keyboard = select_onboard_keyboard(manager, args.device, "read")?;
             // The selection above picked a keyboard whose codec answers, so asking again cannot fail.
             let Some(codec) = keyboard.onboard_codec() else {
                 return Err(Error::DeviceCommunication(
@@ -961,6 +943,158 @@ async fn cmd_onboard(mut manager: Option<&mut DeviceManager>, action: OnboardAct
                 print!("{}", codec.hex(&data, from, to));
             }
         }
+
+        OnboardAction::Write(args) => {
+            // The payload source: a decode report encoded here, or payload bytes taken as they are. Both
+            // paths pick the family from the bytes' own schema word.
+            let (file_codec, payload, source) = match args.bin.as_ref() {
+                Some(path) => {
+                    let bytes = read_file(path).await?;
+                    let codec = codec_for_bytes(&bytes).ok_or_else(no_family)?;
+                    (codec, bytes, path.display().to_string())
+                }
+                None => {
+                    let path = args.file.as_ref().ok_or_else(|| {
+                        Error::InvalidConfig("a write names a profile JSON, or payload bytes with --bin".to_string())
+                    })?;
+                    let text = read_text(path).await?;
+                    let codec = codec_for_json(&text).ok_or_else(no_family)?;
+                    let payload = codec
+                        .encode_json(&text)
+                        .map_err(|e| Error::Other(format!("encode {}: {e}", path.display())))?;
+                    (codec, payload, path.display().to_string())
+                }
+            };
+
+            if args.dry_run || !args.yes {
+                for line in file_codec.write_banner_lines() {
+                    println!("{line}");
+                }
+                println!();
+                let slot = file_codec.slot_for_config(args.profile)?;
+                let plan = file_codec
+                    .write_plan(slot, &payload)
+                    .map_err(|e| Error::Other(format!("frame the write of {source}: {e}")))?;
+                for line in onboard::write_plan_lines(&plan) {
+                    println!("{line}");
+                }
+                println!();
+                if args.dry_run {
+                    println!(
+                        "dry run: no keyboard was opened and nothing was sent; the plan of {} payload bytes is \
+                         {} frames for slot {} (GG config {})",
+                        payload.len(),
+                        plan.frames.len(),
+                        slot,
+                        args.profile
+                    );
+                } else {
+                    println!(
+                        "nothing sent: this is the plan for slot {slot} (GG config {}) of {} payload bytes, \
+                         {} frames; the sequence is capture-derived and has never been replayed on a keyboard, \
+                         so re-running with --yes is what authorises the write",
+                        args.profile,
+                        payload.len(),
+                        plan.frames.len()
+                    );
+                }
+                return Ok(());
+            }
+
+            let Some(manager) = manager.as_mut() else {
+                return Err(Error::Other(
+                    "an on-board profile write needs a keyboard: --dry-run prints the plan without one".to_string(),
+                ));
+            };
+            let keyboard = select_onboard_keyboard(manager, args.device, "write")?;
+            // The keyboard's own codec frames the write: geometry and file id come from the device the write
+            // runs on, not from a codec picked off the payload's schema word.
+            let codec = keyboard.onboard_codec().ok_or_else(|| {
+                Error::DeviceCommunication(
+                    "the selected keyboard answers no on-board profile codec: a write needs the keyboard's own \
+                     family geometry"
+                        .to_string(),
+                )
+            })?;
+            if codec.family_name() != file_codec.family_name() {
+                return Err(Error::InvalidConfig(format!(
+                    "{} is a profile of {} ({} payload bytes, schema {:04X}); the selected keyboard speaks {} \
+                     - write a profile of the keyboard's own family",
+                    source,
+                    file_codec.family_name(),
+                    payload.len(),
+                    onboard::schema_of(&payload),
+                    codec.family_name()
+                )));
+            }
+            let slot = codec.slot_for_config(args.profile)?;
+            for line in codec.write_banner_lines() {
+                println!("{line}");
+            }
+            println!();
+            let plan = codec
+                .write_plan(slot, &payload)
+                .map_err(|e| Error::Other(format!("frame the write of {source}: {e}")))?;
+            for line in onboard::write_plan_lines(&plan) {
+                println!("{line}");
+            }
+            println!();
+
+            let label = onboard_device_label(keyboard.as_ref());
+            println!(
+                "writing on the {label}: this rewrites the profile file of slot {slot} and makes the keyboard \
+                 run that slot"
+            );
+            let stats = keyboard.write_onboard_profile(slot, &payload).await?;
+            let planned = codec.write_stats(&plan);
+            println!(
+                "write finished: {} of {} frames sent, {} of {} payload bytes, {} of {} pushes, {} of {} \
+                 answers read back",
+                stats.frames_sent,
+                planned.frames_sent,
+                stats.bytes_written,
+                planned.bytes_written,
+                stats.pushes,
+                planned.pushes,
+                stats.acks,
+                planned.acks
+            );
+            if stats != planned {
+                println!("the write did not do every frame its plan listed: read the slot back before trusting it");
+            }
+            println!(
+                "slot {slot} (GG config {}) written and deployed on the {label}",
+                args.profile
+            );
+        }
+
+        OnboardAction::Load(args) => {
+            let Some(manager) = manager.as_mut() else {
+                return Err(Error::Other("the on-board profile deploy needs a keyboard".to_string()));
+            };
+            let keyboard = select_onboard_keyboard(manager, args.device, "deploy")?;
+            let Some(codec) = keyboard.onboard_codec() else {
+                return Err(Error::DeviceCommunication(
+                    "the selected keyboard answers no on-board profile codec".to_string(),
+                ));
+            };
+            let slot = codec.slot_for_config(args.profile)?;
+            let label = onboard_device_label(keyboard.as_ref());
+            if !args.yes {
+                println!(
+                    "nothing sent: slot {slot} (GG config {}) would be deployed on the {label}, making the \
+                     keyboard run it; the deploy frame is capture-derived and untested on hardware, so re-run \
+                     with --yes",
+                    args.profile
+                );
+                return Ok(());
+            }
+            keyboard.load_onboard_profile(slot).await?;
+            println!(
+                "slot {slot} (GG config {}) deployed on the {label}: the keyboard now runs it",
+                args.profile
+            );
+        }
     }
 
     Ok(())
@@ -983,6 +1117,46 @@ async fn read_text(path: &std::path::Path) -> Result<String> {
     tokio::fs::read_to_string(path)
         .await
         .map_err(|e| Error::Other(format!("read {}: {e}", path.display())))
+}
+
+/// The keyboard an on-board command runs on: the selection the device manager makes, turned into the
+/// messages the on-board commands answer with when it does not yield exactly one keyboard. `what` names the
+/// command in those messages. Read, write and deploy all run on the keyboard's own handle, so all three use
+/// this one selection.
+fn select_onboard_keyboard(
+    manager: &mut steelseries_gg::devices::discovery::DeviceManager,
+    device: Option<u16>,
+    what: &str,
+) -> Result<Box<dyn Keyboard>> {
+    use steelseries_gg::devices::discovery::OnboardKeyboard;
+
+    match manager
+        .open_onboard_keyboard(device)
+        .map_err(|e| Error::Other(format!("select the on-board profile keyboard: {e}")))?
+    {
+        OnboardKeyboard::Keyboard(keyboard) => Ok(keyboard),
+        OnboardKeyboard::NotFound { product_id } => Err(Error::DeviceNotFound(match product_id {
+            Some(pid) => format!(
+                "no keyboard with product ID {pid:04X} answers the on-board profile protocol: the {what} runs \
+                 on a keyboard's own handle, and only keyboards are candidates"
+            ),
+            None => format!(
+                "no connected keyboard answers the on-board profile protocol: the {what} runs on a keyboard's \
+                 own handle, and only keyboards are candidates (a mouse or a headset is not)"
+            ),
+        })),
+        OnboardKeyboard::Ambiguous { keyboards } => {
+            let listed = keyboards
+                .iter()
+                .map(|(pid, name)| format!("{name} ({pid:04X})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(Error::InvalidConfig(format!(
+                "more than one connected keyboard answers the on-board profile protocol: {listed} - name one \
+                 with --device <pid>"
+            )))
+        }
+    }
 }
 
 /// Where a device-driven read ran: the keyboard's name and the collection the manager opened.

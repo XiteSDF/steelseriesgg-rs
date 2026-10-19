@@ -516,8 +516,10 @@ What this settles: the `0x05` frame layout is **measured**, not guessed (`CMD_PU
 `apex_legacy_profile.rs`, and the `0x85` command builder in `hid_reports` takes the same three fields).
 What it does not settle: **`fs_id 0x0102` is a file no read pulls** (the read walks profile files
 `0x0201..0x0205` and lighting files `0x0301..0x0305`), so which file GG writes with `0x05`, and what a
-push is answered by on the device, are open. Nothing in `ssgg` sends `0x05`, no push byte has been
-replayed on hardware, and there is still no read-back for an on-board write (§Safety).
+push is answered by on the device, were open until the write capture: a push is answered with
+`05 01 …` (202/202, `docs/development/apex-7-onboard-profile-write.md` §Answers and pacing). `ssgg` sends `0x05` only
+in the write plan (`OnboardProfileCodec::write_plan`), no push byte has been replayed on hardware, and there is still
+no read-back for an on-board write (§Safety).
 
 ## Write path: `write_profile_packet`, not `send_report` (measured in source, 2026-10-18)
 
@@ -621,7 +623,8 @@ write path is not implemented, so this section's prohibition on writing a profil
 ## What is not settled
 
 - Whether a payload `encode` writes is accepted by a keyboard. The round trip is verified in software on
-  the 2026-10-18 images (§Encode); no encoded byte has been sent, and no code path can send one.
+  the 2026-10-18 images (§Encode); no encoded byte has been sent. Since 2026-10-20 a code path **can** send one
+  (`ssgg onboard write`, behind `--yes`), and it never has been: `docs/development/apex-7-onboard-profile-write.md`.
 - ~~Where this platform keeps the profile checksum.~~ Settled 2026-10-18: it is the last word of the
   *payload* (schema A at `11648-4`, schema B at `11696-4`), not of the 12288-byte read image - the image is
   padded with whole resource buffers behind the payload, and reading the image tail as the checksum is what

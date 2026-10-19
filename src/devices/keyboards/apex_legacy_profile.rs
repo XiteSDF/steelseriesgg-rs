@@ -87,7 +87,10 @@
 //! leading constant id byte that is not part of the file, so a payload read lands at its file offset and
 //! the assembled image is [`PROFILE_FILE_BYTES`] bytes with no id byte.
 
-use crate::devices::hid_reports::{ONBOARD_GET_WIRE_BYTES, ONBOARD_MAX_READ_LEN, ONBOARD_OUTPUT_REPORT_SIZE};
+use crate::devices::hid_reports::{
+    HidCommand, ONBOARD_FEATURE_REPORT_SIZE, ONBOARD_GET_WIRE_BYTES, ONBOARD_MAX_READ_LEN, ONBOARD_OUTPUT_REPORT_SIZE,
+    OnboardBufferWriteCommand, OnboardCommitCommand, OnboardFileOpenCommand, OnboardPushCommand,
+};
 use crate::devices::keyboards::apex_pro_tkl_2023_profile::profile_checksum;
 use crate::devices::keyboards::onboard::{OnboardDevice, OnboardProfileCodec};
 // Generic payload helpers live in the interface module since 2026-10-19; re-exported here because this
@@ -212,6 +215,338 @@ pub const PROFILE_FILE_BYTES: usize = PULLS_PER_FILE * DEVICE_RESOURCE_BUFFER_LE
 /// Payload reads per pull: one pull fills [`DEVICE_RESOURCE_BUFFER_LEN`], each read drains
 /// [`PAYLOAD_READ_LEN`] of it.
 pub const READS_PER_PULL: usize = DEVICE_RESOURCE_BUFFER_LEN / PAYLOAD_READ_LEN;
+
+// The write geometry, from the engine's write API and the Apex 7 write capture, which
+// reproduces it frame for frame (descriptor citations live in the write doc, not here):
+//   open the profile file (0x88) -> for every window of the profile region, two 512-byte buffer writes
+//   (offsets 0 and 512) then one push of the full buffer (0x05) -> commit the slot (0xEB).
+
+/// Bytes the engine's profile file is (`profile_size` in the family): `0xA000`, which is what the write
+/// API pushes and what the capture's 40 windows add up to. It is larger than any schema's payload, and the
+/// engine pads the difference with zero bytes.
+pub const PROFILE_REGION_BYTES: usize = 40_960;
+/// Bytes one write frame carries into the resource buffer: the engine's profile chunk size (512), and 512
+/// in every write frame of the capture.
+pub const WRITE_CHUNK_BYTES: usize = 512;
+/// Bytes one push copies: the whole resource buffer (1024), 1024 in every push of the capture.
+pub const WRITE_PUSH_BYTES: usize = DEVICE_RESOURCE_BUFFER_LEN;
+/// Write windows in the profile region: profile size divided by the resource buffer, 40 in the capture.
+pub const WRITE_WINDOW_COUNT: usize = PROFILE_REGION_BYTES / WRITE_PUSH_BYTES;
+/// Milliseconds the engine waits after the profile deploy frame (`onboard-load-pause-ms`); the 2026-10-20
+/// capture shows a gap of that size after the `89` frame.
+pub const WRITE_DEPLOY_PAUSE_MS: u64 = 250;
+
+/// One frame of the on-board profile write, in the order the engine sends them. The shape is the write
+/// API's and the byte pattern the Apex 7 write capture shows. `[EXPERIMENTAL]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OnboardWriteFrame {
+    /// `88 | 00 | file id u16 LE` in the 64-byte output report: open the profile file before pushing it.
+    FileOpen { fs_id: u16 },
+    /// `03 | 00 | buffer offset u16 LE | size u16 LE | payload bytes` in the 643-byte feature report: part
+    /// of the payload, placed in the keyboard's resource buffer. No reply of its own.
+    BufferWrite { buffer_offset: u16, data: Vec<u8> },
+    /// `05 | 00 | file id u16 LE | file offset u32 LE | size u16 LE` in the 64-byte output report: copy the
+    /// resource buffer into the profile file. The only write-side frame with a reply of its own.
+    Push { fs_id: u16, file_offset: u32, size: u16 },
+    /// `eb | 1-based profile id` in the 64-byte output report: the last frame of the write.
+    Commit { profile: u8 },
+}
+
+/// Which HID report a write frame travels in, the two shapes the capture separates cleanly:
+/// `wValue 0x0200 wLength 64` (output) and `wValue 0x0300 wLength 642` (feature).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnboardWriteReportKind {
+    /// 64-byte output report.
+    Output,
+    /// 643-byte feature report.
+    Feature,
+}
+
+impl OnboardWriteFrame {
+    /// The report this frame travels in.
+    #[must_use]
+    pub fn report_kind(&self) -> OnboardWriteReportKind {
+        match self {
+            Self::FileOpen { .. } | Self::Push { .. } | Self::Commit { .. } => OnboardWriteReportKind::Output,
+            Self::BufferWrite { .. } => OnboardWriteReportKind::Feature,
+        }
+    }
+
+    /// Wire bytes of the frame: the data stage the capture shows, i.e. the report buffer without its report
+    /// number.
+    #[must_use]
+    pub fn wire_len(&self) -> usize {
+        match self.report_kind() {
+            OnboardWriteReportKind::Output => ONBOARD_OUTPUT_REPORT_SIZE - 1,
+            OnboardWriteReportKind::Feature => ONBOARD_FEATURE_REPORT_SIZE - 1,
+        }
+    }
+
+    /// Serialize into the report buffer of this frame's kind: [`ONBOARD_OUTPUT_REPORT_SIZE`] (65) or
+    /// [`ONBOARD_FEATURE_REPORT_SIZE`] (643), each `[report number][data]` with report number 0.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the typed command's own validation.
+    pub fn serialize(&self, buffer: &mut [u8]) -> Result<usize> {
+        let device = crate::devices::hid_reports::HidDeviceType::Keyboard;
+        match self {
+            Self::FileOpen { fs_id } => OnboardFileOpenCommand { fs_id: *fs_id }.serialize(buffer, device),
+            Self::BufferWrite { buffer_offset, data } => OnboardBufferWriteCommand {
+                buffer_offset: *buffer_offset,
+                data,
+            }
+            .serialize(buffer, device),
+            Self::Push {
+                fs_id,
+                file_offset,
+                size,
+            } => OnboardPushCommand {
+                fs_id: *fs_id,
+                file_offset: *file_offset,
+                size: *size,
+            }
+            .serialize(buffer, device),
+            Self::Commit { profile } => OnboardCommitCommand { profile: *profile }.serialize(buffer, device),
+        }
+    }
+
+    /// The line `ssgg onboard write --dry-run` prints for this frame: the frame's own numbers and the wire
+    /// length it goes out in.
+    #[must_use]
+    pub fn line(&self) -> String {
+        match self {
+            Self::FileOpen { fs_id } => format!("88 00 file {fs_id:04X}      output {:02}", self.wire_len()),
+            Self::BufferWrite { buffer_offset, data } => format!(
+                "03 00 buffer {:>4} size {:>4}  feature {:02}  head {}",
+                buffer_offset,
+                data.len(),
+                self.wire_len(),
+                crate::devices::keyboards::onboard::hex_of(&data[..data.len().min(8)])
+            ),
+            Self::Push {
+                fs_id,
+                file_offset,
+                size,
+            } => format!(
+                "05 00 file {fs_id:04X} offset {:>5} size {:>4}  output {:02}",
+                file_offset,
+                size,
+                self.wire_len()
+            ),
+            Self::Commit { profile } => format!(
+                "eb {:02X} (slot {})      output {:02}",
+                profile + 1,
+                profile,
+                self.wire_len()
+            ),
+        }
+    }
+}
+
+/// The frames `ssgg` sends for one on-board profile write, in wire order: built by [`write_plan`], printed
+/// by `ssgg onboard write --dry-run`, sent by a keyboard's write path.
+///
+/// `[EXPERIMENTAL]` The geometry is capture-confirmed; the sequence has never been sent to a keyboard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnboardWritePlan {
+    /// Profile slot, 0-based.
+    pub profile: u8,
+    /// Profile file the plan writes: `PROFILE_FS_BASE + profile`.
+    pub fs_id: u16,
+    /// Payload bytes the plan carries, the payload's checksum word included.
+    pub payload_len: usize,
+    /// Bytes the plan pushes: the payload padded out to the profile region, as the engine does.
+    pub region_bytes: usize,
+    /// The checksum word the payload carries at its end (its last four bytes, little endian).
+    pub checksum: u32,
+    /// The frames, in wire order.
+    pub frames: Vec<OnboardWriteFrame>,
+}
+
+impl OnboardWritePlan {
+    /// Count of the frames that push the resource buffer into the file.
+    #[must_use]
+    pub fn push_count(&self) -> usize {
+        self.frames
+            .iter()
+            .filter(|frame| matches!(frame, OnboardWriteFrame::Push { .. }))
+            .count()
+    }
+}
+
+/// Build one on-board profile write: open the profile file (0x88), fill the keyboard's resource buffer in
+/// 512-byte halves of each window (0x03), push each window into the file (0x05), commit the slot (0xEB).
+/// The engine pads the payload out to the whole profile region with zeros, so a write covers the region,
+/// not only the payload: the capture shows all 40 windows, the last 28 of them all zero.
+///
+/// The deploy frame (0x89) is not part of the plan; the write path sends it after [`WRITE_DEPLOY_PAUSE_MS`],
+/// and `ssgg onboard load` sends it on its own.
+///
+/// `[EXPERIMENTAL]` Geometry capture-confirmed on Apex 7, never sent to a keyboard by `ssgg`.
+///
+/// # Errors
+///
+/// Returns [`crate::error::Error::InvalidConfig`] for a slot outside the five the engine accepts, an empty
+/// payload, a payload longer than the region, a payload with no room for its checksum word, a region that
+/// is not a whole number of push windows, or a chunk pair that does not fill a window.
+pub fn write_plan(profile: u8, payload: &[u8]) -> Result<OnboardWritePlan> {
+    if profile >= MAX_PROFILE_INDEX {
+        return Err(Error::InvalidConfig(format!(
+            "profile slot {profile} out of range: the engine accepts 0..{}",
+            MAX_PROFILE_INDEX - 1
+        )));
+    }
+    if payload.is_empty() {
+        return Err(Error::InvalidConfig(
+            "an on-board profile write carries a payload: encode a profile first".to_string(),
+        ));
+    }
+    if payload.len() > PROFILE_REGION_BYTES {
+        return Err(Error::InvalidConfig(format!(
+            "payload is {} bytes, the profile region holds {PROFILE_REGION_BYTES}",
+            payload.len()
+        )));
+    }
+    if payload.len() <= checksum_offset(payload.len()) {
+        return Err(Error::InvalidConfig(format!(
+            "payload of {} bytes has no room for the 4-byte checksum word at its end",
+            payload.len()
+        )));
+    }
+    if WRITE_WINDOW_COUNT * WRITE_PUSH_BYTES != PROFILE_REGION_BYTES {
+        return Err(Error::InvalidConfig(
+            "the profile region is not a whole number of push windows".to_string(),
+        ));
+    }
+    if 2 * WRITE_CHUNK_BYTES != WRITE_PUSH_BYTES {
+        return Err(Error::InvalidConfig(
+            "one window is not exactly two write chunks: the engine's write API pairs a buffer half at \
+             offset 0 with one at the chunk size"
+                .to_string(),
+        ));
+    }
+
+    let fs_id = PROFILE_FS_BASE.checked_add(u16::from(profile)).ok_or_else(|| {
+        Error::InvalidConfig(format!(
+            "profile file id {} + {profile} does not fit u16",
+            PROFILE_FS_BASE
+        ))
+    })?;
+    let checksum = u32::from_le_bytes(
+        payload[payload.len() - 4..]
+            .try_into()
+            .map_err(|e| Error::InvalidConfig(format!("checksum word: {e}")))?,
+    );
+    let mut image = payload.to_vec();
+    image.resize(PROFILE_REGION_BYTES, 0);
+
+    let mut frames = Vec::with_capacity(2 + WRITE_WINDOW_COUNT * 3);
+    frames.push(OnboardWriteFrame::FileOpen { fs_id });
+    for window in 0..WRITE_WINDOW_COUNT {
+        let base = window * WRITE_PUSH_BYTES;
+        let file_offset = u32::try_from(base)
+            .map_err(|e| Error::InvalidConfig(format!("profile file offset {base} does not fit u32: {e}")))?;
+        for half in 0..2 {
+            let start = base + half * WRITE_CHUNK_BYTES;
+            let buffer_offset = u16::try_from(half * WRITE_CHUNK_BYTES).map_err(|e| {
+                Error::InvalidConfig(format!(
+                    "buffer offset {} does not fit u16: {e}",
+                    half * WRITE_CHUNK_BYTES
+                ))
+            })?;
+            frames.push(OnboardWriteFrame::BufferWrite {
+                buffer_offset,
+                data: image[start..start + WRITE_CHUNK_BYTES].to_vec(),
+            });
+        }
+        frames.push(OnboardWriteFrame::Push {
+            fs_id,
+            file_offset,
+            size: u16::try_from(WRITE_PUSH_BYTES)
+                .map_err(|e| Error::InvalidConfig(format!("push size {WRITE_PUSH_BYTES} does not fit u16: {e}")))?,
+        });
+    }
+    frames.push(OnboardWriteFrame::Commit { profile });
+
+    Ok(OnboardWritePlan {
+        profile,
+        fs_id,
+        payload_len: payload.len(),
+        region_bytes: PROFILE_REGION_BYTES,
+        checksum,
+        frames,
+    })
+}
+
+/// Counts from one on-board profile write run, the summary `ssgg onboard write` prints after a finished
+/// write. A keyboard's write path fills these from the frames it sent and the answers it read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WriteStats {
+    /// Frames put on the wire.
+    pub frames_sent: usize,
+    /// Payload bytes those frames carried.
+    pub bytes_written: usize,
+    /// Resource-buffer pushes completed.
+    pub pushes: usize,
+    /// Write-side replies read back (`88 01 …` and one per push).
+    pub acks: usize,
+}
+
+/// Tally the frames of a write plan: the counts a finished write of that plan reports, counting the answers
+/// the capture shows (`88 01 …` for the open, `05 01 …` for every push, none for the writes and the commit).
+#[must_use]
+pub fn write_stats(plan: &OnboardWritePlan) -> WriteStats {
+    let mut stats = WriteStats::default();
+    for frame in &plan.frames {
+        stats.frames_sent += 1;
+        match frame {
+            OnboardWriteFrame::FileOpen { .. } => stats.acks += 1,
+            OnboardWriteFrame::BufferWrite { data, .. } => stats.bytes_written += data.len(),
+            OnboardWriteFrame::Push { .. } => {
+                stats.pushes += 1;
+                stats.acks += 1;
+            }
+            OnboardWriteFrame::Commit { .. } => {}
+        }
+    }
+    stats
+}
+
+/// The lines `ssgg onboard write --dry-run` prints: the geometry, every frame in wire order, and the deploy
+/// frame the write path sends after it. No keyboard is involved.
+#[must_use]
+pub fn write_plan_lines(plan: &OnboardWritePlan) -> Vec<String> {
+    let mut lines = vec![
+        format!(
+            "write plan for slot {} (profile file {:04X}): {} payload bytes padded to the {}-byte profile region",
+            plan.profile, plan.fs_id, plan.payload_len, plan.region_bytes
+        ),
+        format!(
+            "payload checksum word at byte {}: {:08X}",
+            checksum_offset(plan.payload_len),
+            plan.checksum
+        ),
+        format!(
+            "{} frames: 1 open, {} windows of 2 writes + 1 push, 1 commit",
+            plan.frames.len(),
+            plan.push_count()
+        ),
+    ];
+    lines.extend(
+        plan.frames
+            .iter()
+            .enumerate()
+            .map(|(n, frame)| format!("  frame {:>3}  {}", n + 1, frame.line())),
+    );
+    lines.push(format!(
+        "then 89 {:02X} (deploy slot {}) after a {} ms pause",
+        plan.profile + 1,
+        plan.profile,
+        WRITE_DEPLOY_PAUSE_MS
+    ));
+    lines
+}
 
 /// The fixed read must cover both payload lengths, or the assembled image would be a partial profile.
 const _: () = assert!(
@@ -1734,6 +2069,39 @@ impl OnboardProfileCodec for LegacyApexOnboard {
         "legacy Apex (Apex 7, Apex Raw, Apex 2014)"
     }
 
+    /// The engine's write sequence, framed for this family's geometry (see [`write_plan`]).
+    fn write_plan(&self, profile: u8, payload: &[u8]) -> Result<OnboardWritePlan> {
+        write_plan(profile, payload)
+    }
+
+    /// The write geometry this codec frames, with the source of every number in it.
+    fn write_banner_lines(&self) -> Vec<String> {
+        vec![
+            "legacy Apex write geometry (the engine's write API, reproduced frame for frame by the \
+             Apex 7 write capture):"
+                .to_string(),
+            format!(
+                "  profile file {:04X} + slot, region {} bytes = {} windows of {} bytes",
+                PROFILE_FS_BASE, PROFILE_REGION_BYTES, WRITE_WINDOW_COUNT, WRITE_PUSH_BYTES
+            ),
+            format!(
+                "  one window = 2 writes of {WRITE_CHUNK_BYTES} bytes into the resource buffer (offsets 0 and \
+                 {WRITE_CHUNK_BYTES}, 642-wire-byte feature report) + 1 push of the full buffer \
+                 (64-wire-byte output report)"
+            ),
+            "  88 00 <file id> opens the file before the windows; eb <slot + 1> commits it after the last \
+             push"
+                .to_string(),
+            "  answers: 88 01 … after the open, 05 01 … after every push; the writes and the commit are not \
+             answered"
+                .to_string(),
+            format!(
+                "  89 <slot + 1> deploys the slot after a {WRITE_DEPLOY_PAUSE_MS} ms pause; no 6c driver-mode \
+                 frame and no HIDCONFIG pacing write is sent"
+            ),
+        ]
+    }
+
     /// The product IDs this protocol was reverse-engineered on (`Apex7::onboard_family`): the four
     /// boards of the legacy platform. Every other product ID needs its family's codec, its own payload
     /// layout and its own encodable feature set.
@@ -3179,5 +3547,200 @@ mod tests {
                 .contains("\"device\": null"),
             "the record states openly that no keyboard is recorded"
         );
+    }
+
+    /// `ONBOARD.md` acceptance for `ssgg onboard write`: the plan of the read report `config_1.json`,
+    /// slot 1, must be the write sequence the Apex 7 capture shows, at least through GG's
+    /// `05 00 01 …` frame (the push of window 11, packet No. 103 of the capture) -
+    /// and it is checked past that frame, over every frame of the session.
+    ///
+    /// The fixture is GG's session as the capture records it (`scripts/gg-write-frames.py`, header states
+    /// the capture and its sha256): frame kind, wire length, the 64-bit FNV-1a of the frame's bytes, head
+    /// bytes, and the full bytes of the two frames this crate's payload cannot reproduce byte for byte.
+    #[test]
+    fn the_write_plan_of_the_read_report_is_the_capture_write_sequence() {
+        #[derive(Debug)]
+        struct GgFrame {
+            index: usize,
+            feature: bool,
+            wire_len: usize,
+            digest: String,
+            head: Vec<u8>,
+            full: Vec<u8>,
+        }
+
+        fn hex_bytes(text: &str) -> Vec<u8> {
+            (0..text.len())
+                .step_by(2)
+                .map(|n| u8::from_str_radix(&text[n..n + 2], 16).expect("fixture hex is two hex digits per byte"))
+                .collect()
+        }
+
+        let manifest = include_str!("../../../tests/fixtures/onboard-write-apex7.manifest.txt");
+        let gg: Vec<GgFrame> = manifest
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .map(|line| {
+                let field: Vec<&str> = line.split_whitespace().collect();
+                let head_end = 4 + 16;
+                let last = *field.last().expect("a frame line has fields");
+                let full = match last.strip_prefix("full=") {
+                    Some(hex) => hex_bytes(hex),
+                    None => Vec::new(),
+                };
+                GgFrame {
+                    index: field[0].parse().expect("frame index"),
+                    feature: field[1] == "feature",
+                    wire_len: field[2].parse().expect("wire length"),
+                    digest: field[3].to_string(),
+                    head: field[4..head_end]
+                        .iter()
+                        .map(|h| u8::from_str_radix(h, 16).expect("head hex"))
+                        .collect(),
+                    full,
+                }
+            })
+            .collect();
+
+        let report = concat!(env!("CARGO_MANIFEST_DIR"), "/config_1.json");
+        let text = std::fs::read_to_string(report).expect("the read's decode report sits in the repo root");
+        let payload = encode_json(&text).expect("encode the decode report of the read that ran on slot 0");
+        assert_eq!(payload.len(), 11_696, "the read report's payload");
+
+        let plan = write_plan(0, &payload).expect("frame the write of the read report into slot 0");
+        assert_eq!(
+            plan.frames.len(),
+            gg.len(),
+            "the plan and the capture session carry the same number of frames"
+        );
+
+        let mut byte_identical = 0;
+        let mut mismatched: Vec<usize> = Vec::new();
+        let mut detail: Vec<String> = Vec::new();
+        for (n, frame) in plan.frames.iter().enumerate() {
+            let expected = &gg[n];
+            assert_eq!(
+                n + 1,
+                expected.index,
+                "fixture frames are numbered from 1 in wire order"
+            );
+            let buffer_size = frame.wire_len() + 1;
+            assert_eq!(
+                expected.feature,
+                matches!(frame.report_kind(), OnboardWriteReportKind::Feature),
+                "frame {} travels in the report the capture shows it in",
+                n + 1
+            );
+            assert_eq!(buffer_size - 1, expected.wire_len, "frame {} wire length", n + 1);
+            let mut buffer = vec![0u8; buffer_size];
+            let size = frame.serialize(&mut buffer).expect("the plan frames are serializable");
+            assert_eq!(size, buffer_size, "frame {} fills its report", n + 1);
+            let wire = &buffer[1..];
+            assert_eq!(
+                wire[..expected.head.len()],
+                expected.head[..],
+                "frame {} head bytes",
+                n + 1
+            );
+            if fnv1a_64(wire) == expected.digest {
+                byte_identical += 1;
+                continue;
+            }
+            mismatched.push(n + 1);
+            if expected.full.is_empty() {
+                detail.push(format!(
+                    "frame {}: digest differs, the fixture keeps only its head",
+                    n + 1
+                ));
+                continue;
+            }
+            assert_eq!(wire.len(), expected.full.len(), "frame {} frame length", n + 1);
+            let at: Vec<usize> = (0..wire.len()).filter(|k| wire[*k] != expected.full[*k]).collect();
+            detail.push(format!(
+                "frame {}: {} byte(s) differ at {} ({} -> {})",
+                n + 1,
+                at.len(),
+                at.iter().map(|k| k.to_string()).collect::<Vec<_>>().join(","),
+                at.iter()
+                    .map(|k| format!("{:02X}", expected.full[*k]))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                at.iter()
+                    .map(|k| format!("{:02X}", wire[*k]))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ));
+        }
+        println!("{byte_identical} of {} frames byte-identical to the capture", gg.len());
+        for line in &detail {
+            println!("{line}");
+        }
+        assert_eq!(
+            byte_identical,
+            gg.len() - 2,
+            "every frame of the session matches GG's bytes except the two known ones: {detail:?}"
+        );
+        assert_eq!(
+            mismatched,
+            vec![3, 35],
+            "the frames GG's own image puts different bytes in"
+        );
+
+        // The frame the acceptance names (`05 00 01 …`, packet No. 103 of the capture)
+        // is the push of window 11, and it is byte-identical: the plan and GG agree up to it and past it.
+        let acceptance = &plan.frames[36];
+        assert_eq!(
+            acceptance,
+            &OnboardWriteFrame::Push {
+                fs_id: 0x0201,
+                file_offset: 0x2C00,
+                size: 1024
+            },
+            "window 11's push is the frame the acceptance names"
+        );
+        assert_eq!(
+            fnv1a_64(&{ wire_of(acceptance) }),
+            gg[36].digest,
+            "its bytes are GG's bytes"
+        );
+
+        // The two known differences, stated exactly. Frame 3 carries payload bytes 512..1024, and the byte
+        // at 791 is the one this crate's encode and GG's own image disagree on. Frame 35 carries the payload
+        // tail, so it carries the checksum word, which GG computed over its own image.
+        let (three, thirty_five) = (&gg[2], &gg[34]);
+        let ours_three = wire_of(&plan.frames[2]);
+        let at: Vec<usize> = (0..ours_three.len())
+            .filter(|k| ours_three[*k] != three.full[*k])
+            .collect();
+        assert_eq!(at, vec![285], "frame 3 differs in the one byte the encode changes");
+        assert_eq!((three.full[285], ours_three[285]), (0x00, 0x04), "GG's byte, then ours");
+        assert_eq!(512 + 285 - 6, 791, "that byte is the payload's byte 791");
+
+        let ours_tail = wire_of(&plan.frames[34]);
+        let at: Vec<usize> = (0..ours_tail.len())
+            .filter(|k| ours_tail[*k] != thirty_five.full[*k])
+            .collect();
+        assert_eq!(
+            at,
+            vec![434, 435, 436, 437],
+            "frame 35 differs in its checksum word and nowhere else"
+        );
+        assert_eq!(
+            ours_tail[434..438],
+            plan.checksum.to_le_bytes(),
+            "the bytes this crate writes are the checksum of its own payload"
+        );
+        assert_ne!(
+            thirty_five.full[434..438],
+            plan.checksum.to_le_bytes(),
+            "GG's checksum word is the checksum of GG's own image"
+        );
+    }
+
+    /// A write frame's wire bytes: the report buffer without its report number, as the capture records them.
+    fn wire_of(frame: &OnboardWriteFrame) -> Vec<u8> {
+        let mut buffer = vec![0u8; frame.wire_len() + 1];
+        frame.serialize(&mut buffer).expect("the plan frames are serializable");
+        buffer[1..].to_vec()
     }
 }

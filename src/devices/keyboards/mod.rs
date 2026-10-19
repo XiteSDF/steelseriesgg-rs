@@ -239,6 +239,32 @@ pub trait Keyboard: Device {
             "on-board profile read is not supported by this keyboard".to_string(),
         ))
     }
+
+    /// Write one on-board profile slot (0-based) with `payload` bytes, `[EXPERIMENTAL]`: the frames come
+    /// from the keyboard's own codec ([`OnboardProfileCodec::write_plan`]), and the keyboard ends the write
+    /// with the profile deploy frame (0x89). **This changes the keyboard's stored profile and makes it run
+    /// the slot written.** Keyboards without a known write sequence return an error.
+    ///
+    /// `[EXPERIMENTAL]`: the frame geometry is capture-confirmed on Apex 7 (`0x1612`, 2026-10-20). The
+    /// sequence has never been sent to a keyboard by this crate.
+    async fn write_onboard_profile(
+        &self,
+        _profile: u8,
+        _payload: &[u8],
+    ) -> Result<crate::devices::keyboards::onboard::WriteStats> {
+        Err(Error::DeviceCommunication(
+            "on-board profile write is not supported by this keyboard".to_string(),
+        ))
+    }
+
+    /// Make the keyboard run one on-board profile slot (0-based): GG's profile deploy frame (0x89), the
+    /// `1-based` profile id on the wire. **This changes what the keyboard is running right now.** Keyboards
+    /// that do not answer the frame return an error.
+    async fn load_onboard_profile(&self, _profile: u8) -> Result<()> {
+        Err(Error::DeviceCommunication(
+            "on-board profile deploy is not supported by this keyboard".to_string(),
+        ))
+    }
 }
 
 /// Generic SteelSeries keyboard implementation.

@@ -211,8 +211,17 @@ pub(crate) enum OnboardAction {
     Decode(OnboardDecodeArgs),
 
     /// Encode a profile JSON back into profile bytes (no device, no hardware). Nothing is sent to a
-    /// keyboard: the write path that will use these bytes is not implemented.
+    /// keyboard; `ssgg onboard write` is what puts these bytes on a keyboard.
     Encode(OnboardEncodeArgs),
+
+    /// Write a profile into a keyboard's on-board slot. **This changes the keyboard**: it rewrites the
+    /// slot's profile file and then makes the keyboard run that slot. `--dry-run` prints the exact frames a
+    /// write would send, and needs no keyboard.
+    Write(OnboardWriteArgs),
+
+    /// Make a keyboard run one of its on-board profile slots: GG's profile deploy frame (0x89). **This
+    /// changes what the keyboard is running right now.**
+    Load(OnboardLoadArgs),
 }
 
 /// One on-board profile read. The flags pick the keyboard, the config number and what to do with the
@@ -325,6 +334,66 @@ pub(crate) struct OnboardEncodeArgs {
     /// Number of bytes in the hex dump
     #[arg(long, default_value = "64")]
     pub(crate) hex_len: usize,
+}
+
+/// One on-board profile write. The payload source is a profile JSON (encoded here, checksum computed
+/// here) or, with `--bin`, the payload bytes an earlier `ssgg onboard read --bin` wrote. The geometry is the
+/// keyboard family's (see
+/// [`OnboardProfileCodec::write_plan`](crate::devices::keyboards::onboard::OnboardProfileCodec::write_plan))
+/// and the frames are the write capture's. `[EXPERIMENTAL]`: the geometry is capture-confirmed on
+/// Apex 7 (`0x1612`); the sequence has never been sent to a keyboard by this crate.
+#[derive(clap::Args)]
+pub(crate) struct OnboardWriteArgs {
+    /// Profile JSON as written by `ssgg onboard decode` (or `onboard read --out`): encoded to payload bytes
+    /// here. Required unless `--bin` names the payload bytes to write
+    #[arg(required_unless_present = "bin")]
+    pub(crate) file: Option<PathBuf>,
+
+    /// Write these payload bytes as they are, with no encode step: the `--bin` image of an earlier
+    /// `ssgg onboard read`, or bytes `onboard encode` wrote
+    #[arg(long, value_name = "FILE", conflicts_with = "file")]
+    pub(crate) bin: Option<PathBuf>,
+
+    /// GG's config number to write (`Config 1` is `1`). There is no default: a write names the slot it
+    /// rewrites. The keyboard's family maps the number to the slot it stores, and refuses a number it does
+    /// not have
+    #[arg(short, long, value_parser = clap::value_parser!(u8))]
+    pub(crate) profile: u8,
+
+    /// Product ID of the keyboard to write, as hex: `1612`. Optional only when exactly one connected keyboard
+    /// answers the on-board profile protocol. The write runs on that keyboard's own handle
+    #[arg(short, long, value_name = "PID", value_parser = parse_product_id)]
+    pub(crate) device: Option<u16>,
+
+    /// Print the frames a write would send, in wire order, and stop. No keyboard is opened and nothing is
+    /// sent
+    #[arg(long)]
+    pub(crate) dry_run: bool,
+
+    /// Send the write. The frame sequence is capture-derived and has never been replayed on a keyboard by
+    /// this crate, so a write to persistent device state needs this flag: without it the command prints the
+    /// plan and sends nothing
+    #[arg(long)]
+    pub(crate) yes: bool,
+}
+
+/// One on-board profile deploy: make the keyboard run the slot GG's config number names.
+#[derive(clap::Args)]
+pub(crate) struct OnboardLoadArgs {
+    /// GG's config number to run (`Config 1` is `1`). There is no default: a deploy names the slot it runs,
+    /// same as a write names the slot it rewrites
+    #[arg(short, long, value_parser = clap::value_parser!(u8))]
+    pub(crate) profile: u8,
+
+    /// Product ID of the keyboard, as hex: `1612`. Optional only when exactly one connected keyboard answers
+    /// the on-board profile protocol
+    #[arg(short, long, value_name = "PID", value_parser = parse_product_id)]
+    pub(crate) device: Option<u16>,
+
+    /// Send the deploy frame. It makes the keyboard run a slot, so it needs this flag: without it the
+    /// command says what it would send and sends nothing
+    #[arg(long)]
+    pub(crate) yes: bool,
 }
 
 #[derive(Subcommand)]

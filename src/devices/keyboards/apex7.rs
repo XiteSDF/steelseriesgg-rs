@@ -31,14 +31,15 @@ use async_trait::async_trait;
 use super::apex_legacy_profile::{
     ChunkRecord, DEVICE_RESOURCE_BUFFER_LEN, GG_GAP_MS, GG_INPUT_READ_BYTES, LegacyApexOnboard, MAX_READ_LEN,
     PAYLOAD_READ_LEN, PROFILE_FILE_BYTES, PULLS_PER_FILE, ProfileImage, READ_REPLY_FRAMING_LEN, READ_REPORT_LEN,
-    READS_PER_PULL, ReadReply, SCHEMA_B, hex_of, parse_firmware_version, parse_read_reply_at, profile_file_id,
-    reply_mismatch, schema_of, validate_profile,
+    READS_PER_PULL, ReadReply, SCHEMA_B, WriteStats, hex_of, parse_firmware_version, parse_read_reply_at,
+    profile_file_id, reply_mismatch, schema_of, validate_profile,
 };
-use super::onboard::{OnboardDevice, OnboardProfileCodec};
+use super::onboard::{OnboardDevice, OnboardProfileCodec, OnboardWriteFrame};
 use super::{GenericKeyboard, Keyboard};
 use crate::devices::hid_reports::{
-    FirmwareSource, HidCommand, ONBOARD_FEATURE_REPORT_SIZE, ONBOARD_OUTPUT_REPORT_SIZE, OnboardFirmwareVersionCommand,
-    OnboardPullCommand, OnboardReadCommand,
+    FirmwareSource, HidCommand, ONBOARD_FEATURE_REPORT_SIZE, ONBOARD_OUTPUT_REPORT_SIZE, OnboardBufferWriteCommand,
+    OnboardCommitCommand, OnboardFileOpenCommand, OnboardFirmwareVersionCommand, OnboardLoadProfileCommand,
+    OnboardPullCommand, OnboardPushCommand, OnboardReadCommand,
 };
 use crate::devices::key_mapping::{KeyId, KeyMapping};
 use crate::devices::product_ids;
@@ -90,6 +91,16 @@ const FIRMWARE_REPLY_ATTEMPTS: u32 = 1;
 const PROBE_PULL_LEN: u16 = 2;
 /// Largest input report a profile collection can return (Apex 7 profile collections report 1024).
 const INPUT_REPORT_MAX_LEN: usize = 1024;
+/// Input-report polls allowed while waiting for the file-open answer (0x88): the write capture
+/// answers it 305 ms after the frame, and the keyboard streams its ordinary input reports in between, all of
+/// which the wait skips (see [`Apex7::await_write_ack`]).
+const WRITE_OPEN_ACK_ATTEMPTS: u32 = 40;
+/// Input-report polls allowed while waiting for a push answer (0x05): 5 ms after the frame in the capture.
+const WRITE_PUSH_ACK_ATTEMPTS: u32 = 20;
+/// Status byte every write-side answer of the capture carries. `[EXPERIMENTAL]`: what it means
+/// is observed, not proven; a write stops on any other value, because the frames after a refused one build
+/// on it.
+const WRITE_ACK_STATUS_OK: u8 = 0x01;
 
 /// A payload read reply arrives as `[report ID][641 bytes]`, and a header-echoing reply spends
 /// [`READ_REPLY_FRAMING_LEN`] of those bytes on its header: that is why a read frame never asks for more
@@ -237,6 +248,188 @@ impl Apex7 {
             known: known_product_id(info.product_id),
         });
         Ok(image)
+    }
+
+    /// Writes one on-board profile slot with `payload` bytes, then deploys the slot.
+    ///
+    /// The write blocks on the keyboard's answers, so it runs on a scoped thread the way the read does: a
+    /// scoped thread borrows this device and the scope is joined before this returns.
+    ///
+    /// **This changes the keyboard**: it rewrites the profile file of the slot and then makes the keyboard
+    /// run that slot. Lighting, audio and the other slots are untouched, and the write sends nothing else.
+    ///
+    /// `[EXPERIMENTAL]`: the frames are the Apex 7 write capture's sequence, byte for byte
+    /// (see [`write_plan`](crate::devices::keyboards::apex_legacy_profile::write_plan), whose tests compare
+    /// with the capture). The sequence has never been sent to a keyboard by this crate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the payload cannot be framed for the slot, a frame is refused, or a frame the
+    /// capture shows answered is not answered here. The write stops at the first such frame, leaving the
+    /// slot as the frames already sent left it.
+    pub async fn write_profile(&self, profile: u8, payload: &[u8]) -> Result<WriteStats> {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| self.write_image(profile, payload))
+                .join()
+                .map_err(|_| Error::Other("onboard write worker panicked".to_string()))?
+        })
+    }
+
+    /// Makes the keyboard run one on-board profile slot: GG's profile deploy frame (0x89), then the pause
+    /// the engine's deploy API puts behind it.
+    ///
+    /// **This changes what the keyboard is running right now.** The capture shows GG sending the
+    /// frame with no answer of its own, so this sends it and waits; it reads nothing back.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the slot is out of range or the device refuses the frame.
+    pub async fn deploy_profile(&self, profile: u8) -> Result<()> {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    validate_profile(profile)?;
+                    self.deploy_frame(profile)
+                })
+                .join()
+                .map_err(|_| Error::Other("onboard deploy worker panicked".to_string()))?
+        })
+    }
+
+    /// Runs the write: every frame of the plan in wire order with GG's pacing between them, then the deploy
+    /// frame and its pause.
+    fn write_image(&self, profile: u8, payload: &[u8]) -> Result<WriteStats> {
+        let codec = &LegacyApexOnboard;
+        let plan = codec.write_plan(profile, payload)?;
+        for line in codec.write_banner_lines() {
+            tracing::info!("onboard write geometry: {line}");
+        }
+        tracing::info!(
+            "onboard write: slot {profile} (file {:04X}) of {} payload bytes padded to {}, {} frames, {} ms \
+             between them, on {}",
+            plan.fs_id,
+            plan.payload_len,
+            plan.region_bytes,
+            plan.frames.len(),
+            GG_GAP_MS,
+            self.collection_label()
+        );
+
+        let mut stats = WriteStats::default();
+        for frame in &plan.frames {
+            match frame {
+                OnboardWriteFrame::FileOpen { fs_id } => {
+                    self.write_output_command(OnboardFileOpenCommand { fs_id: *fs_id })
+                        .map_err(|e| self.frame_error("file open", &format!("file {fs_id:04X}"), e))?;
+                    stats.frames_sent += 1;
+                    stats.acks +=
+                        self.await_write_ack(codec.write_ack_report_ids()[0], WRITE_OPEN_ACK_ATTEMPTS, "file open")?;
+                }
+                OnboardWriteFrame::BufferWrite { buffer_offset, data } => {
+                    self.write_feature_command(OnboardBufferWriteCommand {
+                        buffer_offset: *buffer_offset,
+                        data,
+                    })
+                    .map_err(|e| {
+                        self.frame_error(
+                            "buffer write",
+                            &format!("buffer offset {buffer_offset} size {}", data.len()),
+                            e,
+                        )
+                    })?;
+                    stats.frames_sent += 1;
+                    stats.bytes_written += data.len();
+                }
+                OnboardWriteFrame::Push {
+                    fs_id,
+                    file_offset,
+                    size,
+                } => {
+                    self.write_output_command(OnboardPushCommand {
+                        fs_id: *fs_id,
+                        file_offset: *file_offset,
+                        size: *size,
+                    })
+                    .map_err(|e| {
+                        self.frame_error("push", &format!("file {fs_id:04X} offset {file_offset} size {size}"), e)
+                    })?;
+                    stats.frames_sent += 1;
+                    stats.pushes += 1;
+                    stats.acks +=
+                        self.await_write_ack(codec.write_ack_report_ids()[1], WRITE_PUSH_ACK_ATTEMPTS, "push")?;
+                }
+                OnboardWriteFrame::Commit { profile } => {
+                    // The capture answers the commit with nothing of its own, so the write does not wait.
+                    self.write_output_command(OnboardCommitCommand { profile: *profile })
+                        .map_err(|e| self.frame_error("commit", &format!("slot {profile}"), e))?;
+                    stats.frames_sent += 1;
+                }
+            }
+            if GG_GAP_MS > 0 {
+                std::thread::sleep(Duration::from_millis(GG_GAP_MS));
+            }
+        }
+
+        self.deploy_frame(profile)?;
+        Ok(stats)
+    }
+
+    /// Sends the profile deploy frame and waits the engine's pause behind it.
+    fn deploy_frame(&self, profile: u8) -> Result<()> {
+        let codec = &LegacyApexOnboard;
+        self.write_output_command(OnboardLoadProfileCommand { profile })
+            .map_err(|e| self.frame_error("deploy", &format!("slot {profile}"), e))?;
+        std::thread::sleep(Duration::from_millis(codec.write_deploy_pause_ms()));
+        Ok(())
+    }
+
+    /// A frame refusal, named with the frame and the collection it went out on.
+    fn frame_error(&self, kind: &str, what: &str, e: Error) -> Error {
+        Error::DeviceCommunication(format!(
+            "onboard write frame {kind} ({what}) on {} rejected: {e}",
+            self.collection_label()
+        ))
+    }
+
+    /// Waits the answer a write-side frame gets: the capture answers the file open with
+    /// `88 01 …` (305 ms after the frame) and every push with `05 01 …` (5 ms after it), on the interrupt
+    /// endpoint. The keyboard streams its ordinary input reports in between, so the wait skips every report
+    /// that is not the answer it is looking for.
+    ///
+    /// `[EXPERIMENTAL]`: the status byte is `01` in every answer of that capture. Any other value, and any
+    /// frame left unanswered, stops the write - the frames after it build on the one that was refused.
+    fn await_write_ack(&self, expected_id: u8, attempts: u32, label: &str) -> Result<usize> {
+        let path = self.collection_label();
+        for _ in 0..attempts {
+            match self.read_profile_input_packet(PULL_ACK_LEN, REPLY_POLL_MS) {
+                Ok(report) if report.first() == Some(&expected_id) => {
+                    let status = report.get(1).copied().unwrap_or(0);
+                    if status != WRITE_ACK_STATUS_OK {
+                        return Err(Error::DeviceCommunication(format!(
+                            "onboard write on {path}: {label} answered status {status:#04x}; the 2026-10-20 \
+                             capture only ever shows {WRITE_ACK_STATUS_OK:#04x}, so the write stops here"
+                        )));
+                    }
+                    return Ok(1);
+                }
+                Ok(report) if !report.is_empty() => {
+                    tracing::debug!(
+                        "onboard write on {path}: skipped report {:#04x} while waiting for the {label} answer",
+                        report[0]
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::debug!("onboard write: input-report poll on {path}: {e}");
+                }
+            }
+        }
+        Err(Error::DeviceCommunication(format!(
+            "onboard write on {path}: {label} answered nothing in {} ms; the capture answers every frame of \
+             this kind, so the write stops here",
+            u64::from(attempts) * REPLY_POLL_MS
+        )))
     }
 
     /// Runs GG's 2-byte probe in front of the file read and checks the schema word it answers.
@@ -537,6 +730,14 @@ crate::impl_keyboard_with_delegation!(Apex7, {
 
     async fn read_onboard_profile(&self, profile: u8) -> Result<ProfileImage> {
         self.read_profile(profile).await
+    }
+
+    async fn write_onboard_profile(&self, profile: u8, payload: &[u8]) -> Result<WriteStats> {
+        self.write_profile(profile, payload).await
+    }
+
+    async fn load_onboard_profile(&self, profile: u8) -> Result<()> {
+        self.deploy_profile(profile).await
     }
 });
 
