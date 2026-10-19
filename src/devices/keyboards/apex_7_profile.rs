@@ -1,15 +1,18 @@
-//! [EXPERIMENTAL] On-board profile read-back for the legacy/"macho" Apex platform.
+//! [EXPERIMENTAL] On-board profile read-back for the Apex 7, on its legacy "macho" protocol.
 //!
 //! This module is the pure half of the read path: frame builders, reply parsing, payload assembly,
 //! struct decode, checksum reporting and JSON. It performs no I/O. The hardware loop is
-//! [`crate::devices::keyboards::apex7`] (`Apex7`'s own read methods).
+//! [`crate::devices::keyboards::apex_7`] (`Apex7`'s own read methods).
 //!
 //! It lives in this keyboard namespace next to its consumers, because everything
-//! in it belongs to this one platform: the reply framing, resource-buffer and window sizes, file-id
-//! base, payload sizes, schema words and the payload struct offsets all come from the legacy platform's
-//! own protocol module (`apexui.dll`). Nothing here is generic - the Gen3 platform (`0x1628`) reads its
-//! on-board profile through a completely different transport (see
-//! [`crate::devices::keyboards::apex_pro_tkl_2023_profile`]) and shares none of it.
+//! in it belongs to this one protocol: the reply framing, resource-buffer and window sizes, file-id
+//! base, payload sizes, schema words and the payload struct offsets all come from the platform's
+//! own protocol module (`apexui.dll`, the same code GG runs on an Apex 7). Nothing here is generic - the
+//! Gen3 platform (`0x1628`) reads its on-board profile through a completely different transport (see
+//! [`crate::devices::keyboards::apex_pro_tkl_2023_profile`]) and shares none of it. The engine's own
+//! protocol file (`lisp/apex_7.lisp`) covers the whole legacy platform, `lisp/base_apex_legacy.lisp:6`,
+//! and its words apply to the `0x1614` / `0x1616` / `0x1618` siblings as protocol evidence; this crate
+//! enables the path on the board it measured, `Apex7::onboard_capable`.
 //!
 //! Protocol status: reverse-engineered. The file ids, chunk geometry, frame layouts and the payload
 //! struct layout below are reproduced from the Windows engine's device descriptors, and the wire part of
@@ -2048,21 +2051,21 @@ pub fn encode_json(text: &str) -> Result<Vec<u8>> {
     Ok(data)
 }
 
-/// The legacy Apex family's on-board profile codec: what `ssgg onboard` does with the bytes of this
-/// family's payload layout, with no device involved. `apex7.rs` is what moves them on a keyboard.
+/// The Apex 7 on-board profile codec: what `ssgg onboard` does with the bytes of this payload layout, with
+/// no device involved. `apex_7.rs` is what moves them on a keyboard.
 ///
 /// Registered in [`onboard::codecs`](crate::devices::keyboards::onboard::codecs) and handed out by
-/// [`Apex7::onboard_codec`](crate::devices::keyboards::apex7::Apex7). The report shape this codec carries
-/// is this family's payload layout as data; `onboard.rs` says how the next keyboard plugs in.
+/// [`Apex7::onboard_codec`](crate::devices::keyboards::apex_7::Apex7). The report shape this codec carries is
+/// this layout as data; `onboard.rs` says how the next keyboard plugs in.
 ///
-/// `[EXPERIMENTAL]`: the layout is reverse-engineered from one GG capture and has only ever been read
-/// from keyboards. The text builders below are this family's words for a read and a decode - they moved
-/// out of `src/main.rs` on 2026-10-19, when the CLI stopped naming keyboard families.
-pub struct LegacyApexOnboard;
+/// `[EXPERIMENTAL]`: the layout is reverse-engineered from one GG capture of one `0x1612` and has only ever
+/// been read from keyboards. The text builders below are its words for a read and a decode - they moved out of
+/// `src/main.rs` on 2026-10-19, when the CLI stopped naming keyboards.
+pub struct Apex7Onboard;
 
-impl OnboardProfileCodec for LegacyApexOnboard {
+impl OnboardProfileCodec for Apex7Onboard {
     fn family_name(&self) -> &'static str {
-        "legacy Apex (Apex 7, Apex Raw, Apex 2014)"
+        "Apex 7"
     }
 
     /// The engine's write sequence, framed for this family's geometry (see [`write_plan`]).
@@ -2073,7 +2076,7 @@ impl OnboardProfileCodec for LegacyApexOnboard {
     /// The write geometry this codec frames, with the source of every number in it.
     fn write_banner_lines(&self) -> Vec<String> {
         vec![
-            "legacy Apex write geometry (the engine's write API, reproduced frame for frame by the \
+            "Apex 7 write geometry (the engine's write API, reproduced frame for frame by the \
              Apex 7 write capture):"
                 .to_string(),
             format!(
@@ -2097,11 +2100,12 @@ impl OnboardProfileCodec for LegacyApexOnboard {
         ]
     }
 
-    /// The product IDs this protocol was reverse-engineered on (`Apex7::onboard_family`): the four
-    /// boards of the legacy platform. Every other product ID needs its family's codec, its own payload
-    /// layout and its own encodable feature set.
+    /// The product IDs this protocol is known from (`Apex7::onboard_capable`): the board that was captured.
+    /// Every other product ID needs its own codec, its own payload layout and its own encodable feature set -
+    /// including the `0x1614` / `0x1616` / `0x1618` boards GG lists on this platform, which have no hardware
+    /// here and no measured answer.
     fn knows_product(&self, product_id: u16) -> bool {
-        crate::devices::keyboards::apex7::onboard_family(product_id)
+        crate::devices::keyboards::apex_7::onboard_capable(product_id)
     }
 
     fn config_count(&self) -> u8 {
@@ -2183,10 +2187,7 @@ impl OnboardProfileCodec for LegacyApexOnboard {
 /// verified against, and what to watch while it runs.
 fn banner_lines() -> Vec<String> {
     vec![
-        format!(
-            "[EXPERIMENTAL] {} on-board profile read",
-            LegacyApexOnboard.family_name()
-        ),
+        format!("[EXPERIMENTAL] {} on-board profile read", Apex7Onboard.family_name()),
         "  reverse-engineered from one GG USBPcap capture; it only reads - it sends no frames that".to_string(),
         "  change anything on the keyboard.".to_string(),
         "  the slot layout and checksum match GG's payload struct and a hardware read of the factory".to_string(),

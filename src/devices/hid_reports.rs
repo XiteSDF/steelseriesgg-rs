@@ -513,7 +513,7 @@ pub const ONBOARD_READ_WIRE_BYTES: usize = 642;
 
 /// Bytes a payload read frame may ask for. A reply report arrives as `[report ID][641 bytes]`, and a
 /// header-echoing reply puts a further 5-byte header (`03 01 01 00 01`, see `READ_REPLY_HEADER_LEN` in
-/// `apex_legacy_profile`) in front of the payload, so the payload a read can ask for tops out at
+/// `apex_7_profile`) in front of the payload, so the payload a read can ask for tops out at
 /// 642 - 1 - 5 = 636. An earlier version of this constant said 641: it subtracted the report-ID byte but
 /// not the header, which let a read frame ask for a size no reply can carry.
 pub const ONBOARD_MAX_READ_LEN: usize = ONBOARD_READ_WIRE_BYTES - 1 - 5;

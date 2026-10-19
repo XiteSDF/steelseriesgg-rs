@@ -606,6 +606,17 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   as the GET_REPORT length, `ONBOARD_MAX_READ_LEN` (636) as the most a read frame may ask for. `PLAN.md` history
   entries keep the names used at their date.
 
+- 2026-10-19 (Apex 7 only, and the names say so): the on-board path is scoped to the board it was captured
+  and measured on. `Apex7::onboard_capable` takes `0x1612` alone - it used to take the four PIDs GG lists on
+  this platform (`0x1614` apex_pro_tkl, `0x1616` apex_150, `0x1618` apex_7_tkl, `base_apex_legacy.lisp:6`),
+  and none of them has hardware here, so none is enabled: `ssgg onboard read --device 1616` now answers
+  `no keyboard with product ID 1616 answers the on-board profile protocol`. `LegacyApexOnboard` is
+  `Apex7Onboard`, its `family_name()` is `Apex 7` (was `legacy Apex (Apex 7, Apex Raw, Apex 2014)`) and its
+  write banner says `Apex 7 write geometry`. Files: `apex7.rs` -> `apex_7.rs`, `apex_legacy_profile.rs` ->
+  `apex_7_profile.rs`. Protocol evidence keeps the platform prose (the engine's `apex_7.lisp` covers the
+  siblings, `docs/development/devices.md` keeps the registry names) - what is gone is the code that enabled
+  boards nobody has read an answer from.
+
 ## Reference projects
 
 - Apex RGB: OpenRGB `SteelSeriesApex8ZoneController`

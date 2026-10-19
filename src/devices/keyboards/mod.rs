@@ -1,8 +1,8 @@
 //! Keyboard device support (Apex series).
 
 pub mod apex;
-pub mod apex7;
-pub mod apex_legacy_profile;
+pub mod apex_7;
+pub mod apex_7_profile;
 pub mod apex_pro_tkl_2023;
 pub mod apex_pro_tkl_2023_profile;
 pub mod onboard;

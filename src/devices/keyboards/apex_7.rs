@@ -1,12 +1,12 @@
-//! Apex 7 and the boards of its legacy "macho" platform, including the `[EXPERIMENTAL]` on-board
-//! profile read.
+//! The Apex 7 keyboard device: standard lighting control through [`GenericKeyboard`], plus the
+//! `[EXPERIMENTAL]` on-board profile read of its legacy "macho" protocol.
 //!
 //! Frame construction, reply parsing, payload geometry and decoding live in
-//! [`crate::devices::keyboards::apex_legacy_profile`]; every wire fact the read depends on is stated
+//! [`crate::devices::keyboards::apex_7_profile`]; every wire fact the read depends on is stated
 //! in that module's doc, once. This module is the transfer machinery: it sends the firmware poll and the
 //! pull frames, the pacing read that follows each pull and the payload reads, collects the replies and
 //! assembles a
-//! [`ProfileImage`](crate::devices::keyboards::apex_legacy_profile::ProfileImage).
+//! [`ProfileImage`](crate::devices::keyboards::apex_7_profile::ProfileImage).
 //!
 //! The transfers run on the handle this device already owns - the collection the device manager opened,
 //! held open for the whole read, which is what the packet methods below use. `usbhid` polls a collection's
@@ -28,8 +28,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
-use super::apex_legacy_profile::{
-    ChunkRecord, DEVICE_RESOURCE_BUFFER_LEN, GG_GAP_MS, GG_INPUT_READ_BYTES, LegacyApexOnboard, MAX_READ_LEN,
+use super::apex_7_profile::{
+    Apex7Onboard, ChunkRecord, DEVICE_RESOURCE_BUFFER_LEN, GG_GAP_MS, GG_INPUT_READ_BYTES, MAX_READ_LEN,
     PAYLOAD_READ_LEN, PROFILE_FILE_BYTES, PULLS_PER_FILE, ProfileImage, READ_REPLY_FRAMING_LEN, READ_REPORT_LEN,
     READS_PER_PULL, ReadReply, SCHEMA_B, WriteStats, hex_of, parse_firmware_version, parse_read_reply_at,
     profile_file_id, reply_mismatch, schema_of, validate_profile,
@@ -119,23 +119,22 @@ const _: () = assert!(MAX_READ_LEN + READ_REPLY_FRAMING_LEN < READ_REPLY_BUFFER_
 // the capture shows. Measured 2026-10-19: GG's opening chain and its closing sequence are **not needed** - the
 // read collects a profile slot without either, so this crate sends neither.
 
-/// Apex 7 and the boards of its platform that take the on-board profile protocol.
+/// The on-board profile gate: the Apex 7 (`0x1612`) and nothing else.
 ///
-/// Only `0x1612` (Apex 7) appears in the reference capture; `0x1614` (Apex Pro TKL, 2016), `0x1616`
-/// (`apex_150`) and `0x1618` (`apex_7_tkl`) are the same legacy platform in GG's firmware registry and
-/// are unverified here.
+/// The protocol was captured on a `0x1612` and measured on that board alone. GG's own firmware registry puts
+/// three more boards on this platform - `0x1614` (`apex_pro_tkl`), `0x1616` (`apex_150`) and `0x1618`
+/// (`apex_7_tkl`), `lisp/base_apex_legacy.lisp:6` - and the engine's `apex_7.lisp` drives them the same way,
+/// but none of them is tested here, so none is enabled: with no hardware to read an answer on, the gate stays
+/// at the board the frames are known from. `Apex7::onboard_capable` is the device gate; a platform sibling keeps
+/// standard lighting and answers no on-board codec.
 #[must_use]
-pub fn onboard_family(product_id: u16) -> bool {
-    matches!(
-        product_id,
-        product_ids::APEX_7 | product_ids::APEX_PRO_TKL | product_ids::APEX_150 | product_ids::APEX_7_TKL
-    )
+pub fn onboard_capable(product_id: u16) -> bool {
+    product_id == product_ids::APEX_7
 }
 
-/// Apex 7 keyboard device: standard lighting control through [`GenericKeyboard`], plus the
-/// `[EXPERIMENTAL]` on-board profile read on its own handle.
+/// Apex 7 keyboard device, with the on-board profile read on its own handle.
 ///
-/// Discovery builds this device for every [`onboard_family`] product ID: the device class is part of the
+/// Discovery builds this device for the product ID [`onboard_capable`] accepts: the device class is part of the
 /// device tree, and the read path is part of the core build.
 pub struct Apex7 {
     inner: GenericKeyboard,
@@ -153,7 +152,7 @@ impl Apex7 {
     /// Whether this device's product ID is on the platform the read was reverse-engineered from.
     #[must_use]
     pub fn supports_onboard(&self) -> bool {
-        onboard_family(self.inner.info().product_id)
+        onboard_capable(self.inner.info().product_id)
     }
 
     /// Read one on-board profile slot (slots `0..=4`; everything else about the read is fixed geometry).
@@ -243,7 +242,7 @@ impl Apex7 {
     /// run that slot. Lighting, audio and the other slots are untouched, and the write sends nothing else.
     ///
     /// `[EXPERIMENTAL]`: the frames are the Apex 7 write capture's sequence, byte for byte
-    /// (see [`write_plan`](crate::devices::keyboards::apex_legacy_profile::write_plan), whose tests compare
+    /// (see [`write_plan`](crate::devices::keyboards::apex_7_profile::write_plan), whose tests compare
     /// with the capture). The sequence has never been sent to a keyboard by this crate.
     ///
     /// # Errors
@@ -252,7 +251,7 @@ impl Apex7 {
     /// capture shows answered is not answered here. The write stops at the first such frame, leaving the
     /// slot as the frames already sent left it.
     pub fn write_profile(&self, profile: u8, payload: &[u8]) -> Result<WriteStats> {
-        let codec = &LegacyApexOnboard;
+        let codec = &Apex7Onboard;
         let plan = codec.write_plan(profile, payload)?;
         for line in codec.write_banner_lines() {
             tracing::info!("onboard write geometry: {line}");
@@ -469,7 +468,7 @@ impl Apex7 {
     /// 7, 2026-10-19; the GG capture has both forms on the wire). `[EXPERIMENTAL]`.
     ///
     /// The read calls this with [`FirmwareSource::Keyboard`] for the version line of a
-    /// [`ProfileImage`](crate::devices::keyboards::apex_legacy_profile::ProfileImage); a keyboard that
+    /// [`ProfileImage`](crate::devices::keyboards::apex_7_profile::ProfileImage); a keyboard that
     /// accepts the frame and answers nothing is not an error, `None` is returned.
     ///
     /// # Errors
@@ -695,7 +694,7 @@ impl Device for Apex7 {
 // Delegate Keyboard trait; the on-board profile methods are this device's own.
 crate::impl_keyboard_with_delegation!(Apex7, {
     fn onboard_codec(&self) -> Option<&'static dyn OnboardProfileCodec> {
-        self.supports_onboard().then_some(&LegacyApexOnboard)
+        self.supports_onboard().then_some(&Apex7Onboard)
     }
 
     async fn read_onboard_profile(&self, profile: u8) -> Result<ProfileImage> {
@@ -727,17 +726,27 @@ fn is_ack(report: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::devices::keyboards::apex_legacy_profile::{
+    use crate::devices::keyboards::apex_7_profile::{
         MAX_PROFILE_INDEX, PROFILE_FS_BASE, profile_file_id, validate_profile,
     };
 
     #[test]
-    fn the_family_predicate_selects_the_device() {
-        assert!(onboard_family(product_ids::APEX_7));
-        for pid in [product_ids::APEX_3, product_ids::APEX_PRO, product_ids::APEX_7_2024] {
+    fn the_gate_takes_the_apex_7_alone() {
+        assert!(onboard_capable(product_ids::APEX_7));
+        // The three boards GG lists on this platform, plus the boards of the other families. None of them has
+        // hardware here, so none of them is enabled: the gate is the captured board, not the platform.
+        for pid in [
+            product_ids::APEX_PRO,
+            product_ids::APEX_PRO_TKL,
+            product_ids::APEX_150,
+            product_ids::APEX_7_TKL,
+            product_ids::APEX_3,
+            product_ids::APEX_7_2024,
+            product_ids::APEX_PRO_TKL_2023,
+        ] {
             assert!(
-                !onboard_family(pid),
-                "PID {pid:#06x} is not the legacy platform discovery wraps in Apex7"
+                !onboard_capable(pid),
+                "PID {pid:#06x} is not the board the on-board frames are known from"
             );
         }
     }
@@ -789,29 +798,31 @@ mod tests {
         }
 
         #[test]
-        fn only_the_legacy_family_gets_the_read() {
+        fn only_the_apex_7_gets_the_read() {
             let apex_7 = device_without_handle(product_ids::APEX_7);
             assert!(apex_7.supports_onboard());
             assert!(Apex7::supports_onboard_profile(&apex_7));
             // The codec answers which product IDs its protocol covers: a profile JSON that names a
-            // board outside this list was written by a family this codec is not.
-            assert!(LegacyApexOnboard.knows_product(product_ids::APEX_7));
-            assert!(LegacyApexOnboard.knows_product(product_ids::APEX_PRO_TKL));
-            assert!(LegacyApexOnboard.knows_product(product_ids::APEX_150));
-            assert!(LegacyApexOnboard.knows_product(product_ids::APEX_7_TKL));
+            // board outside this list was written by a keyboard this codec is not.
+            assert!(Apex7Onboard.knows_product(product_ids::APEX_7));
             assert!(
-                !LegacyApexOnboard.knows_product(product_ids::APEX_PRO_TKL_2023),
-                "the 2023 board is not on the legacy platform"
+                !Apex7Onboard.knows_product(product_ids::APEX_PRO_TKL_2023),
+                "the 2023 board reads its profile through its own protocol"
             );
-            assert!(
-                !LegacyApexOnboard.knows_product(0xFFFF),
-                "an ID the registry does not list"
-            );
-            for pid in [product_ids::APEX_3, product_ids::APEX_PRO, product_ids::APEX_7_2024] {
+            assert!(!Apex7Onboard.knows_product(0xFFFF), "an ID the registry does not list");
+            for pid in [
+                product_ids::APEX_PRO,
+                product_ids::APEX_PRO_TKL,
+                product_ids::APEX_150,
+                product_ids::APEX_7_TKL,
+                product_ids::APEX_3,
+                product_ids::APEX_7_2024,
+            ] {
                 assert!(
-                    !onboard_family(pid),
-                    "PID {pid:#06x} is not the platform the read was reverse-engineered from"
+                    !Apex7Onboard.knows_product(pid),
+                    "PID {pid:#06x} has no hardware here, so its frames are not known"
                 );
+                assert!(!onboard_capable(pid), "PID {pid:#06x} is not the captured board");
             }
         }
 
@@ -822,7 +833,7 @@ mod tests {
             // which the read side sends to the device verbatim as wLength 642
             match keyboard
                 .inner
-                .read_profile_feature_packet(0x00, crate::devices::keyboards::apex_legacy_profile::READ_REPORT_LEN)
+                .read_profile_feature_packet(0x00, crate::devices::keyboards::apex_7_profile::READ_REPORT_LEN)
             {
                 Ok(_) => panic!("a device without a handle must not answer a profile packet"),
                 Err(error) => assert!(
@@ -837,13 +848,10 @@ mod tests {
             // The device carries no slot state: the slot is an argument, and slot 0 is the file the
             // capture read.
             assert_eq!(
-                crate::devices::keyboards::apex_legacy_profile::profile_file_id(0),
-                crate::devices::keyboards::apex_legacy_profile::PROFILE_FS_BASE
+                crate::devices::keyboards::apex_7_profile::profile_file_id(0),
+                crate::devices::keyboards::apex_7_profile::PROFILE_FS_BASE
             );
-            assert_eq!(
-                crate::devices::keyboards::apex_legacy_profile::profile_file_id(4),
-                0x0205
-            );
+            assert_eq!(crate::devices::keyboards::apex_7_profile::profile_file_id(4), 0x0205);
         }
     }
 }

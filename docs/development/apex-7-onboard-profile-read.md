@@ -11,8 +11,8 @@ sends no frames that change anything on the keyboard: GG's opening chain and its
 not to be needed (2026-10-18, §Sequences the read does not need). Code: `src/devices/hid_reports.rs` (the command codes
 and every report buffer: `OnboardFirmwareVersionCommand`
 with its `FirmwareSource` byte, `OnboardDriverModeCommand`, `OnboardProfileDeployCommand`,
-`OnboardPayloadPullCommand`, `OnboardBufferReadCommand`), `src/devices/keyboards/apex_legacy_profile.rs` (reply framing, payload geometry, reply parsing, decode - the module moved there on 2026-10-17, from `src/onboard_profile.rs`, because everything in it is specific to this legacy platform),
-`src/devices/keyboards/apex7.rs` (`Apex7`: the keyboard device of the legacy Apex family, which wraps
+`OnboardPayloadPullCommand`, `OnboardBufferReadCommand`), `src/devices/keyboards/apex_7_profile.rs` (reply framing, payload geometry, reply parsing, decode - the module moved there on 2026-10-17, from `src/onboard_profile.rs`, because everything in it is specific to this legacy platform),
+`src/devices/keyboards/apex_7.rs` (`Apex7`: the keyboard device of the legacy Apex family, which wraps
 `GenericKeyboard`, and the read plan, reply assembly and polling - its own `read_profile` /
 `read_image` / `firmware_version` / `probe_schema` / `pull_window` / `read_window` methods; the
 `apex_legacy_onboard` module these lived in was folded into `Apex7` on 2026-10-18) - the packet I/O is
@@ -23,7 +23,7 @@ with its `FirmwareSource` byte, `OnboardDriverModeCommand`, `OnboardProfileDeplo
 (transport, read plan, `Keyboard::read_onboard_profile`) is core code, labelled `[EXPERIMENTAL]`, as are the report builders.
 
 The interfaces (2026-10-19) are per keyboard family: `Keyboard::onboard_codec` answers *which family protocol a
-keyboard speaks* (`Apex7` answers with `apex_legacy_profile::LegacyApexOnboard`, every other keyboard `None`),
+keyboard speaks* (`Apex7` answers with `apex_7_profile::Apex7Onboard`, every other keyboard `None`),
 `Keyboard::read_onboard_profile` pulls a slot on the keyboard's handle, and `OnboardProfileCodec` is the family's
 device-free codec - decode, encode, report JSON, dump names, the `Config 1..5` numbering, and the text a read
 prints. `DeviceManager::open_onboard_keyboard` selects a keyboard that answers it, and `src/main.rs` names no family
@@ -159,7 +159,7 @@ The decoded report names the keyboard it came from in its `device` block (`vendo
 `product`, `known`): a read stamps the product ID it ran on, a decode of a file records nothing. The GUI
 shows a model **name** for that number, and takes it from Rust rather than from the file:
 `tools/profile-gui/sync-products.mjs` parses `pub mod product_ids`, `device_name_from_product_id` and
-`device_type_from_product_id` (`src/devices/mod.rs`), `onboard_family` (`apex7.rs`) and the `codecs()`
+`device_type_from_product_id` (`src/devices/mod.rs`), `onboard_capable` (`apex_7.rs`) and the `codecs()`
 registry (`onboard.rs`) into `tools/profile-gui/products.generated.js`, which `index.html` loads before
 `app.js` (2026-10-19). The registry's name for the recorded ID wins over the `product` string the file
 carries - the crate's own rule, trust the number and not the name - and the same import carries the
@@ -203,8 +203,8 @@ Host side, the measured spacing on the wire is what `ssgg` paces by. The read ca
 bulk-transfer step, cited in §"Answered frames and pacing" of
 [`apex-7-onboard-profile-write.md`](apex-7-onboard-profile-write.md)). `ssgg` paces both paths at
 `GG_GAP_MS` = **5 ms** (the write capture's median, [`GG_GAP_MS`] in
-[`apex_legacy_profile`](crate::devices::keyboards::apex_legacy_profile)), and waits for each answer with the
-50 ms poll of [`REPLY_POLL_MS`] in [`apex7`](crate::devices::keyboards::apex7) - the read's answer arrives 1-3 ms
+[`apex_7_profile`](crate::devices::keyboards::apex_7_profile)), and waits for each answer with the
+50 ms poll of [`REPLY_POLL_MS`] in [`apex7`](crate::devices::keyboards::apex_7) - the read's answer arrives 1-3 ms
 after its request, so the 5 ms step covers the 1 ms the board needs to prepare a buffer (the wait in `read_window`
 that keeps a fast read from pulling an unprepared buffer, recorded in `ONBOARD.md`). Nothing in the read or the
 write runs on a thread of its own: `Apex7::read_profile`, `Apex7::write_profile` and `Apex7::deploy_profile` are
@@ -258,7 +258,7 @@ Four facts come off that:
 - **`0xF0` is GG's code for the Meta cap, and the cap binds through slot 93.** The cap is the HID usage
   `0x65` (electrically the Application/Select keystroke), and `hid_to_offset(0x65)` is `None` - the
   embedded legacy table has `-1` at 0x65, so no profile key is named Meta. The slot GG carries the cap
-  on is the slot whose own table code is `0xF0`: slot 93 (`apex_legacy_profile::meta_key_offset`, the
+  on is the slot whose own table code is `0xF0`: slot 93 (`apex_7_profile::meta_key_offset`, the
   code the page's usage table calls `Fn F0`), which a stock read binds to itself (`51 F0 00 00 00`).
   The user profile above binds slot 93 to `0x65` - the cap types the Context Menu - while its byte
   names the M key, so the cap's binding, the slot and the byte are three separable things. Every other
@@ -405,7 +405,7 @@ Rapid Tap mode nibbles belong to the pairs, not to the mappings: `0x80` report k
 
 ## Encode: the decoder run backwards (2026-10-19, software only) `[EXPERIMENTAL]`
 
-`encode_json` (`src/devices/keyboards/apex_legacy_profile.rs`) takes a decode report and writes payload
+`encode_json` (`src/devices/keyboards/apex_7_profile.rs`) takes a decode report and writes payload
 bytes: the schema word, the name bytes, the lighting block, the META toggle key, the four mapping tables,
 the OLED pixels, the Rapid Tap pairs, the packed macro records, the GUID and its padding, and last the
 checksum it computes over the prefix - the report's stored word is never copied. Geometry comes from the
@@ -549,7 +549,7 @@ keyboard's ordinary all-zero input report, no push-specific reply. The declared 
 the report `03 00 <buffer offset u16> <size u16> <payload>` 642-byte feature writes.
 
 What this settles: the `0x05` frame layout is **measured**, not guessed (`CMD_PUSH_PAYLOAD` is named in
-`apex_legacy_profile.rs`, and the `0x85` command builder in `hid_reports` takes the same three fields).
+`apex_7_profile.rs`, and the `0x85` command builder in `hid_reports` takes the same three fields).
 What it does not settle: **`fs_id 0x0102` is a file no read pulls** (the read walks profile files
 `0x0201..0x0205` and lighting files `0x0301..0x0305`), so which file GG writes with `0x05`, and what a
 push is answered by on the device, were open until the write capture: a push is answered with

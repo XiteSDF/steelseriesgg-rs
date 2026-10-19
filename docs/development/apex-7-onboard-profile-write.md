@@ -130,13 +130,13 @@ other, 4-byte `0x6C` shape the same family uses for driver mode.
 ## What `ssgg` does
 
 `Apex7::write_profile` (via `Keyboard::write_onboard_profile`) runs the plan; the geometry, the frames and the
-pacing come from `apex_legacy_profile::write_plan` (`OnboardWritePlan`, `OnboardWriteFrame`), and the frames go
+pacing come from `apex_7_profile::write_plan` (`OnboardWritePlan`, `OnboardWriteFrame`), and the frames go
 out through the typed commands `OnboardFileOpenCommand` (`0x88`), `OnboardBufferWriteCommand` (`0x03`, feature
 report), `OnboardPayloadPushCommand` (`0x05`), `OnboardFileCommitCommand` (`0xEB`) and `OnboardProfileDeployCommand`
 (`0x89`), all built in `src/devices/hid_reports.rs`.
 
 - The payload goes through the existing encoder (`encode_json`): decode report → payload, checksum recomputed
-  at the payload tail (`apex_legacy_profile::encode_json`). `--bin` takes raw payload bytes as they are.
+  at the payload tail (`apex_7_profile::encode_json`). `--bin` takes raw payload bytes as they are.
 - The payload is zero-padded to the 40,960-byte file region - the padding GG's own session carries - and the
   40 windows are built over that image. The payload's checksum word is written **before** the padding, at
   11,692, as GG's does; no checksum is computed over the padded region.
@@ -174,7 +174,7 @@ frame for frame in report kind, wire length, order and content:
 
 `tests/fixtures/onboard-write-apex7.manifest.txt` (frame index, kind, wire length, FNV-1a-64 digest,
 head bytes, and `full=` data stage for frames 3 and 35) is the capture-derived fixture;
-`apex_legacy_profile::tests::the_write_plan_of_the_read_report_is_the_capture_write_sequence` compares the plan
+`apex_7_profile::tests::the_write_plan_of_the_read_report_is_the_capture_write_sequence` compares the plan
 against it frame by frame - report kind, wire length, head bytes, serializability, the 120 byte-identical
 frames, and the exact five payload bytes named above. The acceptance frame (window 11's push, ONBOARD 1.6's
 "that frame" - that number counts the capture's control frames from the session start, its bytes are

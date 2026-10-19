@@ -194,7 +194,7 @@ pub(crate) enum Commands {
     },
 }
 
-/// [EXPERIMENTAL] Read the on-board profile of a legacy Apex keyboard.
+/// [EXPERIMENTAL] Read the on-board profile of an Apex 7 (`0x1612`, the only board the path is enabled for).
 ///
 /// `decode` and `encode` work on files only and never touch a device. `read` talks to a keyboard: it is
 /// reverse-engineered protocol code that writes request frames to a raw device node, and it changes nothing
@@ -226,8 +226,8 @@ pub(crate) enum OnboardAction {
 }
 
 /// One on-board profile read. The flags pick the keyboard, the config number and what to do with the
-/// result; nothing on the wire is a flag. The geometry is a protocol constant of the keyboard's family (for
-/// the legacy family, `apex_legacy_profile`: 12 pulls of the device's 1024-byte resource buffer, each
+/// result; nothing on the wire is a flag. The geometry is a protocol constant of the keyboard's protocol
+/// (`apex_7_profile`: 12 pulls of the device's 1024-byte resource buffer, each
 /// drained by two 512-byte payload reads), paced like GG and read with the reply framing the reference
 /// capture shows.
 #[derive(clap::Args)]

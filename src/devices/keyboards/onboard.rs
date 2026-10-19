@@ -14,18 +14,18 @@
 //!   decode`, `ssgg onboard encode` and `ssgg onboard write --dry-run` run it on files with no keyboard
 //!   connected.
 //!
-//! One family implements them today: `apex_legacy_profile` (the legacy Apex family, `0x1612`), through
-//! [`LegacyApexOnboard`](crate::devices::keyboards::apex_legacy_profile::LegacyApexOnboard), which
-//! [`Apex7`](crate::devices::keyboards::apex7::Apex7) hands out. The report types below **are** that
-//! family's payload layout as data: the next keyboard plugs in by implementing the codec for its own
+//! One keyboard implements them today: `apex_7_profile` (Apex 7, `0x1612`), through
+//! [`Apex7Onboard`](crate::devices::keyboards::apex_7_profile::Apex7Onboard), which
+//! [`Apex7`](crate::devices::keyboards::apex_7::Apex7) hands out. The report types below **are** that
+//! layout as data: the next keyboard plugs in by implementing the codec for its own
 //! layout, extending these types where its profile has fields this one has, and registering its codec
-//! in [`codecs`]. `src/main.rs` is written against these interfaces and names no keyboard family.
+//! in [`codecs`]. `src/main.rs` is written against these interfaces and names no keyboard.
 
-use crate::devices::keyboards::apex_legacy_profile::{DEVICE_RESOURCE_BUFFER_LEN, PAYLOAD_READ_LEN, PULLS_PER_FILE};
+use crate::devices::keyboards::apex_7_profile::{DEVICE_RESOURCE_BUFFER_LEN, PAYLOAD_READ_LEN, PULLS_PER_FILE};
 use crate::error::{Error, Result};
 use serde::Serialize;
 
-pub use crate::devices::keyboards::apex_legacy_profile::{
+pub use crate::devices::keyboards::apex_7_profile::{
     KeyMapping, LightingProfile, MacroAction, MacroSummary, OnboardMacro, OnboardProfile, OnboardWriteFrame,
     OnboardWritePlan, OnboardWriteReportKind, ProfileImage, RapidTap, RapidTapPair, ReadReply, ReadStats, WriteStats,
     write_plan, write_plan_lines, write_stats,
@@ -35,7 +35,7 @@ pub use crate::devices::keyboards::apex_legacy_profile::{
 /// report the read writes. The payload layout, what can be encoded back, and which features exist are
 /// all per device, so profile bytes without a product ID do not say which board's codec produced them.
 /// A decode of a file records nothing: the file does not name a keyboard, only the schema word inside it.
-/// `[EXPERIMENTAL]`: one family records a device today (legacy Apex).
+/// `[EXPERIMENTAL]`: one keyboard records a device today (Apex 7).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OnboardDevice {
     /// USB vendor ID (every SteelSeries device answers `0x1038`).
@@ -183,7 +183,7 @@ pub trait OnboardProfileCodec: Send + Sync {
 /// [`Keyboard::onboard_codec`](crate::devices::keyboards::Keyboard::onboard_codec).
 #[must_use]
 pub fn codecs() -> Vec<&'static dyn OnboardProfileCodec> {
-    vec![&crate::devices::keyboards::apex_legacy_profile::LegacyApexOnboard]
+    vec![&crate::devices::keyboards::apex_7_profile::Apex7Onboard]
 }
 
 /// The codec of the family that knows a payload schema word.
@@ -273,10 +273,10 @@ mod tests {
 
     #[test]
     fn codec_registry_answers_the_family_that_knows_a_schema() {
-        use crate::devices::keyboards::apex_legacy_profile::{SCHEMA_A, SCHEMA_B};
+        use crate::devices::keyboards::apex_7_profile::{SCHEMA_A, SCHEMA_B};
 
         for schema in [SCHEMA_A, SCHEMA_B] {
-            let codec = codec_for_schema(schema).expect("the legacy Apex family knows its schema words");
+            let codec = codec_for_schema(schema).expect("the Apex 7 codec knows its schema words");
             assert!(codec.knows_schema(schema));
             assert_eq!(codec.config_count(), 5, "GG numbers Config 1 .. Config 5");
             assert!(codec.family_name().contains("Apex"), "{}", codec.family_name());
