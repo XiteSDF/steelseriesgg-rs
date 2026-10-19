@@ -29,7 +29,18 @@ Task: implement `ssgg onboard write` and `ssgg onboard load` commands.
 
 2. `ssgg onboard load` issues a LoadProfile command to load a profile slot specified by user. Same restrictions apply to profile slot as `ssgg onboard write`.
 
-**Result (2026-10-20: it ran on hardware - Config 1 from the payload bytes a read wrote, Config 4 from a payload the encoder wrote, and Config 4 read back byte-identical).** `ssgg onboard write` takes the decode report by
+**Result (2026-10-20: it ran on hardware - Config 1 from the payload bytes a read wrote, Config 4 from a payload the encoder wrote, and Config 4 read back byte-identical).**
+**Result of the operator's second run (2026-10-19, same keyboard, Apex 7 `0x1612`): writes from a JSON work - a
+modified report and an unmodified one, both applied - and the slot switch works both ways, the `89 <slot + 1>`
+frame the write ends with and `ssgg onboard load` on its own.** The one rough edge the operator named is
+**the deploy frame's settle time**: sent right after the `eb 01` commit it can do nothing, and a bit more waiting
+before it is what makes it land. The engine's own sequence has that settle: the `0xEB` commit path ends with an
+**input read** (`base_apex_legacy.lisp:1993-2022`), which blocks until the keyboard answers, and
+`load-profile-with-pause` sleeps 250 ms **behind** the `89` frame (`:2039-2045`; the capture shows 301 ms from
+that frame to the next). The write path sleeps nothing on either side of the deploy. The candidate follow-up is
+the engine's settle, not a longer tail: read after the commit (or sleep before the deploy), then deploy -
+recorded in `docs/development/apex-7-onboard-profile-write.md` §Not settled.
+ `ssgg onboard write` takes the decode report by
 default, `--bin` takes the payload bytes as they are, `--profile N` is mandatory (no default: a write names the slot
 it rewrites) and the frames are the capture's: `88 00 01 02` open, 40 windows of `03 00` buffer 0 +
 `03 00` buffer 512 + `05 00 01 02 <file offset> 00 04` push, `eb 01` commit, then `89 01` deploy (GG sleeps 250 ms

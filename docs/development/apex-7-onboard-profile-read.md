@@ -700,9 +700,7 @@ was dropped; 2026-10-20 the write-side `--yes` went the same way) - it is revers
 nothing on the keyboard; `decode` never touches a device. Both write the JSON decode report by default,
 named from the profile name the image carries (`Config 1` -> `config_1.json`, and GG's config number when
 a slot carries no name); `--bin FILE` writes the raw image and `--hex` hex-dumps it. `--profile` takes
-GG's config number `1..5` and addresses slot `N - 1`, the file `0x020N`. `encode` (2026-10-19,
-§Encode) writes bytes to a **file** and touches no device, and nothing in ssgg sends encoded bytes: the
-write path is not implemented, so this section's prohibition on writing a profile payload stands.
+GG's config number `1..5` and addresses slot `N - 1`, the file `0x020N`. `encode` (2026-10-19, §Encode) writes bytes to a **file** and touches no device. The device side of it is `onboard write`: a write from a JSON report runs `encode` internally, and the write path has run on hardware (2026-10-20 with `--bin` payload bytes, 2026-10-19 from a JSON report - a modified one and an unmodified one, both applied) - see `apex-7-onboard-profile-write.md`.
 
 ## What is not settled
 

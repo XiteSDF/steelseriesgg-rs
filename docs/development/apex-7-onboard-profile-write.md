@@ -155,7 +155,8 @@ report), `OnboardPayloadPushCommand` (`0x05`), `OnboardFileCommitCommand` (`0xEB
   interrupt reports against 750 payload reads).
 - The lighting files, driver mode, OLED, volatile, firmware polls and pacing frames are not sent. The write
   touches one profile file and, at the end, deploys that slot (`89 <slot + 1>` right after the commit - the
-  engine sleeps 250 ms behind the deploy frame, the write path does not, ONBOARD step 1.4).
+  engine sleeps 250 ms behind the deploy frame, the write path does not, ONBOARD step 1.4). The deploy frame
+  works on hardware, in the write's own sequence and through `ssgg onboard load` alone.
 - There is no confirmation gate: `onboard write` and `onboard load` send when asked (`--yes` was dropped
   2026-10-20; asking for the command is the authorisation). `--dry-run` is the mode that sends nothing.
 
@@ -207,7 +208,17 @@ that frame - looked like one that answers nothing.
 - **Read-back is the only check, and the encoder path passed it once.** A written profile is seen through the read
   path: on 2026-10-20 a slot written from encoder-written payload bytes read back byte for byte. A slot written from a
   report edited in `tools/profile-gui` has not been read back, nor has the byte-exact `--bin` write of a slot that
-  carries its own region bytes.
+  carries its own region bytes. The 2026-10-19 run answered the wider question - a write from a JSON report, a
+  **modified** one and an unmodified one, both applied and the keyboard runs them - so an edited report writes and
+  takes effect; a byte-level read-back of a GUI-edited report is still the open half of that check.
+- **The deploy frame needs a settle before it** (operator report 2026-10-19, and the mechanism is in the lisp):
+  `89 <slot + 1>` sent immediately after `eb 01` can do nothing, and waiting a little longer before it is what
+  makes the keyboard switch. The engine has a settle the write path does not: its commit path ends with an **input
+  read** (`base_apex_legacy.lisp:1993-2022`) that blocks until the keyboard answers, and `load-profile-with-pause`
+  sleeps 250 ms **behind** the deploy frame (`:2039-2045`; the capture shows 301 ms from that frame to the next
+  frame of the session). The write path sleeps nothing on either side. Unmeasured: how long the commit needs,
+  whether a pre-deploy sleep or a post-commit read is what the keyboard is waiting for, and whether a deploy
+  frame that lands early is dropped by the device or answered.
 - **Sent to a keyboard, not measured frame by frame.** The write frames ran on hardware 2026-10-20; the write path
   reads only the `88 01 …` and `05 01 …` answers it counts, and the per-frame latency of our own pacing (7.1 ms, the
   100 ms every 32 frames) has never been measured from `ssgg`.

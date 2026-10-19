@@ -743,6 +743,18 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   that region back to the device and an encoder-written payload leaves it zeros. **Reverted here**: keeping "no
   frame has ever been replayed on a keyboard" in the prose after the family's write ran.
 
+- 2026-10-19 (**writes from a JSON work on hardware, and the slot switch works**, operator report, Apex 7
+  `0x1612`): `ssgg onboard write` ran from a decode report as input - **a modified report and an unmodified one,
+  both applied** - and the slot switch landed both ways: the `89 <slot + 1>` frame the write ends with, and
+  `ssgg onboard load` on its own. ONBOARD steps 1 and 1.4 are answered on hardware this way (the write takes the
+  JSON the read's `--out` writes, and the deploy after a write runs the slot). The rough edge the operator named
+  is the deploy frame's settle: sent straight after `eb 01` it can do nothing, and a bit more waiting before it is
+  what makes it land - which is what the engine's own sequence has and ours does not: the commit path ends with an
+  input read that blocks (`base_apex_legacy.lisp:1993-2022`) and `load-profile-with-pause` sleeps 250 ms behind the
+  deploy frame (`:2039-2045`, 301 ms to the next frame on the wire). **Open item, not implemented**: the engine's
+  settle (a read after the commit, or a sleep before the deploy) and its length.
+  **Reverted here**: a deploy frame the write sends with no settle on either side of it.
+
 - 2026-10-19 (**a poll loop's attempts never applied**, user-reported): `read_profile_input_packet` answered the
   interrupt-endpoint read's timeout as `Err(DeviceCommunication("no input report within 50 ms"))`, and both poll
   loops - the read's input-report collection and `read_protocol_report`, which the write's `await_write_ack` waits
