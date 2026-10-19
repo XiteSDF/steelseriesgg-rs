@@ -319,7 +319,9 @@ Four facts come off that:
   field as derived from the META layer, not as an independent setting. The GUI therefore shows it read-only
   and writes the derived bytes; a stock read's mask is the five default META bindings - the four
   F9-F12 usages `0x42-0x45` and LWin `0xE3`.
-  `[EXPERIMENTAL]` measured in reads only; nothing of it has been sent to a keyboard.
+  `[EXPERIMENTAL]` measured in reads only; nothing of it has been sent to a keyboard. The operator
+  accepted this rule and the Lock Win / META toggle split on 2026-10-20 as the page's behaviour
+  ("confirmed working"); it is not hardware evidence, and the status line above is unchanged.
 - **The rest of the META layer's `0x62` entries are GG's own defaults**, not the toggle: slots 72, 80,
   88 and 96 (usages `0x42`-`0x45` = F9-F12) carry `01 00 00 00`, `02 01 00 00`, `03 01 00 00`,
   `04 01 00 00`. That is why a stock slot read classifies as `meta: 6 custom` - the toggle slot plus

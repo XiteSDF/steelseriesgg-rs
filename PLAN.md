@@ -275,7 +275,8 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   stored bytes bit-for-bit in 8 of the 9 reports it decodes; the 9th (`config_1-copy.json`) is a GUI-edited
   file whose mask is stale - GG treats the field as derived. The Lighting panel's row is read-only, shows
   the derived bytes and how far the read's bytes are from them, and `serializeDoc` writes the derived mask
-  while the open document keeps what the read carried. GUI suite 195 tests. Facts in the read doc §the META
+  while the open document keeps what the read carried. GUI suite 195 tests. Operator-accepted on
+  2026-10-20 as the page's behaviour ("confirmed working") - not hardware evidence. Facts in the read doc §the META
   section. `[EXPERIMENTAL]` read-side only: the Rust write sends the JSON's bytes as they are and no mask
   has been sent to a keyboard; deriving the mask in the Rust codec is open work.
 - 2026-10-20: **the GUI binding window keeps Lock Win and the META toggle apart** (operator report of
