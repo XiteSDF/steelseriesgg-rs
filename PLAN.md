@@ -275,10 +275,13 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   stored bytes bit-for-bit in 8 of the 9 reports it decodes; the 9th (`config_1-copy.json`) is a GUI-edited
   file whose mask is stale - GG treats the field as derived. The Lighting panel's row is read-only, shows
   the derived bytes and how far the read's bytes are from them, and `serializeDoc` writes the derived mask
-  while the open document keeps what the read carried. GUI suite 195 tests. Operator-accepted on
-  2026-10-20 as the page's behaviour ("confirmed working") - not hardware evidence. Facts in the read doc §the META
-  section. `[EXPERIMENTAL]` read-side only: the Rust write sends the JSON's bytes as they are and no mask
-  has been sent to a keyboard; deriving the mask in the Rust codec is open work.
+  while the open document keeps what the read carried. GUI suite 195 tests.
+  **Verified on hardware 2026-10-20** (operator: the write carrying the derived mask applied, the META
+  lighting followed the META-layer bindings, the toggle key left out, and the Lock Win / toggle split
+  behaved apart; the profile file used in that run was not recorded). Facts in the read doc §the META
+  section. **Derivation stays in the page by the operator's decision (2026-10-20)**: `encode` sends the
+  mask the JSON carries verbatim, and that is not backlog - a write from a hand-edited JSON or a `.bin`
+  keeps its own bytes.
 - 2026-10-20: **the GUI binding window keeps Lock Win and the META toggle apart** (operator report of
   2026-10-19: `0x05` is Lock Win and was acting as the toggle). The Meta action select lists the six
   actions of function `0x62` (`01` Profile Switch, `02` Macro, `03` Brightness Down, `04` Brightness Up,

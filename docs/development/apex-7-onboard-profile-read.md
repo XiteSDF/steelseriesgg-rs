@@ -241,7 +241,7 @@ Block layout, in the order the Windows engine's decoder walks the payload:
 |-------:|-------|--------|
 | 0 | schema word (u16) | confirmed |
 | 2 | profile name, 24 bytes | engine decoder |
-| 27 | lighting block, 57 bytes (lock/meta/win colours, dimmers, idle mode and timeout, three lock-key HID codes, the 32-byte META mapping mask at `27 + 15 = 42`, OLED illumination options, 6 trailing reserved bytes) | engine decoder, layout `[EXPERIMENTAL]` |
+| 27 | lighting block, 57 bytes (lock/meta/win colours, dimmers, idle mode and timeout, three lock-key HID codes, the 32-byte META mapping mask at `27 + 15 = 42` - a derived mask of bound META-layer keys, verified on hardware 2026-10-20, §the META section, OLED illumination options, 6 trailing reserved bytes) | engine decoder, layout `[EXPERIMENTAL]` |
 | 84 | META toggle HID code | engine decoder, measured value in every read decoded so far: `0xF0` - see §The META toggle is a byte and a binding |
 | 85 | 128 button mappings, **5-byte** entries (`key_mapping`: function byte + 4 key codes) | engine struct, verified on hardware |
 | 725 | 2 wheel mappings, 5-byte entries | engine struct |
@@ -319,9 +319,13 @@ Four facts come off that:
   field as derived from the META layer, not as an independent setting. The GUI therefore shows it read-only
   and writes the derived bytes; a stock read's mask is the five default META bindings - the four
   F9-F12 usages `0x42-0x45` and LWin `0xE3`.
-  `[EXPERIMENTAL]` measured in reads only; nothing of it has been sent to a keyboard. The operator
-  accepted this rule and the Lock Win / META toggle split on 2026-10-20 as the page's behaviour
-  ("confirmed working"); it is not hardware evidence, and the status line above is unchanged.
+  **Verified on hardware (2026-10-20, Apex 7 `0x1612` wired, operator-confirmed):** a write carrying
+  the derived mask was applied and the keyboard's META lighting followed the META-layer bindings, with
+  the key `meta_toggle_hid` names left out, and the Lock Win / META toggle split behaved as separate
+  options. Not recorded: which profile file the run wrote and the exact lit pattern. The rule is derived
+  **in the page only** by the operator's decision the same day: `apex_7_profile::encode` sends the mask
+  the JSON carries verbatim and does not compute it, so a write from a hand-edited JSON or a `.bin`
+  carries whatever bytes that source has.
 - **The rest of the META layer's `0x62` entries are GG's own defaults**, not the toggle: slots 72, 80,
   88 and 96 (usages `0x42`-`0x45` = F9-F12) carry `01 00 00 00`, `02 01 00 00`, `03 01 00 00`,
   `04 01 00 00`. That is why a stock slot read classifies as `meta: 6 custom` - the toggle slot plus
