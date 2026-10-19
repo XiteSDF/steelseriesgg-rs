@@ -44,7 +44,7 @@ use crate::devices::hid_reports::{
 use crate::devices::key_mapping::{KeyId, KeyMapping};
 use crate::devices::product_ids;
 use crate::devices::zone_mapping::{ZoneEffect, ZoneMapping};
-use crate::devices::{Device, DeviceType, device_name_from_product_id, known_product_id};
+use crate::devices::{Device, DeviceType, device_name_from_product_id};
 use crate::error::{Error, Result};
 use crate::rgb::{Color, PerKeyEffect};
 
@@ -208,10 +208,8 @@ impl Apex7 {
         // the feature set are all per device, so a profile file has to name its model.
         let info = self.info();
         image.device = Some(OnboardDevice {
-            vendor_id: info.vendor_id,
             product_id: info.product_id,
             product: device_name_from_product_id(info.product_id).to_string(),
-            known: known_product_id(info.product_id),
         });
         Ok(image)
     }
@@ -676,10 +674,13 @@ impl Device for Apex7 {
 
 // Delegate Keyboard trait; the on-board profile methods are this device's own.
 crate::impl_keyboard_with_delegation!(Apex7, {
+    /// This class answers the Apex 7 codec, and discovery builds this class only for the Apex 7 collection
+    /// (`usage_page 0xFFC0, usage 0x9F` with product ID `0x1612`) - the board the protocol was captured on and
+    /// measured on. That is the whole on-board scope: the `0x1614` / `0x1616` / `0x1618` boards GG lists on this
+    /// platform are built as their own classes and answer no codec, so a file's recorded product ID is checked
+    /// by the class that reads it, not by a product-ID table the codec keeps.
     fn onboard_codec(&self) -> Option<&'static dyn OnboardProfileCodec> {
-        Apex7Onboard
-            .knows_product(self.inner.info().product_id)
-            .then_some(&Apex7Onboard)
+        Some(&Apex7Onboard)
     }
 
     async fn read_onboard_profile(&self, profile: u8) -> Result<ProfileImage> {
@@ -765,29 +766,13 @@ mod tests {
         fn only_the_apex_7_gets_the_read() {
             let apex_7 = device_without_handle(product_ids::APEX_7);
             assert!(Apex7::supports_onboard_profile(&apex_7));
-            // The codec answers which product IDs its protocol is known from, and the device answers
-            // `supports_onboard_profile` through it: a keyboard the codec does not know answers no codec, and
-            // a profile JSON naming a board outside that list was written by a keyboard this codec is not.
-            assert!(Apex7Onboard.knows_product(product_ids::APEX_7));
-            for pid in [
-                product_ids::APEX_PRO,
-                product_ids::APEX_PRO_TKL,
-                product_ids::APEX_150,
-                product_ids::APEX_7_TKL,
-                product_ids::APEX_3,
-                product_ids::APEX_7_2024,
-                product_ids::APEX_PRO_TKL_2023,
-                0xFFFF,
-            ] {
-                assert!(
-                    !Apex7Onboard.knows_product(pid),
-                    "PID {pid:#06x} has no hardware here, so its frames are not known"
-                );
-                assert!(
-                    !Apex7::supports_onboard_profile(&device_without_handle(pid)),
-                    "PID {pid:#06x} answers no on-board codec"
-                );
-            }
+            // The Apex 7 class answers the codec; every other keyboard class answers none, which is the
+            // scope statement in code: discovery builds this class for the captured board's collection alone.
+            assert!(Apex7::supports_onboard_profile(&apex_7));
+            assert!(matches!(
+                apex_7.onboard_codec().map(|codec| codec.family_name()),
+                Some(name) if name == "Apex 7"
+            ));
         }
 
         #[test]

@@ -512,14 +512,6 @@ pub fn device_type_from_product_id(product_id: u16) -> DeviceType {
     }
 }
 
-/// Whether this crate's product registry lists this product ID. The name lookup below answers its
-/// fallback string for an ID it does not list, and a record that names a keyboard has to say which of
-/// the two it got, so the number is trusted and the name is labelled.
-#[must_use]
-pub fn known_product_id(product_id: u16) -> bool {
-    !matches!(device_type_from_product_id(product_id), DeviceType::Unknown)
-}
-
 /// Get device name from product ID.
 pub fn device_name_from_product_id(product_id: u16) -> &'static str {
     use product_ids::*;

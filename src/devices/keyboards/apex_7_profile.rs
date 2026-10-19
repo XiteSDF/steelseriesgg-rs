@@ -2100,22 +2100,6 @@ impl OnboardProfileCodec for Apex7Onboard {
         ]
     }
 
-    /// The board this protocol is known from: the Apex 7 (`0x1612`), the one it was captured on and measured
-    /// on. This is the on-board scope, and the only place it is stated:
-    /// [`Apex7::onboard_codec`](crate::devices::keyboards::apex_7::Apex7) answers this question and
-    /// [`Keyboard::supports_onboard_profile`](crate::devices::keyboards::Keyboard::supports_onboard_profile)
-    /// reports it, and discovery never asks it - every keyboard discovery builds is a keyboard with its
-    /// lighting path.
-    ///
-    /// GG's firmware registry puts three more boards on this platform (`0x1614` `apex_pro_tkl`, `0x1616`
-    /// `apex_150`, `0x1618` `apex_7_tkl`, `lisp/base_apex_legacy.lisp:6`) and `apex_7.lisp` drives them the
-    /// same way, which is protocol evidence, not support: none of them has hardware here and none has ever
-    /// answered one of our frames, so each needs its own codec, payload layout and encodable feature set
-    /// before it is enabled.
-    fn knows_product(&self, product_id: u16) -> bool {
-        product_id == crate::devices::product_ids::APEX_7
-    }
-
     fn config_count(&self) -> u8 {
         MAX_PROFILE_INDEX + 1
     }
@@ -2212,17 +2196,7 @@ fn image_lines(image: &ProfileImage, label: &str) -> Vec<String> {
     let mut lines = vec![
         format!("read {} profile bytes from {label}", image.data.len()),
         match image.device.as_ref() {
-            Some(device) => format!(
-                "device:  {}{known} (vendor {:04X}, product {:04X})",
-                device.product,
-                device.vendor_id,
-                device.product_id,
-                known = if device.known {
-                    String::new()
-                } else {
-                    " - product ID not in this crate's registry".to_string()
-                },
-            ),
+            Some(device) => format!("device:  {} (product {:04X})", device.product, device.product_id),
             None => "device:  not recorded".to_string(),
         },
         match image.firmware.as_deref() {
@@ -2255,10 +2229,7 @@ fn profile_lines(profile: &OnboardProfile) -> Vec<String> {
 
     let mut lines = vec![
         match profile.device.as_ref() {
-            Some(device) => format!(
-                "device:  {} (vendor {:04X}, product {:04X})",
-                device.product, device.vendor_id, device.product_id
-            ),
+            Some(device) => format!("device:  {} (product {:04X})", device.product, device.product_id),
             None => "device:  not recorded (decoded from a file, which names no keyboard)".to_string(),
         },
         format!("schema: {} (0x{:04X})", profile.schema_name, profile.schema),
@@ -3511,10 +3482,8 @@ mod tests {
 
         let mut stamped = profile.clone();
         stamped.device = Some(OnboardDevice {
-            vendor_id: crate::devices::STEELSERIES_VENDOR_ID,
             product_id: crate::devices::product_ids::APEX_7,
             product: crate::devices::device_name_from_product_id(crate::devices::product_ids::APEX_7).to_string(),
-            known: crate::devices::known_product_id(crate::devices::product_ids::APEX_7),
         });
         let text = profile_json(&stamped).expect("the stamped report serializes");
         let value: serde_json::Value = serde_json::from_str(&text).expect("the stamped report parses");
@@ -3523,17 +3492,11 @@ mod tests {
             .map(|object| object.keys().cloned().collect::<Vec<_>>());
         assert_eq!(
             keys,
-            Some(vec![
-                "known".to_string(),
-                "product".to_string(),
-                "product_id".to_string(),
-                "vendor_id".to_string(),
-            ]),
+            Some(vec!["product".to_string(), "product_id".to_string()]),
             "serde_json parses objects sorted"
         );
         assert_eq!(value["device"]["product_id"], serde_json::json!(0x1612));
         assert_eq!(value["device"]["product"], serde_json::json!("Apex 7"));
-        assert_eq!(value["device"]["known"], serde_json::json!(true));
         assert_eq!(
             encode_json(&text).expect("a device block does not stop the encoder"),
             data,

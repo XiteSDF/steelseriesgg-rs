@@ -20,9 +20,10 @@ with its `FirmwareSource` byte, `OnboardDriverModeCommand`, `OnboardProfileDeplo
 (`write_profile_packet` for output frames - not `send_report`, whose write dedups: see "Write path" below -
 `send_feature`, `read_profile_feature_packet`, `read_profile_input_packet`), `ssgg onboard` (`src/cli.rs`, `src/main.rs`), and the interfaces the CLI runs on: `src/devices/keyboards/onboard.rs` (2026-10-19). Discovery builds `Apex7` from the keyboard's HID collection and product ID - it never asks the on-board
 question (the catch-all arm that wrapped on-board-capable product IDs in `Apex7` is deleted 2026-10-19), so every
-keyboard the manager enumerates is a keyboard with its lighting path. The on-board scope is stated once, on the
-codec: `Apex7Onboard::knows_product` = `0x1612`, the board the frames were captured on and measured on;
-`Apex7::onboard_codec` asks it and `Keyboard::supports_onboard_profile` reports it. The read path
+keyboard the manager enumerates is a keyboard with its lighting path. The on-board scope is stated once, in the device
+class: `Apex7` answers the codec, and discovery builds `Apex7` for the captured collection alone (`usage_page
+0xFFC0, usage 0x9F` with product ID `0x1612`, the board the frames were captured on and measured on).
+`Keyboard::supports_onboard_profile` is `onboard_codec().is_some()`, and that is the gate. The read path
 (transport, read plan, `Keyboard::read_onboard_profile`) is core code, labelled `[EXPERIMENTAL]`, as are the report builders.
 
 The interfaces (2026-10-19) are per keyboard family: `Keyboard::onboard_codec` answers *which family protocol a
@@ -158,11 +159,14 @@ per chunk from the typed commands, nothing materialises a transfer list (`Step`,
 writes for the same image (the format `tools/profile-gui` opens); `--report FILE` adds the per-pull read
 record (chunk headers, framing stats, image hash) and `--bin FILE` the raw image bytes.
 
-The decoded report names the keyboard it came from in its `device` block (`vendor_id`, `product_id`,
-`product`, `known`): a read stamps the product ID it ran on, a decode of a file records nothing. The GUI
+The decoded report names the keyboard it came from in its `device` block (`product_id`, `product`): a read
+stamps the product ID it ran on, a decode of a file records nothing. Two fields, not four: every SteelSeries
+device answers the same vendor ID `0x1038`, so the product ID identifies the model alone, and the model name is
+derivable from it, so a record that carries both carries no redundancy. A model this crate's registry does not
+list is labelled by that name - a reader trusts the number. The GUI
 shows a model **name** for that number, and takes it from Rust rather than from the file:
 `tools/profile-gui/sync-products.mjs` parses `pub mod product_ids`, `device_name_from_product_id` and
-`device_type_from_product_id` (`src/devices/mod.rs`), the on-board scope `Apex7Onboard::knows_product` (`apex_7_profile.rs`) and the `codecs()`
+`device_type_from_product_id` (`src/devices/mod.rs`) and the `codecs()`
 registry (`onboard.rs`) into `tools/profile-gui/products.generated.js`, which `index.html` loads before
 `app.js` (2026-10-19). The registry's name for the recorded ID wins over the `product` string the file
 carries - the crate's own rule, trust the number and not the name - and the same import carries the

@@ -625,6 +625,38 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   (`= onboard_codec().is_some()`), which is the gate `open_onboard_keyboard` and `onboard read --device <pid>`
   use. `onboard_capable` and `Apex7::supports_onboard` are deleted as duplicates of that one report.
 
+- 2026-10-19 (probe: the `6c 00 01` frame is answered on interrupt EP2, and it is not the read's pacing):
+  sent to the live Apex 7 - 3 copies of `6c 00 01` (feature, EP0 path) and 3 of `6c 01 01` (output) - the
+  device answered **every copy with `81 01` on interrupt EP2** (24 bytes, the rest zero). So the frame the
+  engine's profile sessions use for pacing gets an ack, and the ack is an **interrupt report, not a feature
+  report**: it is the same report the read's pulls answer on, on the same endpoint. Two facts about it:
+  `0x6c` is **not** a HID report ID (report 68 on this board is a 64-byte output report; the engine sent it
+  as a feature report ID 0, like it does with `80`), and the read's pacing frames are **not** the gap between
+  the pulls - all 40 `6c`-family frames of a GG read sit in the session's first 43 ms, with a ~50 ms gap
+  between the pulls and no frame in it; the `6c 01 01` stream runs at ~2 ms intervals and stops when GG stops.
+  `6c 00 01` closes the session. Nothing in the read is time-limited: a pull is answered by its own reply.
+  **Reverted here**: the `read_pacing: 1 ms` field (it was a name for a GG frame I had mis-assigned to the
+  read's 50 ms gap, and it drove a sleep after every pull, and it printed `1 ms` in read output as a
+  protocol property of a frame nobody has measured the interval on).
+
+- 2026-10-19 (scope change): `onboard_capable` is deleted (2026-10-19) - `Keyboard::supports_onboard_profile`
+  is the one report a keyboard makes about reading a profile off the board (`onboard_codec().is_some()`,
+  which is the codec's `knows_product` answer for this device's product ID), and `discovery` never asked the
+  question anyway: `open_keyboard` decides the keyboard class from the collection and product ID, the class
+  decides what it can read. A keyboard the manager enumerates is a keyboard with its lighting path, whatever
+  it can read off the board. `docs/development/adding-hardware.md` (the `Onboard-capable keyboards` section
+  and the checklist row), `ONBOARD.md` and the read doc follow. **Reverted here**: moving `onboard_capable`
+  into `keyboards/onboard.rs` as a shared predicate - the user redirected it to deletion, because it was the
+  same rule as `supports_onboard_profile` written in two places.
+
+- 2026-10-19 (the device record is two fields): `OnboardDevice` keeps `product_id` + `product`; `vendor_id`
+  (every SteelSeries device answers `0x1038`) and the `known` flag go, and with them `devices::known_product_id`
+  and the codec's `knows_product` - a record with the model name already carries the registry's reading of the
+  number, and the on-board scope lives in the device class (`Apex7` answers the codec; discovery builds `Apex7`
+  for `0xffc0/0x9f` + `0x1612`, the board the frames were measured on), not in a product-ID table a codec keeps.
+  The decode report's device line reads `Apex 7 (product 1612)`. **Reverted here**: keeping a per-codec product
+  ID table as the scope statement, and the registry-known flag as a label on the name.
+
 ## Reference projects
 
 - Apex RGB: OpenRGB `SteelSeriesApex8ZoneController`
