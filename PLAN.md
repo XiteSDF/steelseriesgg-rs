@@ -751,8 +751,11 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   is the deploy frame's settle: sent straight after `eb 01` it can do nothing, and a bit more waiting before it is
   what makes it land - which is what the engine's own sequence has and ours does not: the commit path ends with an
   input read that blocks (`base_apex_legacy.lisp:1993-2022`) and `load-profile-with-pause` sleeps 250 ms behind the
-  deploy frame (`:2039-2045`, 301 ms to the next frame on the wire). **Open item, not implemented**: the engine's
-  settle (a read after the commit, or a sleep before the deploy) and its length.
+  deploy frame (`:2039-2045`, 301 ms to the next frame on the wire). **Implemented the same day**: the deploy is
+  sent after a 250 ms settle in front of it - `apex_7_profile::DEPLOY_SETTLE_MS`, slept by `Apex7::deploy_frame`, so
+  it covers the write's own deploy and `ssgg onboard load`; the `--dry-run` plan line names it and
+  `the_deploy_settle_is_the_engine_pause_number_and_the_plan_names_it` pins the number and that the settle is a wait,
+  never a frame. Unmeasured: the settle the keyboard needs, and whether the engine's post-commit read is the mechanism.
   **Reverted here**: a deploy frame the write sends with no settle on either side of it.
 
 - 2026-10-19 (**a poll loop's attempts never applied**, user-reported): `read_profile_input_packet` answered the

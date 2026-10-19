@@ -301,6 +301,10 @@ impl Apex7 {
             }
         }
 
+        // Give time for the profile to settle before switching, this is the same as GG.
+        std::thread::sleep(Duration::from_millis(
+            crate::devices::keyboards::apex_7_profile::DEPLOY_SETTLE_MS,
+        ));
         self.deploy_frame(profile)?;
         Ok(stats)
     }
@@ -318,10 +322,7 @@ impl Apex7 {
         validate_profile(profile)?;
         self.deploy_frame(profile)
     }
-    /// Sends the profile deploy frame (0x89) and reads nothing back.
-    ///
-    /// `[EXPERIMENTAL]`: the engine's deploy API sleeps 250 ms behind this frame; the capture shows no frame
-    /// and no reply after it, so this sends the frame and returns.
+    /// Sends the profile deploy frame (0x89) and reads nothing back
     fn deploy_frame(&self, profile: u8) -> Result<()> {
         self.write_output_command(OnboardProfileDeployCommand { profile })
             .map_err(|e| self.frame_error("deploy", &format!("slot {profile}"), e))

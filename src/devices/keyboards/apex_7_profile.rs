@@ -181,6 +181,17 @@ pub const READ_REPLY_HEADER_LEN: usize = 5;
 /// probe accepted 6. There is no CLI knob for it (the `--reply-header` option was removed 2026-10-17):
 /// a keyboard that anchors its payload elsewhere is a change of this constant, not an option.
 pub const READ_REPLY_FRAMING_LEN: usize = 0;
+/// Settle in front of the profile **deploy** frame (`0x89`), in milliseconds.
+///
+/// `[EXPERIMENTAL]`: measured on hardware by the operator on 2026-10-19 on an Apex 7 `0x1612` - the deploy frame
+/// sent straight after the commit (`eb 01`) can do nothing, and a bit more waiting **before** it is what makes the
+/// keyboard switch slots. The engine's own sequence has settles this path did not: its commit path ends with an
+/// **input read** that blocks until the keyboard answers (`base_apex_legacy.lisp:1993-2022`), and
+/// `load-profile-with-pause` sleeps 250 ms **behind** the deploy frame (`:2039-2045`; the write capture shows 301 ms
+/// from that frame to the session's next frame). 250 ms is the engine's own number; the keyboard's need for a settle
+/// **before** the frame is the hardware observation, and how much the device needs is not measured.
+pub const DEPLOY_SETTLE_MS: u64 = 250;
+
 /// Median gap between two device replies during a GG profile read in the reference capture, in
 /// milliseconds: the fixed pacing between our own transfers. (GG's opening-chain frames are 11 ms apart;
 /// this read replays none of them. `--gap-ms` is gone, so this constant is the pacing.)
@@ -542,7 +553,9 @@ pub fn write_plan_lines(plan: &OnboardWritePlan) -> Vec<String> {
             .map(|(n, frame)| format!("  frame {:>3}  {}", n + 1, frame.line())),
     );
     lines.push(format!(
-        "then 89 {:02X} (deploy slot {}) - the engine sleeps 250 ms behind this frame, the write path does not",
+        "then 89 {:02X} (deploy slot {}) after a {DEPLOY_SETTLE_MS} ms settle - the engine sleeps 250 ms behind \
+         this frame and its commit path ends with an input read; the settle in front of the frame is the hardware \
+         fix of 2026-10-19: sent straight after the commit, the frame can do nothing",
         plan.profile + 1,
         plan.profile
     ));
@@ -2202,9 +2215,11 @@ impl OnboardProfileCodec for Apex7Onboard {
             "  answers: 88 01 … after the open, 05 01 … after every push; the writes and the commit are not \
              answered"
                 .to_string(),
-            "  89 <slot + 1> deploys the slot right after the commit (the engine sleeps 250 ms behind it, \
-             the write path does not); no 6c driver-mode frame and no HIDCONFIG pacing write is sent"
-                .to_string(),
+            format!(
+                "  89 <slot + 1> deploys the slot after a {DEPLOY_SETTLE_MS} ms settle (the engine sleeps 250 ms \
+                 behind it and its commit path ends with an input read); no 6c driver-mode frame and no HIDCONFIG \
+                 pacing write is sent"
+            ),
         ]
     }
 
@@ -3831,6 +3846,38 @@ mod tests {
     /// payload bytes - the `88 00` open, the 40 `05 00` pushes, the `eb` commit - are byte-identical to
     /// the capture. The 80 buffer writes carry payload bytes, so their content is the operator's
     /// acceptance: see the ignored test below.
+    /// The deploy frame's settle: the engine's own pause number, the frame list carries no settle (it is a
+    /// wait, not a transfer), and the plan a `--dry-run` prints names it - a plan that prints 122 frames and
+    /// sends a frame the keyboard needs a settle for must say so.
+    ///
+    /// `[EXPERIMENTAL]`: the settle is hardware-measured (operator, 2026-10-19, Apex 7 `0x1612`): `89` straight
+    /// after `eb 01` can do nothing, and waiting a little longer before it is what lands the switch. The engine
+    /// sleeps 250 ms behind the deploy frame and its commit path ends with an input read
+    /// (`base_apex_legacy.lisp:2039-2045`, `:1993-2022`).
+    #[test]
+    fn the_deploy_settle_is_the_engine_pause_number_and_the_plan_names_it() {
+        assert_eq!(
+            DEPLOY_SETTLE_MS, 250,
+            "250 ms is load-profile-with-pause's own pause (base_apex_legacy.lisp:2039-2045)"
+        );
+        let payload = vec![0u8; PAYLOAD_LEN_B];
+        let plan = write_plan(0, &payload).expect("a payload-length image plans a write");
+        assert_eq!(
+            plan.frames
+                .iter()
+                .filter(|frame| frame.line().contains("deploy"))
+                .count(),
+            0,
+            "the settle is a wait in front of the deploy frame, never a frame of the plan"
+        );
+        let lines = write_plan_lines(&plan);
+        let last = lines.last().expect("the plan text ends with the deploy line");
+        assert!(
+            last.contains(&format!("after a {DEPLOY_SETTLE_MS} ms settle")),
+            "the dry-run plan names the settle the send path takes, got: {last}"
+        );
+    }
+
     #[test]
     fn the_write_plan_frames_are_the_capture_sequence() {
         let gg = gg_write_frames();

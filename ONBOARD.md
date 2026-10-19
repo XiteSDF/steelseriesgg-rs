@@ -37,9 +37,10 @@ frame the write ends with and `ssgg onboard load` on its own.** The one rough ed
 before it is what makes it land. The engine's own sequence has that settle: the `0xEB` commit path ends with an
 **input read** (`base_apex_legacy.lisp:1993-2022`), which blocks until the keyboard answers, and
 `load-profile-with-pause` sleeps 250 ms **behind** the `89` frame (`:2039-2045`; the capture shows 301 ms from
-that frame to the next). The write path sleeps nothing on either side of the deploy. The candidate follow-up is
-the engine's settle, not a longer tail: read after the commit (or sleep before the deploy), then deploy -
-recorded in `docs/development/apex-7-onboard-profile-write.md` §Not settled.
+that frame to the next). **Implemented the same day**: the deploy frame is sent after a settle in front of it,
+`DEPLOY_SETTLE_MS` = 250 ms (`apex_7_profile`, slept by `Apex7::deploy_frame`, so it applies to the write's own
+deploy and to `ssgg onboard load`), and the `--dry-run` plan line names the settle. How long the keyboard actually
+needs, and whether the engine's post-commit input read is the real mechanism, stay unmeasured.
  `ssgg onboard write` takes the decode report by
 default, `--bin` takes the payload bytes as they are, `--profile N` is mandatory (no default: a write names the slot
 it rewrites) and the frames are the capture's: `88 00 01 02` open, 40 windows of `03 00` buffer 0 +
@@ -48,7 +49,7 @@ behind that frame; the write path does not).
 The geometry is the keyboard family's (`OnboardProfileCodec::write_plan`, `FILE_BLOCKS` of `apex_7.lisp:217` and the
 engine write API `base_apex_legacy.lisp:1993-2022`), the pacing is the capture's (7.1 ms average per frame, the
 100 ms the engine inserts every 32 frames, 5 ms of answer drain after each push; the engine's 250 ms sleep behind
-the deploy frame is not slept), and a
+the deploy frame is settled 250 ms in front of the frame, DEPLOY_SETTLE_MS), and a
 write answers `88 01 …` after the open and `05 01 …` after every push (202/202 in the capture; buffer writes and the
 commit are not answered). 1.6 is met: the plan of `config_1.json` byte-equals the capture's frames, its frame 103 is
 the capture's frame 103 (`05 00 01 …`, file offset 33792), and a 12,288-byte image plans the
