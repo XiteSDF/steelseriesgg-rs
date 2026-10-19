@@ -273,7 +273,9 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   own HID usage: set for every key whose META-layer entry carries a binding (function byte != 0), not set
   for the key `meta_toggle_hid` names, and the wheel is never in it. The GUI's computation reproduces the
   stored bytes bit-for-bit in 8 of the 9 reports it decodes; the 9th (`config_1-copy.json`) is a GUI-edited
-  file whose mask is stale - GG treats the field as derived. The Lighting panel's row is read-only, shows
+  file carrying one META binding more than a stock read, and the bit that binding needs is the difference -
+  GG treats the field as derived. Its stored bytes are now the derived ones, written by this page's own save
+  on 2026-10-20, so the stale sample no longer exists on disk (the suite measures the extra bit instead). The Lighting panel's row is read-only, shows
   the derived bytes and how far the read's bytes are from them, and `serializeDoc` writes the derived mask
   while the open document keeps what the read carried. GUI suite 195 tests.
   **Verified on hardware 2026-10-20** (operator: the write carrying the derived mask applied, the META

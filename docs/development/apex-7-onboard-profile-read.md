@@ -315,8 +315,10 @@ Four facts come off that:
   reproduces the stored bytes in **8 of the 9 reports it decodes** - `sample-identity`, `sample-remap`,
   `sample-macros`, `config_1`, `config_3` (both stored versions), `some_rebounds.json` and
   `some_rebounds_prev.json`. The ninth, `config_1-copy.json`, is a file edited on this page: its mask is
-  the read's stale bytes and misses the binding that edit added - direct evidence that GG treats the
-  field as derived from the META layer, not as an independent setting. The GUI therefore shows it read-only
+  the read's stale bytes and missed the binding that edit added - direct evidence that GG treats the
+  field as derived from the META layer, not as an independent setting. That file now carries the derived
+  bytes: this page's own write re-derived them when the operator saved it (2026-10-20 00:57) - the same
+  bit, gained. The GUI therefore shows it read-only
   and writes the derived bytes; a stock read's mask is the five default META bindings - the four
   F9-F12 usages `0x42-0x45` and LWin `0xE3`.
   **Verified on hardware (2026-10-20, Apex 7 `0x1612` wired, operator-confirmed):** a write carrying
