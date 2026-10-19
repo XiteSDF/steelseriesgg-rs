@@ -195,6 +195,13 @@ fixture header and asserted by the test. The decode line (`Config 1`, schema `0x
 measurements were read from the reassembled image in the session that built the fixture. Anyone who re-captures the
 same session should regenerate the manifest from the capture and diff it against the fixture.
 
+**Every ack wait spends its attempts** (2026-10-19, a fix to the read primitive the write shares): the
+interrupt-endpoint read answers a timeout as `Ok(None)` - the normal state of a poll - and keeps a real read
+failure as its only `Err`, and `poll_outcome` sorts a poll into match / silence / skip / failure, with only
+failure ending a transfer. Before that shape a timeout ended `await_write_ack` on its **first** window, so the
+attempt count never applied and a keyboard that answers late - the capture answers the file open 305 ms after
+that frame - looked like one that answers nothing.
+
 ## Not settled
 
 - **Read-back is the only check, and the encoder path passed it once.** A written profile is seen through the read

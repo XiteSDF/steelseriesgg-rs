@@ -552,7 +552,13 @@ impl GenericKeyboard {
 
     /// Read one interrupt-endpoint input report from this keyboard's collection, waiting up to
     /// `timeout_ms`.
-    pub(crate) fn read_profile_input_packet(&self, len: usize, timeout_ms: u64) -> Result<Vec<u8>> {
+    ///
+    /// `Ok(None)` **is the timeout**: the window carried nothing, which is the normal state of a transfer that
+    /// polls this endpoint while it waits for an answer. Only a real read failure is an `Err`, so a poll loop
+    /// can tell "not yet" from "this device is not answering any more". Fixing the shape that made a timeout an
+    /// `Err` is what makes a loop's attempt count mean anything: every window is polled, and the first window
+    /// that fails as a read ends the transfer.
+    pub(crate) fn read_profile_input_packet(&self, len: usize, timeout_ms: u64) -> Result<Option<Vec<u8>>> {
         let mut report = vec![0u8; len.max(1)];
         let poll_ms = i32::try_from(timeout_ms).unwrap_or(i32::MAX);
         let received = {
@@ -562,12 +568,10 @@ impl GenericKeyboard {
                 .map_err(|e| Error::DeviceCommunication(format!("input report read: {e}")))?
         };
         if received == 0 {
-            return Err(Error::DeviceCommunication(format!(
-                "no input report within {timeout_ms} ms"
-            )));
+            return Ok(None);
         }
         report.truncate(received);
-        Ok(report)
+        Ok(Some(report))
     }
 
     /// Update the cached actuation point value.

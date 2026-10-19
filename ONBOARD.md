@@ -259,6 +259,15 @@ matches (2026-10-18, slot 0). Remaining:
     of the wrong length. **Nothing sends these bytes - the write path is not implemented** - and every offset,
     stride and field width encode writes carries the `[EXPERIMENTAL]` status of the decode that produced it
     (`docs/development/apex-7-onboard-profile-read.md` §Encode).
+12. **A poll window that carried nothing is a value, not an error** (2026-10-19, user-reported):
+    `read_profile_input_packet` (`src/devices/keyboards/mod.rs`) answers the interrupt-endpoint read's timeout as
+    `Ok(None)` and keeps a real read failure as its only `Err`, and every poll is sorted by `poll_outcome`
+    (`src/devices/keyboards/apex_7.rs`) into match / silence / skip / failure - only failure ends a transfer,
+    silence spends another attempt. The shape that answered a timeout as an `Err` ended **both** poll loops on
+    their first window, so the attempt count never applied and a keyboard that answers late looked like one that
+    does not: the read's input poll (`REPLY_INPUT_ATTEMPTS` windows of `REPLY_POLL_MS` ms, so 1 s of polling) and
+    the write's ack wait (`await_write_ack`, same primitive) now spend their attempts. Pinned by the lib test
+    `a_poll_window_that_carried_nothing_spends_an_attempt_and_a_read_failure_ends_it`.
 
 ---
 

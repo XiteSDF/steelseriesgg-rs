@@ -505,23 +505,27 @@ impl Apex7 {
         let mut input_attempts = 0u32;
         while input_attempts < REPLY_INPUT_ATTEMPTS {
             input_attempts = input_attempts.saturating_add(1);
-            match self.read_profile_input_packet(INPUT_REPORT_MAX_LEN, REPLY_POLL_MS) {
-                Ok(report) if reply_carries_payload(&report, payload_len) => {
+            match poll_outcome(
+                self.read_profile_input_packet(INPUT_REPORT_MAX_LEN, REPLY_POLL_MS),
+                &|report: &[u8]| reply_carries_payload(report, payload_len),
+            ) {
+                PollOutcome::Match(report) => {
                     tracing::debug!(
                         "onboard read: reply arrived on {path} as a {}-byte input report",
                         report.len()
                     );
                     return Ok(report);
                 }
-                Ok(report) if !is_ack(&report) => {
+                PollOutcome::Skip(report) if !is_ack(&report) => {
                     tracing::debug!(
                         "onboard read on {path}: ignored a {}-byte input report (report {:#04X})",
                         report.len(),
                         report.first().copied().unwrap_or(0),
                     );
                 }
-                Ok(_) => {}
-                Err(e) => {
+                // A window that carried nothing is one of the attempts, not a failure of them.
+                PollOutcome::Skip(_) | PollOutcome::Silence => {}
+                PollOutcome::Failure(e) => {
                     tracing::debug!("onboard read on {path}: input report read failed: {e}");
                     break;
                 }
@@ -568,17 +572,18 @@ impl Apex7 {
     fn read_protocol_report(&self, len: usize, attempts: u32, want: impl Fn(&[u8]) -> bool) -> Option<Vec<u8>> {
         let path = self.collection_label();
         for _ in 0..attempts {
-            match self.read_profile_input_packet(len, REPLY_POLL_MS) {
-                Ok(report) if want(&report) => return Some(report),
-                Ok(report) if !report.is_empty() => {
+            match poll_outcome(self.read_profile_input_packet(len, REPLY_POLL_MS), &want) {
+                PollOutcome::Match(report) => return Some(report),
+                PollOutcome::Skip(report) if !report.is_empty() => {
                     tracing::debug!(
                         "onboard poll on {path}: skipped report {:#04x} ({} bytes)",
                         report[0],
                         report.len()
                     );
                 }
-                Ok(_) => {}
-                Err(e) => {
+                // Every window is one of the attempts: a window that carried nothing is polled again.
+                PollOutcome::Skip(_) | PollOutcome::Silence => {}
+                PollOutcome::Failure(e) => {
                     tracing::debug!("onboard input-report poll on {path}: {e}");
                     break;
                 }
@@ -695,6 +700,32 @@ crate::impl_keyboard_with_delegation!(Apex7, {
 });
 
 /// A reply carries a payload when it is long enough to hold `payload_len` bytes behind its report-ID
+/// One poll of the interrupt endpoint, in the terms a poll loop acts on.
+///
+/// The distinction the loops live by is `Silence` from `Failure`: a window that carried nothing is the normal
+/// state of a transfer waiting on this endpoint, so the loop spends another attempt on it; a read failure is
+/// not a state to wait out, and ends the transfer. A shape that answered a timeout as an error (fixed 2026-10-19)
+/// ended every loop on its **first** window, so `attempts` was never spent and a device that answers late looked
+/// like a device that does not answer.
+enum PollOutcome {
+    /// The report this transfer was looking for.
+    Match(Vec<u8>),
+    /// The window carried nothing: poll again.
+    Silence,
+    /// A report arrived and is not the one wanted: skip it and poll again.
+    Skip(Vec<u8>),
+    /// The read itself failed - the device is not answering on a later attempt either.
+    Failure(String),
+}
+
+fn poll_outcome(read: Result<Option<Vec<u8>>>, want: &dyn Fn(&[u8]) -> bool) -> PollOutcome {
+    match read {
+        Ok(Some(report)) if want(&report) => PollOutcome::Match(report),
+        Ok(Some(report)) => PollOutcome::Skip(report),
+        Ok(None) => PollOutcome::Silence,
+        Err(e) => PollOutcome::Failure(e.to_string()),
+    }
+}
 /// byte and its report ID is not a poll acknowledge.
 fn reply_carries_payload(report: &[u8], payload_len: usize) -> bool {
     if report.is_empty() {
@@ -800,5 +831,36 @@ mod tests {
             );
             assert_eq!(crate::devices::keyboards::apex_7_profile::profile_file_id(4), 0x0205);
         }
+    }
+
+    /// The distinction every poll of the interrupt endpoint is sorted into. A window that carried nothing
+    /// spends one of the loop's attempts; a read failure ends the transfer. The shape that answered a timeout
+    /// as an error ended every loop on its **first** window, so `attempts` was never spent and a keyboard that
+    /// answers late looked like one that does not answer (fixed 2026-10-19).
+    #[test]
+    fn a_poll_window_that_carried_nothing_spends_an_attempt_and_a_read_failure_ends_it() {
+        let want = |report: &[u8]| report.first() == Some(&0x05);
+        assert!(
+            matches!(poll_outcome(Ok(None), &want), PollOutcome::Silence),
+            "a timeout is the normal state of a poll, not a failure: the loop polls the endpoint again"
+        );
+        assert!(
+            matches!(poll_outcome(Ok(Some(vec![0x05, 0x01])), &want), PollOutcome::Match(_)),
+            "the report the transfer is looking for ends the poll with its answer"
+        );
+        assert!(
+            matches!(poll_outcome(Ok(Some(vec![0x01])), &want), PollOutcome::Skip(_)),
+            "a report that is not the wanted one is skipped and the poll goes on"
+        );
+        let failure = poll_outcome(
+            Err(crate::error::Error::DeviceCommunication(
+                "input report read: Broken pipe".into(),
+            )),
+            &want,
+        );
+        assert!(
+            matches!(failure, PollOutcome::Failure(_)),
+            "a read failure is not a state to wait out: the transfer stops on it"
+        );
     }
 }

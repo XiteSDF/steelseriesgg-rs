@@ -743,6 +743,17 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   that region back to the device and an encoder-written payload leaves it zeros. **Reverted here**: keeping "no
   frame has ever been replayed on a keyboard" in the prose after the family's write ran.
 
+- 2026-10-19 (**a poll loop's attempts never applied**, user-reported): `read_profile_input_packet` answered the
+  interrupt-endpoint read's timeout as `Err(DeviceCommunication("no input report within 50 ms"))`, and both poll
+  loops - the read's input-report collection and `read_protocol_report`, which the write's `await_write_ack` waits
+  on - treated any `Err` as terminal and broke on the **first** window. So a keyboard that answers late (the
+  capture answers the write's file open 305 ms after that frame) looked like one that answers nothing, and
+  `attempts` was decorative. The read now answers a timeout as `Ok(None)`, keeping a real read failure as its only
+  `Err`, and `poll_outcome` sorts each poll into match / silence / skip / failure, with only failure ending a
+  transfer: the read's input poll spends its 20 windows of 50 ms and an ack wait spends the attempts it is given.
+  Lib test `a_poll_window_that_carried_nothing_spends_an_attempt_and_a_read_failure_ends_it` pins the four states.
+  **Reverted here**: a poll's "nothing yet" being an error, which is what made the attempt count meaningless.
+
 - 2026-10-19 (a write that sends frames never reached the keyboard): `ssgg onboard write` without `--dry-run`
   answered `an on-board profile write needs a keyboard: --dry-run prints the plan without one` **with the keyboard
   connected**. The dispatch in `main` built a `DeviceManager` only for `Read` and `Load`, so `cmd_onboard` received
