@@ -20,11 +20,30 @@
 //! in [`codecs`]. `src/main.rs` is written against these interfaces and names no keyboard family.
 
 use crate::error::Result;
+use serde::Serialize;
 
 pub use crate::devices::keyboards::apex_legacy_profile::{
     KeyMapping, LightingProfile, MacroAction, MacroSummary, OnboardMacro, OnboardProfile, ProfileImage, RapidTap,
     RapidTapPair, ReadReply, ReadStats,
 };
+
+/// The keyboard a read collected profile bytes from, recorded in the read's record and in the decode
+/// report the read writes. The payload layout, what can be encoded back, and which features exist are
+/// all per device, so profile bytes without a product ID do not say which board's codec produced them.
+/// A decode of a file records nothing: the file does not name a keyboard, only the schema word inside it.
+/// `[EXPERIMENTAL]`: one family records a device today (legacy Apex).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OnboardDevice {
+    /// USB vendor ID (every SteelSeries device answers `0x1038`).
+    pub vendor_id: u16,
+    /// USB product ID: the model selector, and the key of the model-name table.
+    pub product_id: u16,
+    /// Model name this crate lists for the product ID ([`crate::devices::device_name_from_product_id`]).
+    pub product: String,
+    /// False when this crate's product registry does not list the ID: the name is then the crate's
+    /// fallback, and a reader should trust the numbers, not the name.
+    pub known: bool,
+}
 
 /// A keyboard family's on-board profile codec: everything the protocol does with bytes, with no device.
 ///
@@ -33,6 +52,11 @@ pub use crate::devices::keyboards::apex_legacy_profile::{
 pub trait OnboardProfileCodec: Send + Sync {
     /// Family label for logs and read output: which boards this codec's protocol covers.
     fn family_name(&self) -> &'static str;
+
+    /// Whether this family's protocol was reverse-engineered on this product ID. A codec answers for
+    /// its own family, so `false` on a codec means "these bytes are from a board this codec does not
+    /// know", which is what a device recorded in a file has to be checked against.
+    fn knows_product(&self, product_id: u16) -> bool;
 
     /// Number of profile slots the keyboard stores, as GG numbers them: `Config 1 .. Config N`.
     fn config_count(&self) -> u8;

@@ -34,7 +34,7 @@ use super::apex_legacy_profile::{
     READS_PER_PULL, ReadReply, SCHEMA_B, hex_of, parse_firmware_version, parse_read_reply_at, profile_file_id,
     reply_mismatch, schema_of, validate_profile,
 };
-use super::onboard::OnboardProfileCodec;
+use super::onboard::{OnboardDevice, OnboardProfileCodec};
 use super::{GenericKeyboard, Keyboard};
 use crate::devices::hid_reports::{
     FirmwareSource, HidCommand, ONBOARD_FEATURE_REPORT_SIZE, ONBOARD_OUTPUT_REPORT_SIZE, OnboardFirmwareVersionCommand,
@@ -43,7 +43,7 @@ use crate::devices::hid_reports::{
 use crate::devices::key_mapping::{KeyId, KeyMapping};
 use crate::devices::product_ids;
 use crate::devices::zone_mapping::{ZoneEffect, ZoneMapping};
-use crate::devices::{Device, DeviceType};
+use crate::devices::{Device, DeviceType, device_name_from_product_id, known_product_id};
 use crate::error::{Error, Result};
 use crate::rgb::{Color, PerKeyEffect};
 
@@ -227,6 +227,15 @@ impl Apex7 {
 
         let mut image = ProfileImage::assemble(profile, chunks)?;
         image.firmware = firmware;
+        // The bytes are stamped with the keyboard they came off: the layout, the encodable fields and
+        // the feature set are all per device, so a profile file has to name its model.
+        let info = self.info();
+        image.device = Some(OnboardDevice {
+            vendor_id: info.vendor_id,
+            product_id: info.product_id,
+            product: device_name_from_product_id(info.product_id).to_string(),
+            known: known_product_id(info.product_id),
+        });
         Ok(image)
     }
 
@@ -613,6 +622,20 @@ mod tests {
             let apex_7 = device_without_handle(product_ids::APEX_7);
             assert!(apex_7.supports_onboard());
             assert!(Apex7::supports_onboard_profile(&apex_7));
+            // The codec answers which product IDs its protocol covers: a profile JSON that names a
+            // board outside this list was written by a family this codec is not.
+            assert!(LegacyApexOnboard.knows_product(product_ids::APEX_7));
+            assert!(LegacyApexOnboard.knows_product(product_ids::APEX_PRO_TKL));
+            assert!(LegacyApexOnboard.knows_product(product_ids::APEX_150));
+            assert!(LegacyApexOnboard.knows_product(product_ids::APEX_7_TKL));
+            assert!(
+                !LegacyApexOnboard.knows_product(product_ids::APEX_PRO_TKL_2023),
+                "the 2023 board is not on the legacy platform"
+            );
+            assert!(
+                !LegacyApexOnboard.knows_product(0xFFFF),
+                "an ID the registry does not list"
+            );
             for pid in [product_ids::APEX_3, product_ids::APEX_PRO, product_ids::APEX_7_2024] {
                 assert!(
                     !onboard_family(pid),
