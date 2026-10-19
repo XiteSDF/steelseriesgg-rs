@@ -1009,8 +1009,10 @@ pub struct MacroSummary {
     pub fnv1a_64: String,
     /// First 16 bytes, hex.
     pub head: String,
-    /// Every byte of the block, hex, space separated. Written only where the whole block is
-    /// worth shipping ([`OLED_LEN`] bytes = a 128x40 1bpp bitmap); `None` elsewhere, and
+    /// Every byte of the block, hex, space separated. Written for the blocks the engine treats as
+    /// opaque byte arrays and that a write must reproduce verbatim: the OLED bitmap
+    /// ([`OLED_LEN`] bytes = a 128x40 1bpp bitmap) and the macro block
+    /// ([`MACRO_DATA_LEN`] bytes, the engine's own `(macro-data-size)`). `None` elsewhere, and
     /// `None` skips the field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes_hex: Option<String>,
@@ -1286,11 +1288,17 @@ pub struct OnboardProfile {
     pub oled: MacroSummary,
     /// Rapid Tap block, schema [`SCHEMA_B`] only.
     pub rapid_tap: Option<RapidTap>,
-    /// Macro data block summary.
+    /// Macro data block summary, carrying the block's bytes verbatim: the engine declares this field
+    /// as a `bytearray` and never parses it (`lisp/apex_7.lisp:62, 101`), so a write sends these bytes
+    /// back unchanged and [`Self::macros`] is display only.
     pub macro_data: MacroSummary,
-    /// Packed macro records of the macro data block, in list order. Empty when the block is empty.
+    /// Packed macro records of the macro block, in list order, as [`decode_macros`] reads them.
+    /// Display only: a write takes [`Self::macro_data`]'s bytes, never this list, when the report carries
+    /// them. Empty when the block is empty.
     pub macros: Vec<OnboardMacro>,
-    /// Why the macro block did not parse cleanly, `None` when it did.
+    /// Why the macro block did not parse cleanly, `None` when it did. A note says the parsed record list
+    /// in [`Self::macros`] is incomplete; it does not stop a write of a report that carries the block's
+    /// bytes. `ssgg` has seen real GG blocks whose bytes its grammar rejects.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub macro_note: Option<String>,
     /// 16-byte profile GUID, hex.
@@ -1665,7 +1673,7 @@ pub fn decode(data: &[u8]) -> Result<OnboardProfile> {
         wheel_meta_mappings: key_table(data, WHEEL_META_MAPPINGS_OFFSET, WHEEL_MAPPING_COUNT)?,
         oled: summary_of_bytes(data, OLED_OFFSET, OLED_LEN),
         rapid_tap,
-        macro_data: summary_of(data, macro_offset, MACRO_DATA_LEN),
+        macro_data: summary_of_bytes(data, macro_offset, MACRO_DATA_LEN),
         macros,
         macro_note,
         guid: hex_of(&data[guid_offset..guid_offset + GUID_LEN]),
@@ -2073,15 +2081,57 @@ pub fn encode_json(text: &str) -> Result<Vec<u8>> {
         (None, false) => {}
     }
 
-    if let Some(note) = &profile.macro_note {
-        return Err(Error::Profile(format!(
-            "the macro block did not parse ({note}), so its bytes cannot be written back"
-        )));
-    }
     if profile.macro_data.offset != macro_offset || profile.macro_data.len != MACRO_DATA_LEN {
         return Err(Error::Profile(format!(
             "macro block is described at offset {} as {} bytes, this schema puts it at offset {macro_offset} as {MACRO_DATA_LEN} bytes",
             profile.macro_data.offset, profile.macro_data.len
+        )));
+    }
+    // The engine's own field is an opaque 9,600-byte bytearray, so a report that carries the block's
+    // bytes writes them back verbatim and its parsed record list is not consulted. `bytes_hex` is absent
+    // only in JSON a person wrote by hand, and then the records are the only source of bytes there is.
+    if let Some(hex) = profile.macro_data.bytes_hex.as_deref() {
+        let raw = parse_hex(hex, "macro block", hex.split_whitespace().count())?;
+        if raw.len() != MACRO_DATA_LEN {
+            return Err(Error::Profile(format!(
+                "macro block carries {} bytes, the block is {MACRO_DATA_LEN}",
+                raw.len()
+            )));
+        }
+        data[macro_offset..macro_offset + MACRO_DATA_LEN].copy_from_slice(&raw);
+    } else {
+        encode_macro_records(&profile, macro_offset, &mut data)?;
+    }
+
+    data[guid_offset..guid_offset + GUID_LEN].copy_from_slice(&parse_hex(&profile.guid, "profile GUID", GUID_LEN)?);
+    if schema_b {
+        if !profile.guid_padding.is_empty() {
+            return Err(Error::Profile(
+                "schema b has no padding behind the GUID and the JSON carries some".to_string(),
+            ));
+        }
+    } else {
+        data[guid_offset + GUID_LEN..guid_offset + GUID_LEN + GUID_PADDING_LEN].copy_from_slice(&parse_hex(
+            &profile.guid_padding,
+            "GUID padding",
+            GUID_PADDING_LEN,
+        )?);
+    }
+
+    let crc_offset = checksum_offset(len);
+    let computed = compute_checksum(&data[..crc_offset]);
+    data[crc_offset..crc_offset + 4].copy_from_slice(&computed.to_le_bytes());
+    Ok(data)
+}
+
+/// Pack the parsed macro records into the block: the source of bytes for JSON that carries no
+/// `macro_data.bytes_hex`. A block that did not parse has bytes this grammar cannot represent, so the
+/// write is refused rather than sent with invented bytes.
+fn encode_macro_records(profile: &JsonProfile, macro_offset: usize, data: &mut [u8]) -> Result<()> {
+    if let Some(note) = &profile.macro_note {
+        return Err(Error::Profile(format!(
+            "the macro block did not parse ({note}) and the JSON carries no macro_data.bytes_hex, so its \
+             bytes cannot be written back - read the profile with `ssgg onboard read` and write that report"
         )));
     }
     let mut written = 0usize;
@@ -2106,26 +2156,7 @@ pub fn encode_json(text: &str) -> Result<Vec<u8>> {
         data[at..at + raw.len()].copy_from_slice(&raw);
         written = at + raw.len() - macro_offset;
     }
-
-    data[guid_offset..guid_offset + GUID_LEN].copy_from_slice(&parse_hex(&profile.guid, "profile GUID", GUID_LEN)?);
-    if schema_b {
-        if !profile.guid_padding.is_empty() {
-            return Err(Error::Profile(
-                "schema b has no padding behind the GUID and the JSON carries some".to_string(),
-            ));
-        }
-    } else {
-        data[guid_offset + GUID_LEN..guid_offset + GUID_LEN + GUID_PADDING_LEN].copy_from_slice(&parse_hex(
-            &profile.guid_padding,
-            "GUID padding",
-            GUID_PADDING_LEN,
-        )?);
-    }
-
-    let crc_offset = checksum_offset(len);
-    let computed = compute_checksum(&data[..crc_offset]);
-    data[crc_offset..crc_offset + 4].copy_from_slice(&computed.to_le_bytes());
-    Ok(data)
+    Ok(())
 }
 
 /// The Apex 7 on-board profile codec: what `ssgg onboard` does with the bytes of this payload layout, with
@@ -2613,6 +2644,63 @@ mod tests {
         }
     }
 
+    /// Macro bytes as a keyboard with GG macros carries them (`Some rebounds`, read 2026-10-19): five
+    /// packed records this grammar walks (28, 28, 28, 16, 8 bytes), the zero byte that ends the list, then
+    /// the byte that stops it - `03`, not a `0x77` marker. The first 109 bytes are the block as the
+    /// keyboard wrote them; the eight behind that byte are ours, standing in for the bytes the report
+    /// does not ship.
+    const GG_MACRO_BYTES: [u8; 117] = [
+        0x77, 0x01, 0x05, 0x00, 0x01, 0x01, 0x0F, 0x00, 0x02, 0xE0, 0x01, 0x01, 0x02, 0x06, 0x01, 0x01, 0x04, 0x00,
+        0x14, 0x00, 0x02, 0x06, 0x01, 0x00, 0x02, 0xE0, 0x01, 0x00, 0x77, 0x01, 0x05, 0x00, 0x01, 0x01, 0x0F, 0x00,
+        0x02, 0xE0, 0x01, 0x01, 0x02, 0x19, 0x01, 0x01, 0x04, 0x00, 0x14, 0x00, 0x02, 0x19, 0x01, 0x00, 0x02, 0xE0,
+        0x01, 0x00, 0x77, 0x01, 0x05, 0x00, 0x01, 0x01, 0x0F, 0x00, 0x02, 0xE0, 0x01, 0x01, 0x02, 0x1B, 0x01, 0x01,
+        0x04, 0x00, 0x14, 0x00, 0x02, 0x1B, 0x01, 0x00, 0x02, 0xE0, 0x01, 0x00, 0x77, 0x04, 0x02, 0x00, 0x01, 0x01,
+        0x0F, 0x00, 0x02, 0x25, 0x01, 0x01, 0x02, 0x25, 0x01, 0x00, 0x77, 0x01, 0x01, 0x00, 0x00, 0x01, 0x0F, 0x00,
+        0x00, 0x03, 0x01, 0x01, 0x00, 0x00, 0x01, 0x0F, 0x00,
+    ];
+
+    /// A real macro block the record grammar rejects: the write is not refused and nothing is invented -
+    /// the engine declares this block a `bytearray` (`lisp/apex_7.lisp:62, 101`), so the report ships its
+    /// bytes and the write sends them back verbatim.
+    #[test]
+    fn a_real_macro_block_the_grammar_rejects_writes_back_verbatim() {
+        let mut data = synthetic_payload(SCHEMA_B);
+        let at = MACRO_OFFSET_B;
+        data[at..at + SYNTH_MACRO_BLOCK.len()].fill(0);
+        data[at..at + GG_MACRO_BYTES.len()].copy_from_slice(&GG_MACRO_BYTES);
+        let crc_offset = checksum_offset(data.len());
+        let computed = compute_checksum(&data[..crc_offset]);
+        data[crc_offset..].copy_from_slice(&computed.to_le_bytes());
+
+        let profile = decode(&data).expect("the payload decodes");
+        let note = profile
+            .macro_note
+            .as_ref()
+            .expect("the list stops at the byte that is not a marker");
+        assert!(
+            note.contains("0x03") && note.contains("+109"),
+            "the note names the byte and where it sits: {note}"
+        );
+        assert_eq!(
+            profile.macros.len(),
+            5,
+            "the records before that byte are listed for display"
+        );
+        let bytes_hex = profile
+            .macro_data
+            .bytes_hex
+            .as_ref()
+            .expect("the report carries the block's bytes");
+        assert_eq!(
+            bytes_hex.split_whitespace().count(),
+            MACRO_DATA_LEN,
+            "the whole 9,600-byte block ships, not the part that parsed"
+        );
+
+        let encoded = encode_json(&profile_json(&profile).expect("json")).expect("the write path accepts this report");
+        assert_eq!(encoded, data, "the block's bytes go back exactly as they came");
+    }
+
     /// The last four bytes are always the checksum the encoder computes, never the stored word of
     /// the report, so an image read with a wrong checksum encodes to a self-consistent payload.
     #[test]
@@ -2640,12 +2728,19 @@ mod tests {
         let profile = decode(&data).expect("decodes");
         let mut value: serde_json::Value =
             serde_json::from_str(&profile_json(&profile).expect("json")).expect("valid JSON");
+        // Without the block's bytes the parsed records are the only source of them, and a block the
+        // decoder walked as far as it could has bytes that list cannot hold.
+        value["macro_data"]
+            .as_object_mut()
+            .expect("macro block")
+            .remove("bytes_hex");
         value["macro_note"] = json!("stopped at offset 2100");
         let json = value.to_string();
-        let error = encode_json(&json).expect_err("a noted block is refused");
+        let error = encode_json(&json).expect_err("a noted block without bytes is refused");
+        let reason = error.to_string();
         assert!(
-            error.to_string().contains("did not parse"),
-            "the reason names the decode note: {error}"
+            reason.contains("did not parse") && reason.contains("no macro_data.bytes_hex"),
+            "the reason names the decode note and the missing bytes: {error}"
         );
     }
 
@@ -3302,7 +3397,13 @@ mod tests {
         );
         assert_eq!(
             keys_of(&value["macro_data"]),
-            ["fnv1a_64", "head", "len", "nonzero", "offset"]
+            ["bytes_hex", "fnv1a_64", "head", "len", "nonzero", "offset"]
+        );
+        let macro_bytes = value["macro_data"]["bytes_hex"].as_str().expect("macro block bytes");
+        assert_eq!(
+            macro_bytes.split(' ').count(),
+            MACRO_DATA_LEN,
+            "the engine's opaque bytearray ships whole, so a write can send it back verbatim"
         );
         assert_eq!(value["button_mappings"].as_array().unwrap().len(), 128);
         assert_eq!(value["wheel_mappings"].as_array().unwrap().len(), 2);
@@ -3668,43 +3769,35 @@ mod tests {
         );
     }
 
-    /// `ONBOARD.md` acceptance for `ssgg onboard write`: the plan of the read report `config_1.json`,
-    /// slot 1, must be the write sequence the Apex 7 capture shows, at least through GG's
-    /// `05 00 01 …` frame (the push of window 11, packet No. 103 of the capture) -
-    /// and it is checked past that frame, over every frame of the session.
-    ///
-    /// The fixture is GG's session as the capture records it (`scripts/gg-write-frames.py`, header states
-    /// the capture and its sha256): frame kind, wire length, the 64-bit FNV-1a of the frame's bytes, head
-    /// bytes, and the full bytes of the two frames this crate's payload cannot reproduce byte for byte.
-    #[test]
-    fn the_write_plan_of_the_read_report_is_the_capture_write_sequence() {
-        #[derive(Debug)]
-        struct GgFrame {
-            index: usize,
-            feature: bool,
-            wire_len: usize,
-            digest: String,
-            head: Vec<u8>,
-            full: Vec<u8>,
-        }
+    /// One frame of GG's write session, as the capture fixture records it.
+    #[derive(Debug)]
+    struct GgFrame {
+        index: usize,
+        feature: bool,
+        wire_len: usize,
+        digest: String,
+        head: Vec<u8>,
+        full: Vec<u8>,
+    }
 
-        fn hex_bytes(text: &str) -> Vec<u8> {
-            (0..text.len())
-                .step_by(2)
-                .map(|n| u8::from_str_radix(&text[n..n + 2], 16).expect("fixture hex is two hex digits per byte"))
-                .collect()
-        }
+    fn gg_hex_bytes(text: &str) -> Vec<u8> {
+        (0..text.len())
+            .step_by(2)
+            .map(|n| u8::from_str_radix(&text[n..n + 2], 16).expect("fixture hex is two hex digits per byte"))
+            .collect()
+    }
 
-        let manifest = include_str!("../../../tests/fixtures/onboard-write-apex7.manifest.txt");
-        let gg: Vec<GgFrame> = manifest
+    /// The fixture: GG's write session, one line per frame, in wire order
+    /// (`scripts/gg-write-frames.py`; its header states the capture and its sha256).
+    fn gg_write_frames() -> Vec<GgFrame> {
+        include_str!("../../../tests/fixtures/onboard-write-apex7.manifest.txt")
             .lines()
             .filter(|line| !line.starts_with('#'))
             .map(|line| {
                 let field: Vec<&str> = line.split_whitespace().collect();
-                let head_end = 4 + 16;
                 let last = *field.last().expect("a frame line has fields");
                 let full = match last.strip_prefix("full=") {
-                    Some(hex) => hex_bytes(hex),
+                    Some(hex) => gg_hex_bytes(hex),
                     None => Vec::new(),
                 };
                 GgFrame {
@@ -3712,19 +3805,122 @@ mod tests {
                     feature: field[1] == "feature",
                     wire_len: field[2].parse().expect("wire length"),
                     digest: field[3].to_string(),
-                    head: field[4..head_end]
+                    head: field[4..4 + 16]
                         .iter()
                         .map(|h| u8::from_str_radix(h, 16).expect("head hex"))
                         .collect(),
                     full,
                 }
             })
-            .collect();
+            .collect()
+    }
 
-        let report = concat!(env!("CARGO_MANIFEST_DIR"), "/config_1.json");
-        let text = std::fs::read_to_string(report).expect("the read's decode report sits in the repo root");
-        let payload = encode_json(&text).expect("encode the decode report of the read that ran on slot 0");
-        assert_eq!(payload.len(), 11_696, "the read report's payload");
+    /// Bytes of a write frame that are not payload: the open's command and file id, a buffer write's
+    /// command with its buffer offset and size, a push's file id, offset and size, a commit's two bytes.
+    fn frame_header_len(frame: &OnboardWriteFrame) -> usize {
+        match frame {
+            OnboardWriteFrame::FileOpen { .. } => 4,
+            OnboardWriteFrame::BufferWrite { .. } => 6,
+            OnboardWriteFrame::Push { .. } => 11,
+            OnboardWriteFrame::Commit { .. } => 2,
+        }
+    }
+
+    /// The write session, checked with nothing outside the repository: every frame of GG's session
+    /// matches the plan on index, report kind, wire length and header bytes, and the frames carrying no
+    /// payload bytes - the `88 00` open, the 40 `05 00` pushes, the `eb` commit - are byte-identical to
+    /// the capture. The 80 buffer writes carry payload bytes, so their content is the operator's
+    /// acceptance: see the ignored test below.
+    #[test]
+    fn the_write_plan_frames_are_the_capture_sequence() {
+        let gg = gg_write_frames();
+        // The payload is the crate's own synthetic profile: the frames compared here carry no
+        // payload bytes, so their bytes do not depend on which profile is being written.
+        let payload = synthetic_payload(SCHEMA_B);
+
+        let plan = write_plan(0, &payload).expect("frame the write of the example payload into slot 0");
+        assert_eq!(
+            plan.frames.len(),
+            gg.len(),
+            "the plan and the capture carry the same frames"
+        );
+
+        let mut header_only = 0usize;
+        for (n, frame) in plan.frames.iter().enumerate() {
+            let expected = &gg[n];
+            assert_eq!(
+                n + 1,
+                expected.index,
+                "fixture frames are numbered from 1 in wire order"
+            );
+            assert_eq!(
+                expected.feature,
+                matches!(frame.report_kind(), OnboardWriteReportKind::Feature),
+                "frame {} travels in the report the capture shows it in",
+                n + 1
+            );
+            let wire = wire_of(frame);
+            assert_eq!(wire.len(), expected.wire_len, "frame {} wire length", n + 1);
+            let header = frame_header_len(frame);
+            assert_eq!(
+                wire[..header],
+                expected.head[..header],
+                "frame {} carries the header the capture shows",
+                n + 1
+            );
+            if !matches!(frame, OnboardWriteFrame::BufferWrite { .. }) {
+                header_only += 1;
+                assert_eq!(fnv1a_64(&wire), expected.digest, "frame {} is GG's bytes", n + 1);
+            }
+        }
+        assert_eq!(
+            header_only,
+            plan.push_count() + 2,
+            "the open, every push and the commit carry no payload bytes"
+        );
+
+        // The frame the acceptance names (`05 00 01 …`, packet No. 103 of the capture) is the push of
+        // window 11, and it is byte-identical.
+        let acceptance = &plan.frames[36];
+        assert_eq!(
+            acceptance,
+            &OnboardWriteFrame::Push {
+                fs_id: 0x0201,
+                file_offset: 0x2C00,
+                size: 1024
+            },
+            "window 11's push is the frame the acceptance names"
+        );
+        assert_eq!(
+            fnv1a_64(&wire_of(acceptance)),
+            gg[36].digest,
+            "its bytes are GG's bytes"
+        );
+    }
+
+    /// GG's own write session, byte for byte, needs the read report the capture was made from:
+    /// `ssgg onboard read --config 1 --report config_1.json` on the keyboard of the capture, then
+    /// `cargo test -- --ignored`. It is `#[ignore]`d because that report is the operator's and is not in
+    /// the repository: a clean checkout has no `config_1.json`, and a re-read of a profile someone changed
+    /// legitimately differs from a capture of the profile as it was.
+    #[ignore]
+    #[test]
+    fn the_write_plan_of_the_read_report_is_the_capture_write_sequence() {
+        let gg = gg_write_frames();
+        // The payload bytes the capture's write carried: the `--bin` image of the read that ran on the
+        // keyboard of the capture. A write frames carry exactly these bytes, so this needs no encode step -
+        // and a report someone edited cannot be compared with a capture of the profile as it was.
+        let image = concat!(env!("CARGO_MANIFEST_DIR"), "/config_1.bin");
+        let bytes = std::fs::read(image)
+            .expect("the read's payload image sits in the repo root: read the reference slot with --bin config_1.bin");
+        let len = payload_len_for_schema(schema_of(&bytes)).expect("the image's schema names its payload length");
+        assert!(
+            bytes.len() >= len,
+            "the image is {} bytes, a payload of {len} is needed",
+            bytes.len()
+        );
+        let payload = bytes[..len].to_vec();
+        assert_eq!(payload.len(), 11_696, "the read image's payload");
 
         let plan = write_plan(0, &payload).expect("frame the write of the read report into slot 0");
         assert_eq!(

@@ -409,8 +409,29 @@ What the JSON carries: `macros[]` with `index` (the binding index of the group, 
 (the position in the packed list), `offset`, `mode`, `mode_name`, `id`, `flags`,
 `interval_ms`, `record_bytes`, `action_count`, `actions[]` (`kind`, `key`, `word`, `ms`) and `raw`
 (the record's own bytes, for comparing with a capture); `macro_index` on the `0x71` entries;
-`macro_note` when a block does not pack cleanly. `macro_data` stays the summary block (offset, len,
-nonzero, FNV, head).
+`macro_note` when a block does not pack cleanly. `macro_data` carries the summary (offset, len,
+nonzero, FNV, head) **and the block's 9,600 bytes as `bytes_hex`** (since 2026-10-19, like the OLED block).
+
+### The engine keeps the macro block as an opaque bytearray, so a write sends it back verbatim `[EXPERIMENTAL]`
+
+The engine's own struct declares this field `(field macro_data bytearray (size (macro-data-size)))`
+with `(macro-data-size) 9600` (`lisp/apex_7.lisp:62` schema `a`, `:101` schema `b`,
+`lisp/base_apex_legacy.lisp:109`): GG parses nothing inside it, and what the engine writes is the bytes it
+was given. Our record grammar is therefore a **display view**, not the block's format, and it is partial: a
+user's own profile (`Some rebounds`, read 2026-10-19, 581 non-zero block bytes) walks as five records -
+28, 28, 28, 16, 8 bytes, 108 in all - and then hits the byte at `+109`, a `03` after one zero byte, which is
+no marker we know, so the walk stops there with the five records listed. Real GG blocks carry action bytes
+beyond the `0x02` press/release and `0x04` delay we name, and bytes behind a record header our header shape
+does not cover.
+
+So the block's bytes ride in the report as `macro_data.bytes_hex` (9,600 of them, space separated) and a
+write, an encode and the GUI send them back **unchanged**; the parsed list is never the source of bytes when
+the report carries them. A report written before 2026-10-19 has no `bytes_hex`, and a noted block in such a
+report is refused - the bytes behind its note are not in the file, and `ssgg` does not invent them (re-read
+the slot to get a report the write path accepts). Pinned by the crate test
+`a_real_macro_block_the_grammar_rejects_writes_back_verbatim`, whose fixture bytes are the five record runs
+of that real block, the zero pad byte, the `03`, and eight bytes standing in for what the decoder does not
+name.
 
 GG's `device-offset-lookup-table` (`lisp/base_apex_legacy.lisp`) maps a key's HID usage to its slot in
 these tables: 120 of the 128 slots, `0xFF` for the 8 slots this device has no key for. Slots 120-127
@@ -433,19 +454,20 @@ Rapid Tap mode nibbles belong to the pairs, not to the mappings: `0x80` report k
 
 `encode_json` (`src/devices/keyboards/apex_7_profile.rs`) takes a decode report and writes payload
 bytes: the schema word, the name bytes, the lighting block, the META toggle key, the four mapping tables,
-the OLED pixels, the Rapid Tap pairs, the packed macro records, the GUID and its padding, and last the
-checksum it computes over the prefix - the report's stored word is never copied. Geometry comes from the
-same layout table the decoder reads, so a report that describes a block where this schema does not put it
-is refused, as is a macro block carrying a decode note (the bytes behind a note are not in the report, so
-writing the records alone would drop them), a mapping table whose `offset` fields are not in payload
+the OLED pixels, the Rapid Tap pairs, the **macro block's bytes as the report carries them**, the GUID and its
+padding, and last the checksum it computes over the prefix - the report's stored word is never copied.
+Geometry comes from the same layout table the decoder reads, so a report that describes a block where this
+schema does not put it is refused, as is a macro block whose report carries neither its bytes
+(`macro_data.bytes_hex`) nor a clean record list - a noted block with no bytes has bytes no list can hold, so
+the write says that instead of sending invented ones - a mapping table whose `offset` fields are not in payload
 order, Rapid Tap on schema `a` or missing on schema `b`, and any hex field of the wrong length. The zero
 pad the reference reads carry behind the name, behind the mapping tables and in the rest of the macro
 block is written as zeros, because that is what the reads have there.
 
 Verified on the 2026-10-18 images in this repo (schema `b`, 11,696-byte payload): `decode` -> JSON ->
 `encode_json` gives back the 11,696 payload bytes **byte for byte** for `config_1.bin`, `config_1_2.bin`
-and `config_3.bin`, `config_1.json` included with its two macro records (58, 56 and 94 raw bytes:
-`onboard write` will send them unchanged). Those files are 12,288-byte read windows from the 12-pull read:
+and `config_3.bin`, `config_1.json` included with its macro block sent back as the 9,600 bytes the report
+carries (2 records' runs inside 97 non-zero bytes, all of it unchanged). Those files are 12,288-byte read windows from the 12-pull read:
 the 592 bytes behind the payload are device buffer content, not profile bytes - 80 bytes of `FF` then zeros
 behind slot 3, all zeros behind slot 1 - which is why the check compares the payload and says what the tail
 is. Since 2026-10-19 a read's `--bin` is exactly the 11,696-byte payload and the region behind it (the read
