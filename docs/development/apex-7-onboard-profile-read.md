@@ -294,6 +294,19 @@ Four facts come off that:
   on the slot the byte names, and no read decoded so far carries a `0x62` entry on the base layer at
   all - so a binding write marks the toggle by writing `62` with code 1 = `05`, and nothing in these
   reads supports writing `05` anywhere else.
+- **Lock Win and the META toggle are separate, and the GUI keeps them apart (operator report,
+  2026-10-19, implemented 2026-10-20).** The binding window used to offer one list where the byte
+  `0x05` was both the Lock Win label and the thing that moved the toggle: picking Lock Win wrote
+  `62 05` **and** named the key in `meta_toggle_hid`. They are now two controls. The Meta action
+  select lists the six actions of `0x62` (`01` Profile Switch, `02` Macro, `03` Brightness Down,
+  `04` Brightness Up, `05` **Lock Win**, `0A` Rapid Tap) and picking one writes only this entry's
+  code 1. The META toggle is a row of its own in the binding window (a checkbox) and writes only the
+  profile byte: checking writes this key's code (`0xF0` for the Meta cap), unchecking writes `0x00`,
+  and no binding byte of any layer is touched - the shape `some_rebounds.json` carries. The key the
+  byte names keeps its own binding bytes in its binding window, and is painted as a meta key with
+  `META` in its cap on both layers; a `62 05` entry prints `Lock Win` in its cap.
+  `[EXPERIMENTAL]` neither byte has been written to a keyboard; `apex_7.lisp:145` names code `0x04`
+  `toggle-key` and `:146` code `0x05` `lock-win`, which is the same split the page now draws.
 - **The rest of the META layer's `0x62` entries are GG's own defaults**, not the toggle: slots 72, 80,
   88 and 96 (usages `0x42`-`0x45` = F9-F12) carry `01 00 00 00`, `02 01 00 00`, `03 01 00 00`,
   `04 01 00 00`. That is why a stock slot read classifies as `meta: 6 custom` - the toggle slot plus

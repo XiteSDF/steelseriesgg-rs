@@ -268,6 +268,17 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
 
 ## Done or dropped (do not redo)
 
+- 2026-10-20: **the GUI binding window keeps Lock Win and the META toggle apart** (operator report of
+  2026-10-19: `0x05` is Lock Win and was acting as the toggle). The Meta action select lists the six
+  actions of function `0x62` (`01` Profile Switch, `02` Macro, `03` Brightness Down, `04` Brightness Up,
+  `05` Lock Win, `0A` Rapid Tap) and picking one writes only this entry's code 1. The META toggle is a row
+  of its own in the same window (a checkbox) and writes only the profile byte `meta_toggle_hid`, touching
+  no binding byte - the shape `some_rebounds.json` carries (`0x10` names the M key, its base entry
+  self-bound, its META entry all zero). The key the byte names keeps its own binding bytes in the panel and
+  prints `META` in its cap on both layers; a `62 05` entry prints `Lock Win`. The GUI suite is 192 tests
+  and asserts both halves. Facts stay read-side (`[EXPERIMENTAL]`: nothing of this has been sent;
+  `apex_7.lisp:145` `#x04` = `toggle-key`, `:146` `#x05` = `lock-win`).
+
 - 2026-10-19: on-board **payload layout** fixed against the Windows engine's own struct (`apex_7.lisp`
   `onboard_profile_payload`) and verified on hardware by the checksum: 5-byte `key_mapping` entries
   (function byte + 4 key codes, not 4 bytes total), 5-byte Rapid Tap pairs, OLED block at 1385, wheel
