@@ -92,9 +92,17 @@ the capture's median push-answer latency, which is above its median inter-frame 
 
 **Endpoints**: the `05 01` / `88 01` answers arrive on the profile collection's interrupt endpoint - the
 collection at `2.2` of the Apex 7 composite device, `0x82`, the endpoint the read path drains too.
-Keystrokes come from the keyboard collection on the other endpoint (stated by the operator 2026-10-20, not
-measured by me) - so a write path that drains this endpoint is not wading through key reports, and its ack
+Keystrokes come from the keyboard collection on the other endpoint (stated by the operator 2026-10-20, and
+consistent with the read capture: 293 interrupt reports against 750 payload reads, 698 of them inside 40 ms after a
+payload read, which is key chatter) - so a write path that drains this endpoint is not wading through key reports,
+and its ack
 filter only has to skip protocol reports (the `01 00 …` ones).
+
+`ssgg` does not consume that stream for its acks: `Apex7::await_write_ack` asks for the **feature report with the
+id the ack carries** (`read_profile_feature_packet(0x88)` for the open, `(0x05)` for the push), the same primitive
+the read's payload replies use. That is the engine's own way - its resource read is
+`read-report(DEVICE_FEATURE, resource_report_id, max-usb-timeout)` - and it means a write never reads a keyboard
+report. `[EXPERIMENTAL]`: GET_REPORT is the untested half of this path, like the rest of the write.
 
 ## Engine side
 
@@ -108,6 +116,16 @@ push paths behind it; `WriteOnboardProfileWithCallback` at `0x2297a0`.
 `load-profile-with-pause` (`base_apex_legacy.lisp:2039-2045`) is the deploy: `0x89` with a 1-based profile id,
 then a 250 ms pause. The capture shows the deploy frame (`89 01`, profile 1) and the pause on the wire: 301 ms
 from that frame to the next frame of the session.
+
+The engine's own pacing is a **device setting, written with `0x6C`**: `hidconfig` writes 12 bytes read as three
+u32 - `time-between-commands`, `file-access`, `max-usb-timeout` - whose boilerplate values are 10, `FA_READWRITE`
+and 500, with the engine's comment "HID Configuration - 10 ms is also the default in devicelib"
+(`standard-boilerplate.lisp:8-10, 24`). The profile write spec writes that frame twice in front of the file open,
+with `5000` and then with `max-usb-timeout` as the third word, the read spec writes it in front of the pulls, and
+every one of them resets it in `api-finally` with `{"hidconfig": []}` (`apex_7.lisp:217, 224, 251, 253, 270`;
+`base_apex_legacy.lisp:546, 1514, 2008, 2064`). The `6c 00 01 …` frame in the captures is this write - see
+`apex-7-onboard-profile-read.md` §"What paces the read, and what GG paces with `6c`" for the decode and for the
+other, 4-byte `0x6C` shape the same family uses for driver mode.
 
 ## What `ssgg` does
 
@@ -125,9 +143,11 @@ report), `OnboardPushCommand` (`0x05`), `OnboardCommitCommand` (`0xEB`) and `Onb
 - Pacing is `GG_GAP_MS` (5 ms) between frames, the capture's median.
 - The write waits the answers the capture shows: `88 01` after the open, `05 01` after every push; it does not
   wait on writes or on the commit, which are not answered. A status byte other than `01`, and a frame that is
-  not answered, stop the write. The wait is the read side's own poll primitive
-  (`Apex7::read_protocol_report`, the one the pacing drain and the firmware poll use) with the expected report
-  id as the filter - one drain for the whole transfer, not a second one for the write.
+  not answered, stop the write. The wait is `Apex7::await_write_ack`: a poll for the **report with the id the ack
+  carries** (`0x88` for the open, `0x05` for the push, the codec's `write_ack_report_ids`), on the profile
+  collection with the read path's own 50 ms poll (`REPLY_POLL_MS`) - one ack primitive for the whole transfer, and
+  never a keyboard input report, which is where key events come from (§Endpoints above, and the read capture's 293
+  interrupt reports against 750 payload reads).
 - The lighting files, driver mode, OLED, volatile, firmware polls and pacing frames are not sent. The write
   touches one profile file and, at the end, deploys that slot (`89 <slot + 1>` right after the commit - the
   engine sleeps 250 ms behind the deploy frame, the write path does not, ONBOARD step 1.4).

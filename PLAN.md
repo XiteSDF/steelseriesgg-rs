@@ -39,10 +39,13 @@ firmware 4.16.3, 122 frames): `ssgg onboard write` (JSON by default, `--bin` for
 mandatory, `--dry-run`) and `ssgg onboard load` (`--profile N` mandatory). The sequence is the
 capture's: `88 00 <file id>` open, 40 windows of two 512-byte `03 00 <buffer offset> <size>` feature writes
 (642 wire bytes) plus one `05 00 <file id> <file offset> 1024` push, `eb <slot + 1>` commit, then `89 <slot + 1>`
-deploy after 250 ms. Geometry comes from the keyboard family (`OnboardProfileCodec::write_plan`); the capture's
+deploy - the engine sends that frame 250 ms after the commit, `ssgg` sends it with the commit and with no pause, and
+`--dry-run` shows it as the frame after the 122. Geometry comes from the keyboard family
+(`OnboardProfileCodec::write_plan`); the capture's
 answer to a push is `05 01 …` (202/202) and to the open `88 01 …`. Frame builders in `hid_reports`
 (`OnboardFileOpenCommand`, `OnboardBufferWriteCommand`, `OnboardPushCommand`, `OnboardCommitCommand`), the device
-path `Apex7::write_onboard_profile` / `Apex7::deploy_onboard_profile`, fixture
+path `Apex7::write_profile` / `Apex7::deploy_profile` behind `Keyboard::write_onboard_profile` /
+`Keyboard::load_onboard_profile`, fixture
 `tests/fixtures/onboard-write-apex7.manifest.txt` (generator `scripts/gg-write-frames.py`) asserted
 frame for frame by `apex_legacy_profile::tests::the_write_plan_of_the_read_report_is_the_capture_write_sequence`.
 `onboard decode` of the capture's image answers `Config 1`, schema `0x000B`, stored checksum `0EB1C3D1` equals
@@ -501,6 +504,94 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   page and clicks it, and the real capture dump when `p0.json` is in the repo), `node tools/profile-gui/preview.mjs`
   renders the board to SVG. Next steps belong to items 5 and 7 (hardware read, hardware write); the 2023
   actuation JSON is a different shape and is not handled.
+- 2026-10-19 (JSON is per device, and the device is what answers): the read stamps its JSON with a `device`
+  block (`vendor_id`, `product_id`, `product`, `known` - the same rule as every other product-id read: trust the
+  number, not the name), `onboard decode` writes its JSON as `<name>.json` by default like the read does, and
+  `onboard encode` takes `--json` as the default input kind with `--report` kept as an alias. A `decode` of a
+  file is a file-only command, so it cannot know the device it describes: `--device <product-id>` carries the
+  device the JSON is for (`0x1612`, `6162`, `Apex 7` forms accepted) and is recorded in the file.
+- 2026-10-19 (JSON schema = the engine's own version field): `apex_7.lisp:1341` `json-schema` of
+  `profile-image` is 43 fields, `json-parser.lisp:109` writes `schema-version` 1, and 2026-10-19 a `ssgg` read
+  of the same slot under `json-format 3` (engine `onboard-json-version`) answers byte-identically to the same
+  read under `json-format 1`, with the 43 fields, one per field. So the engine's `schema-version` **is** this
+  JSON's `schema_version`, and our 3 is a number we invented: a GG-created JSON and ours differ in that one
+  field. The JSON's own field, the engine's `json-schema` and the 34-field reader list
+  (`apex_7.lisp:1364`) are now each asserted in
+  `apex_legacy_profile::tests::the_json_field_list_is_the_engine_schema` - the reader-list half is the proof
+  the 43-field JSON has a 34-field reader: 9 fields (all 6 `actuation_*`, the 2 `rapid_tap_*` and `key_guard`) are
+  dropped in the payload path (`:220` `deploy-profile` -> `profile-write` -> `write-profile`), 22 are dropped
+  in the JSON path (`profile-json` drops what `profile-write` does not). A payload decode therefore cannot
+  rebuild that JSON - it has no source for those 24 fields - so the read's JSON is the only complete shape. A
+  `schema_version` other than 1 is refused by the reader, and a schema-43 GG JSON read by `onboard encode`
+  fails closed with a named field, not a silent one.
+- 2026-10-19 (the region GG reads from, and the `6c` frame): the read pulls a **5120-byte** region (`05 00`
+  asks for 5120 = 4096 + 1024) into a 6144-byte buffer (the engine's `buffer-size` argument to `write-buffer`,
+  `apex_7.lisp:217`), and keeps only the first 4096 payload bytes (`file-write`'s `min` clamp at `:230`);
+  `PROFILE_FILE_BYTES` stays 4096, which is 40960/10 on the engine's own comment. The read's extra 1024-byte
+  pull is the engine's `file-read` default (`buffer-length` 1024) running over the whole region, so the region
+  is read in 5 windows; the extra 1024 bytes answer on the wire (the read captures them) and are not in
+  `file-write`'s destination - they are **not** the bytes GG writes to this slot. Recorded behind
+  `--report` as `pull_region_bytes` plus a `region` block of the extra 1024 (sha256, hex, ASCII, printable,
+  decoded `region`/`unmapped`/`zone N` labels), and compared in the decode report. `ONBOARD.md` step 11 is the
+  open question: write the GG-built payload to an empty slot, read it back and diff the slot to learn what GG
+  writes to an untouched slot; the 1024 bytes behind the payload are **not** evidence, and
+  `apex_legacy_profile::tests::the_bytes_behind_the_payload_come_back_unchanged` is an in-memory
+  assemble-and-split test, not evidence from a board. Same date, the read's `6c 00 01`: `6c 00 01` is the
+  **driver mode** write (`set-driver-mode`, `base_apex_legacy.lisp:671`), the engine keeps it as `hid-mode`
+  (`:798`), opens driver mode with `6c 00 01` and closes the session with `6c 00 00` (it does the same on
+  Apex 3, with `0x75` - which is why the frame is a family constant, not an Apex 7 one). The engine's `6c`
+  values are `00`/`01` only; `6c 00 0a` is the `set-controller-id` command (controller id 10), a different
+  command with the same opcode.
+- 2026-10-19 (the family codec is device-scoped): every device command resolves the keyboard first
+  (`select_onboard_keyboard`), then asks that keyboard for its codec (`Keyboard::onboard_codec`), and the
+  `onboard` device subcommands take a `--device` selector (`read`/`write`/`load`/`verify`). The codec is a
+  family-wide value, not a device: `LegacyApexOnboard` decodes and encodes, names slots, says which product ids
+  its layout applies to (`applies_to`), which models its feature set describes (`feature_set_for`) and what
+  geometry a write of that family has (`write_plan`); the device method answers it, file-only commands reach
+  it through `onboard::codec_for_product_id`. Two product ids with the same layout share one codec, a new
+  family is a new codec; the `onboard::codecs` registry is the file-only lookup (and `onboard codecs` lists
+  what is registered). `onboard features` is the command that prints the feature set a device answers with.
+- 2026-10-19 (scoping the read to the read path): the plan's opening chain was sent from `read_image`, so every
+  read sent frames that were not asked for. The chain is now a command of its own -
+  `Keyboard::onboard_init_chain` (`ssgg onboard chain`) - and the read sends only what the read needs: one
+  firmware poll, the schema probe, then the pulls (the two `90` polls inside the old chain are the same
+  firmware poll, and the poll is informational, so a refused or unanswered poll is recorded and the read
+  continues). The chain stays in `hid_reports` as `ONBOARD_INIT_CHAIN` and in the docs, with every frame cited
+  to its descriptor: `90 00`/`90 01` = firmware poll, `f4 00` = `update-status` (engine
+  `base_apex_legacy.lisp:1514`, 12 bytes, firmware status), `6c 00 01` = driver mode.
+- 2026-10-19 (pacing measured on both captures, and GG's `6c` is its own pacing knob): the read's 125 pull frames
+  are 0 ms apart and 708 of its 750 payload reads are 20 ms apart; the write's 103 frame gaps have a 7.1 ms mean,
+  45 zeros, 47 gaps of 10-11 ms and a 100 ms pause every 32 frames. `ssgg` paces both paths at `GG_GAP_MS` = 5 ms
+  (the write's median answer latency) and polls each answer every `REPLY_POLL_MS` = 50 ms. GG's own 10 ms is a
+  **device setting**: the engine's `hidconfig` writes command `6c` with three u32 - time-between-commands (default
+  10, commented "10 ms is also the default in devicelib"), file-access (`FA_READWRITE`), max-usb-timeout (500) -
+  `standard-boilerplate.lisp:8-10, 24`; the profile read spec writes it with 1 ms in front of the pulls and resets
+  it in `api-finally` (`apex_7.lisp:217, 224`), the write spec writes it with 5000 in front of the file open and
+  again with 500 (`:251, 253, 270`). The chain's `6c 00 01 …` frame is that write, not driver mode: driver mode is
+  the same command byte with a 4-byte payload (`base_apex_legacy.lisp:562, 570`). Both are in
+  `docs/development/apex-7-onboard-profile-read.md` §"What paces the read".
+- 2026-10-19 (a protocol reply is not a keyboard input report): the write's acks (`05 01` to a push, `88 01` to
+  a file open) are read as a **report on the profile collection, matched by report id**, with the read's own poll
+  (`Apex7::await_write_ack` over the protocol read). The keyboard's interrupt input report carries key events: in
+  the read capture 293 interrupt reports arrive against 750 payload reads (698 of them within 40 ms after a payload
+  read, which is key chatter), and protocol replies are never key reports. `read_report_timeout` is not used by any
+  on-board path.
+- 2026-10-19 (no thread for the read, the write or the deploy): all three are plain blocking calls. They used
+  `std::thread::scope`, which joined before the call returned, so the blocking work ran on a thread either way
+  and nothing ran concurrently with it; the read's ~2 s and the write's frame loop simply block the caller. The
+  `join().map_err(...)` panic mapping went with the scope. The engine's 250 ms pause behind the deploy frame is
+  not slept and its 40 x 500 ms deploy poll is not run: measured 2026-10-19, the capture shows **no frame and no
+  reply after the `89`**, so the deploy sends the frame and reads nothing back.
+- 2026-10-19 (the deploy is its own step and the write's last frame): `onboard load` sends `89 <slot + 1>` on
+  its own, and `onboard write` sends it right after the commit with no pause - the engine sleeps 250 ms behind the
+  frame and polls 40 x 500 ms for the slot to come back; measured 2026-10-19, the capture has **no frame and no
+  reply after the `89`**, so `deploy_profile` sends the frame and reads nothing back.
+- 2026-10-19 (the write plan is built per family): the codec names the write geometry (`file_id`, region, block
+  window, `FILE_BLOCKS`, the ack report ids) and the family module frames it, because the windows are family
+  facts (`apex_7.lisp:217` `write-region` -> `windows`, `file-write`'s `min` clamp): the engine caps a
+  `file-write` at 1024 bytes, and the buffer window is 512 (`DEVICE_RESOURCE_BUFFER_LEN` 1024 / 2), so a family
+  that sets `FILE_BLOCKS` to a value not divisible by 1024 (a 2048-byte block on a legacy family) is an error
+  naming the divisibility rule, not a frame stream that ignores the engine.
 
 ## Reference projects
 

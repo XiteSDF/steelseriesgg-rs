@@ -168,12 +168,48 @@ was read back on, which is the set its encodings apply to. A model outside that 
 needing its own layout, encoder and feature set, which is the point of recording the product ID at all.
 `node tools/profile-gui/sync-products.mjs --check` fails when Rust moved and the generated file did not,
 and `selftest.mjs` runs it as a check.
-The profile slot is the only run-time choice. The geometry (25 pulls of 1024, 5 reads of 636), the pacing
-([`GG_GAP_MS`]), the firmware poll (one `90 00`) and the reply framing
+The profile slot is the only run-time choice. The geometry (12 pulls of 1024, 2 payload reads of 512 per
+pull), the pacing ([`GG_GAP_MS`]), the firmware poll (one `90 00`) and the reply framing
 ([`READ_REPLY_FRAMING_LEN`], 0 = the offset the capture's replies show) are constants:
 `ReadConfig` and its CLI tunables (`--resource-len`, `--read-len`, `--chunks`, `--payload-len`,
 `--fs-base`, `--gap-ms`, `--no-init-chain`, `--reply-header`) were removed 2026-10-17. A keyboard that
 needs other geometry is a code change, measured first on the capture.
+
+### What paces the read, and what GG paces with `6c`
+
+GG's pacing is **a device setting it writes to the keyboard**, not only a host-side sleep: the engine's
+`hidconfig` API writes command `6c` with 12 bytes read as three u32 - `time-between-commands`,
+`file-access`, `max-usb-timeout` (`standard-boilerplate.lisp:24`). Its default is 10 ms with the engine's own
+comment "HID Configuration - 10 ms is also the default in devicelib" (`standard-boilerplate.lisp:8-10`),
+`file-access` is `FA_READWRITE` and `max-usb-timeout` is 500 (`:9-10`; `apex_7.lisp:312-313` restates the last
+two for this model). The profile APIs set it themselves: the read's spec writes
+`HIDCONFIG 12 [(uint32-to-bytes 1) (uint32-to-bytes (file-access)) (uint32-to-bytes (max-usb-timeout))]` with the
+comment "Set time between commands" before the first pull (`apex_7.lisp:217`), the write's spec writes the same
+frame with `5000` as the third word in front of the file open (`apex_7.lisp:251`, and the normal value again at
+`:253`), and both reset it in `api-finally` with `{"hidconfig": []}` (`apex_7.lisp:224`, `:270`). The `6c` frames
+in the captures **are** those writes. The read capture's chain frame is
+`6c 00 01 00 00 00 00 64 00 00 00 10 27 00 00` (§Opening chain lists it); its 12 bytes after the 2-byte header
+read as three LE u32: `1`, `0x6400` = 25600, `0x271000` = 2560000 - the same three words the engine writes, in the
+same order, with `FA_READWRITE` as the middle one (`(define (file-access) FA_READWRITE)`, `standard-boilerplate
+.lisp:9`, and 25600 = `0x6400` is that flag). `ssgg`'s own `6c 00 01` builder is the **driver-mode** shape of the
+same opcode (`base_apex_legacy.lisp:562`), which is 4 bytes, not 14: the two uses of `6c` in this family have the
+same command byte and different payloads, so a builder for one is not a builder for the other. **The units of the
+capture's words are not settled** (1 ms pacing against the engine's 10 ms default, and a third word of 2560000
+against its 500).
+
+Host side, the measured spacing on the wire is what `ssgg` paces by. The read capture's 125 pull frames are
+**0 ms** apart and 708 of its 750 payload reads are **20 ms** apart; the write capture's 103 frame gaps have a
+**7.1 ms** mean, 45 of them are 0 and 47 are 10-11 ms, with a 100 ms pause every 32 frames (the engine's own
+bulk-transfer step, cited in §"Answered frames and pacing" of
+[`apex-7-onboard-profile-write.md`](apex-7-onboard-profile-write.md)). `ssgg` paces both paths at
+`GG_GAP_MS` = **5 ms** (the write capture's median, [`GG_GAP_MS`] in
+[`apex_legacy_profile`](crate::devices::keyboards::apex_legacy_profile)), and waits for each answer with the
+50 ms poll of [`REPLY_POLL_MS`] in [`apex7`](crate::devices::keyboards::apex7) - the read's answer arrives 1-3 ms
+after its request, so the 5 ms step covers the 1 ms the board needs to prepare a buffer (the wait in `read_window`
+that keeps a fast read from pulling an unprepared buffer, recorded in `ONBOARD.md`). Nothing in the read or the
+write runs on a thread of its own: `Apex7::read_profile`, `Apex7::write_profile` and `Apex7::deploy_profile` are
+plain blocking calls (2026-10-19 - they used `std::thread::scope`, which joined before returning, so the work
+blocked a thread either way and nothing ran concurrently).
 
 
 ## Payload layout
