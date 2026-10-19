@@ -593,6 +593,19 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
   that sets `FILE_BLOCKS` to a value not divisible by 1024 (a 2048-byte block on a legacy family) is an error
   naming the divisibility rule, not a frame stream that ignores the engine.
 
+- 2026-10-19 (on-board frame names): every on-board command in `hid_reports.rs` is now named by the object it
+  moves, and its `CommandCode` variant carries the same words as the type: `OnboardFileOpenCommand` /
+  `OnboardFileCommitCommand` (the profile file), `OnboardBufferReadCommand` / `OnboardBufferWriteCommand` (the
+  device resource buffer), `OnboardPayloadPullCommand` (read side) / `OnboardPayloadPushCommand` (write side) (the
+  payload, on the same opcode `05`), `OnboardProfileDeployCommand` (the slot; "load" is what the board does, we
+  deploy), plus `OnboardFirmwareVersionCommand` and `OnboardDriverModeCommand`. Renamed from `OnboardReadCommand`,
+  `OnboardCommitCommand`, `OnboardPullCommand`, `OnboardPushCommand`, `OnboardLoadProfileCommand`,
+  `ONBOARD_GET_WIRE_BYTES` (now `ONBOARD_READ_WIRE_BYTES`) and the bare `CommandCode::{FirmwareVersion, DriverMode,
+  LoadProfile}` variants. The report-size constants keep the hidapi vocabulary: `ONBOARD_OUTPUT_REPORT_SIZE` (65)
+  against `ONBOARD_WRITE_REPORT_KIND::Feature`'s `ONBOARD_FEATURE_REPORT_SIZE` (643), `ONBOARD_READ_WIRE_BYTES` (642)
+  as the GET_REPORT length, `ONBOARD_MAX_READ_LEN` (636) as the most a read frame may ask for. `PLAN.md` history
+  entries keep the names used at their date.
+
 ## Reference projects
 
 - Apex RGB: OpenRGB `SteelSeriesApex8ZoneController`
