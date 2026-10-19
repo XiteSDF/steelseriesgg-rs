@@ -268,6 +268,16 @@ exists; if not, ask the user before adding one. Unknown devices must stay detect
 
 ## Done or dropped (do not redo)
 
+- 2026-10-20: **the META mapping mask is derived, measured, and read-only in the GUI.**
+  `lighting.meta_mapped_elements` (32 bytes at payload `42`) is a 256-bit mask whose bit index is a key's
+  own HID usage: set for every key whose META-layer entry carries a binding (function byte != 0), not set
+  for the key `meta_toggle_hid` names, and the wheel is never in it. The GUI's computation reproduces the
+  stored bytes bit-for-bit in 8 of the 9 reports it decodes; the 9th (`config_1-copy.json`) is a GUI-edited
+  file whose mask is stale - GG treats the field as derived. The Lighting panel's row is read-only, shows
+  the derived bytes and how far the read's bytes are from them, and `serializeDoc` writes the derived mask
+  while the open document keeps what the read carried. GUI suite 195 tests. Facts in the read doc §the META
+  section. `[EXPERIMENTAL]` read-side only: the Rust write sends the JSON's bytes as they are and no mask
+  has been sent to a keyboard; deriving the mask in the Rust codec is open work.
 - 2026-10-20: **the GUI binding window keeps Lock Win and the META toggle apart** (operator report of
   2026-10-19: `0x05` is Lock Win and was acting as the toggle). The Meta action select lists the six
   actions of function `0x62` (`01` Profile Switch, `02` Macro, `03` Brightness Down, `04` Brightness Up,
