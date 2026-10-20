@@ -79,7 +79,7 @@ Key W is slot 16 (actuation byte at 1100, reset byte at 1170, mode byte at 1462)
 ### Slot map (slot = index, HID usage in hex)
 
 Slots follow the physical rows, left to right. Evidence: **C** = captured with a single-key edit
-(engine capture 2, engine capture 3), **S** = matched as a set against GG's stored config (values unique to that
+(`run2.pcap`, `run3.pcap`), **S** = matched as a set against GG's stored config (values unique to that
 set; identity inside the set follows the ISO/JIS layout), **R** = row order, not observed directly.
 The same table is `WIRED_2023_PROFILE_SLOTS` in `src/devices/keyboards/apex_pro_tkl_2023.rs`.
 

@@ -456,14 +456,8 @@ impl GenericKeyboard {
     /// manager opened.
     ///
     /// `[EXPERIMENTAL]` - **needs a hardware test on the wired Apex Pro TKL 2023 (`0x1628`)**. This was
-    /// routed through the path-based `send_feature_report_raw` on 2026-10-15, on the reading that the
-    /// model takes feature reports on USB interface 1 while discovery opens the wireless layout
-    /// (interface 3); the raw call is the same `HIDIOCSFEATURE` ioctl on a path resolved by sysfs
-    /// lookup, so the interface question was never measured from this code. The Apex 7 profile read of
-    /// 2026-10-15/16 showed the same `SET_REPORT wValue 0x0300` shape going out on the collection hidapi
-    /// opened, so the special path is reverted. Test it on hardware (`ssgg rgb color FF0000` on `0x1628`
-    /// with GG stopped, then `rgb brightness` and an animated effect); if the keyboard ignores the
-    /// frames, re-open the interface-1 collection explicitly rather than restoring the path lookup.
+    /// routed through the path-based `send_feature_report_raw`, but the bug this was supposed to work
+    /// around was fixed in hidapi 2.6.6.
     #[cfg(unix)]
     pub fn send_feature(&self, data: &[u8], report_len: usize) -> Result<()> {
         let device = self.connected_device()?;
@@ -508,13 +502,7 @@ impl GenericKeyboard {
             .await
     }
 
-    /// Send one output report on this keyboard's collection: `data[0]` is the report number
-    /// (`SET_REPORT wValue 0x0200`).
-    ///
-    /// Use this for profile protocol transfers, not [`GenericKeyboard::send_report`]: `send_report` writes
-    /// through [`crate::devices::write_padded_report`], whose global [`crate::devices::HidOptimizer`] skips any
-    /// report byte-identical to one sent in the last 50 ms, and profile-protocol transfers repeat identical
-    /// frames (`90 00` and `90 01` polls).
+    /// Send one output report on this keyboard's collection (`SET_REPORT wValue 0x0200`).
     pub(crate) fn write_profile_packet(&self, data: &[u8]) -> Result<()> {
         let device = self.connected_device()?.lock();
         let written = device
@@ -529,12 +517,7 @@ impl GenericKeyboard {
         Ok(())
     }
 
-    /// Read one feature report from this keyboard's collection (`GET_REPORT wValue 0x0300`): `report_id`
-    /// seeds byte 0 and `len` is the buffer size, which the kernel forwards to the device as `wLength`
-    /// verbatim (`HIDIOCGFEATURE`; hidapi hands the slice length straight to the ioctl, hidapi 2.6.7
-    /// `src/linux_native/ioctl.rs:26`). The device's report-ID byte arrives in byte 0, so a `len`-byte ask
-    /// delivers `len - 1` payload bytes. Unlike the write side, where the kernel strips the report number
-    /// from the data stage.
+    /// Read one feature report from this keyboard's collection (`GET_REPORT wValue 0x0300`).
     pub(crate) fn read_profile_feature_packet(&self, report_id: u8, len: usize) -> Result<Vec<u8>> {
         if len < 2 {
             return Err(Error::DeviceCommunication(format!(
@@ -552,12 +535,6 @@ impl GenericKeyboard {
 
     /// Read one interrupt-endpoint input report from this keyboard's collection, waiting up to
     /// `timeout_ms`.
-    ///
-    /// `Ok(None)` **is the timeout**: the window carried nothing, which is the normal state of a transfer that
-    /// polls this endpoint while it waits for an answer. Only a real read failure is an `Err`, so a poll loop
-    /// can tell "not yet" from "this device is not answering any more". Fixing the shape that made a timeout an
-    /// `Err` is what makes a loop's attempt count mean anything: every window is polled, and the first window
-    /// that fails as a read ends the transfer.
     pub(crate) fn read_profile_input_packet(&self, len: usize, timeout_ms: u64) -> Result<Option<Vec<u8>>> {
         let mut report = vec![0u8; len.max(1)];
         let poll_ms = i32::try_from(timeout_ms).unwrap_or(i32::MAX);

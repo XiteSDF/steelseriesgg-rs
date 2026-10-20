@@ -26,9 +26,6 @@ src/devices/hid_reports.rs     HidReportBuilder and typed HID commands - use thi
 src/devices/discovery.rs       DeviceManager: enumeration, hot-plug, fingerprinting
 src/devices/keyboards/         Keyboard impls (apex.rs, apex_pro_tkl_2023.rs = experimental)
 src/gamesense/server.rs        Axum HTTP server (port 27301)
-src/devices/keyboards/apex7.rs Apex 7 legacy family (`0x1612`-`0x1615`): on-board profile read, write, deploy
-src/devices/keyboards/onboard.rs OnboardProfileCodec trait - the read/write geometry a family implements
-src/devices/keyboards/apex_legacy_profile.rs Apex 7 codec: decode, encode, checksum, write plan
 src/audio/                     feature `audio` (pulse.rs) and `sonar` (sonar.rs)
 src/bin/                       helper binaries, not part of `ssgg` (discover_actuation probes actuation firmware)
 examples/                      device_readback.rs (hardware read-back example)
@@ -115,13 +112,12 @@ this is expected, CI builds and lints `audio` on Linux only.
 
 - **Search before reading**: `rg 'TypeName|fn_name' src/`, then read only the relevant lines. Large files: `src/main.rs`, `src/devices/hid_reports.rs`.
 - **Documents**: only create planning or analysis documents when explicitly requested.
-- **Commit messages**: one short imperative subject, no body; details belong in `PLAN.md` and `docs/`.
 
 ---
 
 ## Protocol research notes
 
-- `docs/development/` was checked against source on 2026-10-20 (`docs/development/README.md` lists each file and
+- `docs/development/` was checked against source on 2026-10-15 (`docs/development/README.md` lists each file and
   its state). Source still wins; verify before acting on a doc claim.
 - Command-code status (confirmed / experimental / placeholder) lives in `.claude/rules/experimental-protocol.md`.
 
@@ -142,9 +138,7 @@ was replayed from `ssgg` (one solid colour, see below).
   GG brightness is software scaling of the RGB values (brightness 0 = all-black frame).
 - **Code state**: `0x1628` uses the direct path with GG's 84-key table `WIRED_2023_KEYS`, a 645-byte buffer
   (report-ID byte + 644 wire bytes) and skips the `0x4B` init (`apex_pro_tkl_2023.rs`). Gen3 models keep `TKL_KEYS`
-  (112) and 643. `send_feature` sends on the device's own hidapi handle on every platform; the path-based
-  special case added for this model on 2026-10-15 was reverted on 2026-10-17 (**test on hardware** whether
-  hidapi reaches it: `ssgg rgb color FF0000` on `0x1628` with GG stopped).
+  (112) and 643. Unix `send_feature` uses `info.path` (interface 1) for this model only (`keyboards/mod.rs`).
   Per-key (`rgb perkey`) sends the same 84-key frame with unlisted keys black (no read-back exists).
   `ssgg rgb` warns on Windows when `SteelSeriesEngine.exe` runs (`warn_if_gg_engine_running`, `src/main.rs`).
 - **Hardware evidence**: on 2026-10-14, with GG stopped, `ssgg rgb color FF0000` turned the keyboard solid red
@@ -165,41 +159,11 @@ was replayed from `ssgg` (one solid colour, see below).
 - **GG's stored config**: per-key JSON in `C:\ProgramData\SteelSeries\GG\apps\engine\db\database.db`, table
   `configurations`, column `settings`, `device_id` 242 (`apex_pro_tkl_2022`). Open read-only with GG stopped.
 
-### Apex 7, wired (PIDs `0x1612`-`0x1615`): on-board profile read and write
-
-Apex 7 (`0x1612`), Apex Pro (`0x1614`), Apex 2014 (`0x1616`), Apex Raw (`0x1618`). All of it is `[EXPERIMENTAL]`:
-no byte of the read side is confirmed on hardware per the promotion rule, and **no byte of the write side has been
-sent to a keyboard at all**. Full write-ups: `docs/development/apex-7-onboard-profile-read.md` (read) and
-`docs/development/apex-7-onboard-profile-write.md` (write); `ONBOARD.md` carries the open hardware steps.
-
-- **Read** (`ssgg onboard read`, core code since the `onboard` feature flag was removed 2026-10-17): `90 00` firmware
-  poll (last byte selects firmware source: `00` keyboard, `01` LED controller), one `83 00` schema probe, then per
-  file 40 `85 00 <fs> <file offset> 512` pulls; every pull is **paced** by draining the keyboard's all-zero input
-  report, every `83` window read is read back after a ~1 ms wait, profile files `0x0201 + slot` (`--profile N` =
-  slot `N - 1`, GG's `Config 1`..`Config 5`), lighting `0x0301 + slot`, 512-byte resource buffer, 643-byte reply
-  (report-ID byte + 642 data bytes). GG's six-frame opening chain and closing sequence are sent by nothing (measured
-  2026-10-19: a full slot is read without them), the read changes nothing on the keyboard. Payload layout and
-  checksum (FNV-1a 64 over `0..len-4`, u32 LE word at the payload tail) are in the read doc; `decode`/`encode` are
-  file-only and `tools/profile-gui` binds them.
-- **Write** (`ssgg onboard write`, `ssgg onboard load`, added 2026-10-20 from the operator's GG write capture write
-  capture): `88 00 <profile file id>` open, then **40 windows** of the 40,960-byte profile region - two 512-byte
-  `03 00 <buffer offset> <size> <data>` feature writes (642 wire bytes, buffer offsets 0 and 512, data behind the
-  6-byte header) plus one `05 00 <file id> <file offset> 1024` push (64-byte output report) - then `eb <slot + 1>`
-  commit, then `89 <slot + 1>` deploy after a 250 ms pause. A push is answered with `05 01 …` (202/202) and the open
-  with `88 01 …`; buffer writes and the commit are not answered. Geometry comes from the keyboard's family codec
-  (`OnboardProfileCodec::write_plan`), a write pads the payload to the region, and the file's own size is never read
-  from the board. `--dry-run` prints the 122-frame plan with no keyboard opened; **`--yes` is what authorises
-  sending** - without it write and load send nothing. Fixture asserted frame for frame against the plan:
-  `tests/fixtures/onboard-write-apex7.manifest.txt` (generator `scripts/gg-write-frames.py`).
-- **No read-back exists for an on-board write** on this family, so a write cannot be verified from the device except
-  by reading the slot back with the read path and diffing. That cycle, the first hardware write, and the keyboard
-  effects of `89` are open steps in `ONBOARD.md`.
-
 ### Windows reverse-engineering environment
 
 - Tools: Wireshark (`C:\Program Files\Wireshark\tshark.exe`), USBPcap (`C:\Program Files\USBPcap\USBPcapCMD.exe`).
-  `USBPcapCMD` without arguments is interactive and hangs; always pass `-d \\.\<capture device> -o <file> -A`.
-- The keyboard was the captured USB address in past captures; re-check with tshark after changing ports.
+  `USBPcapCMD` without arguments is interactive and hangs; always pass `-d \\.\USBPcap1 -o <file> -A`.
+- The keyboard was USB device address 3 in past captures; re-check with tshark after changing ports.
 - Useful tshark fields: `-e frame.time_epoch -e usb.data_fragment`; filter
   `usb.setup.bRequest==9 && usb.bmRequestType==0x21 && usb.setup.wValue==0x0300` (or `0x0200` for output reports).
 - Stop GG: kill every `SteelSeries*` process, or the engine respawns. Restart from `C:\Program Files\SteelSeries\GG`
@@ -207,13 +171,10 @@ sent to a keyboard at all**. Full write-ups: `docs/development/apex-7-onboard-pr
   (`SteelSeriesGG.exe` alone exits with code 2).
 - Do not launch GUI capture prompters with `-WindowStyle Hidden`; it hides the form.
 - `ctx_execute_file` refuses paths outside the project; run analysis scripts with `python -I <script> <args>`.
-- Capture artifacts (outside the repo) in the artifact kit: `blobs.bin` / `blobs3.bin`
+- Capture artifacts (outside the repo) in `C:\Users\Ven0m0\gg-capture-artifacts\`: `blobs.bin` / `blobs3.bin`
   (reassembled 12,500-byte profile blobs, 13 each, 8 distinct) and `profile_crc_check.py <blob files>`. The original
-  pcaps (engine capture 2, engine capture 3), step CSVs, `an*.py` scripts and capture prompters were gone on 2026-10-15; the
-  blobs were recovered from an old session scratchpad. The Apex 7 **write** GG write capture (2026-10-20,
-  677,636 bytes, sha256 <digest recorded outside the repo>, Apex 7 `0x1612` firmware 4.16.3, the captured USB address - re-check with tshark
-  after changing ports) decodes to `tests/fixtures/onboard-write-apex7.manifest.txt` via
-  `scripts/gg-write-frames.py`.
+  pcaps (`run2.pcap`, `run3.pcap`), step CSVs, `an*.py` scripts and capture prompters were gone on 2026-10-15; the
+  blobs were recovered from an old session scratchpad.
 
 ---
 
