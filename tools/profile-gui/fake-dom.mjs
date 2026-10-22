@@ -72,6 +72,13 @@ export class FakeNode {
     this.children.push(child);
     return child;
   }
+  // Element.append(...nodes): appends each node, skipping null/undefined, throwing on a non-node.
+  append(...nodes) {
+    for (const node of nodes) {
+      if (node === null || node === undefined) continue;
+      this.appendChild(node);
+    }
+  }
   replaceChildren(...nodes) {
     this.children = [];
     for (const node of nodes) {
@@ -123,6 +130,9 @@ export class FakeNode {
 export const document = {
   createElement: (tag) => new FakeNode(tag),
   createElementNS: (ns, tag) => new FakeNode(tag, ns),
+  // No page tree is attached in the fake DOM, so an id lookup finds nothing: main.js and macros.js both
+  // treat a missing element as "this host has no panel for it".
+  getElementById: () => null,
   addEventListener() {},
   body: new FakeNode('body'),
 };

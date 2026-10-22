@@ -226,16 +226,18 @@ it, it sends the block's own bytes back. Records start with marker `0x77`:
 
 ```
 header  0x77 | mode u8 | id u16 LE | flags u16 LE | interval u16 LE    (8 bytes)
-press   0x02 | key | 0x01 0x01 | word u16 LE | ms u16 LE               (8 bytes)
+press   0x02 | key | 0x01 0x01                                         (4 bytes)
 release 0x02 | key | 0x01 0x00                                         (4 bytes)
 delay   0x04 | 0x00 | ms u16 LE                                        (4 bytes)
 ```
 
 Modes seen: `1` = play once, stepping `interval` ms between actions; `4` = play again every `interval`
 (a mode-4 record with `interval` 5000 presses `4`, which is the META + Insert binding of profile 1). A `0x71`
-mapping row carries `record ordinal × 7` in its third code byte, so `index / 7` names the record
-(`MACRO_INDEX_STRIDE`, `[EXPERIMENTAL]`: every binding a read carried resolved that way, and the press `word`
-(4 in every press seen) is unexplained).
+mapping row carries the **macro id** in its third code byte, and the binding number is `35 + id - 1`
+(`MACRO_BINDING_BASE`, `[EXPERIMENTAL]`: measured 2026-10-22 on a read whose META mapping 15 carries 117 and
+whose records carry id 83, the only id above 34 there, so `35 + 83 - 1 = 117`). Ids `1..221` fit the one-byte
+binding field (`MACRO_ID_MAX`). The `flags` bytes are `01 01` on every record with actions and `01 00` on the
+header that carries none, and are unexplained (`MACRO_RECORD_FLAGS_KNOWN`).
 
 **Checksum**: the little-endian u32 at the payload tail is the STM32 hardware CRC-32 (poly `0x04C11DB7`, init
 `0xFFFFFFFF`, no input/output reflection, no final XOR) over `payload[0..len-4]` read as little-endian 32-bit
@@ -251,14 +253,17 @@ The 64-bit FNV-1a digests in the read report are identity hashes for comparing r
 `decode` walks the macro block into a record list (`apex_7_profile::decode_macros`), and `tools/profile-gui`
 displays it: the Macro panel lists every record the walk produced (mode, id, interval, flags, its keystrokes, the
 keys bound to it, its raw bytes), a key bound with `0x71` shows the same record in its own panel, and the binding
-select offers the decoded records as bind targets. At the moment, only five most recently written to keyboard
-macros are read here.
+select offers the decoded records as bind targets. The walk reads the whole block: every record whose bytes the
+region holds, not a fixed count.
 
 What is **not** supported, and the limits that go with it:
 
-- **No macro editing.** Nothing in `ssgg` or the GUI composes, inserts, deletes, reorders, trims or renames a
-  record. The page can rebind a key to a record - it writes `ordinal * 7` into the third code byte of the
-  binding - and it cannot touch the record's actions.
+- **Editing is a GUI feature, and the write path refuses its result.** The macro editor (the popup window of
+  `ssgg gui`, `tools/profile-gui/macros.js`) composes, inserts, reorders and trims records and hands the list to
+  the open profile. Nothing in `ssgg` writes a macro: `encode` refuses a record list that does not match the
+  block's own bytes - the block between the records is GG's own per-macro structures this grammar cannot rebuild
+  - and it refuses a list past the block's capacity with the byte counts. The editor shows both refusals as the
+  codec states them.
 - **The record list is never encoded.** A write takes `macro_data.bytes_hex`, the block as the read recorded it,
   and sends it verbatim; the decoded list in `macros` is not serialised, so a list that disagrees with the bytes
   has no effect on what the keyboard gets.
@@ -266,10 +271,10 @@ What is **not** supported, and the limits that go with it:
   that is neither the zero pad nor a `0x77` record start, and returns the records up to that point with a note in
   `macro_note`. `ssgg` has seen real GG blocks whose bytes its grammar rejects. A report carrying such a note and
   no `bytes_hex` is refused by the write path (`OnboardWriteError::MacroRecordNote`).
-- **Bytes inside a record are unconfirmed.** `flags` is `01 01` in every record seen and is unexplained; the only
-  modes measured are `1` and `4`; `id` is read as GG's database id. The binding stride 7 is `[EXPERIMENTAL]` -
-  every binding measured resolved by `index / 7`, and the largest binding seen (117 = 7 × 16 + 5) needs 17
-  records, the same order of size as the 9,600-byte block.
+- **Bytes inside a record are unconfirmed.** `flags` is `01 01` in every record with actions and is unexplained;
+  the modes measured are `1`, `2`, `4` and `5`; `id` is read as GG's database id. The binding rule `35 + id - 1`
+  is `[EXPERIMENTAL]`: measured on the read named above, and the ids measured (1 to 83) all resolve to bindings
+  inside `35..255`.
 - **Macro names are not in the payload.** The name and the macro as GG displays it live in GG's own database
   (`db\database.db`); the payload carries packed records only, which is why the panel labels a record by ordinal,
   mode and action count and not by name.

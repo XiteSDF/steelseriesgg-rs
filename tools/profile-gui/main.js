@@ -15,6 +15,8 @@ const controls = {
   status: document.getElementById('status'),
   fileInput: document.getElementById('fileInput'),
   saveBtn: document.getElementById('saveBtn'),
+  macroBtn: document.getElementById('macroBtn'),
+  macroBox: document.getElementById('macroBox'),
   layerBaseBtn: document.getElementById('layerBaseBtn'),
   layerMetaBtn: document.getElementById('layerMetaBtn'),
   onRender: syncLayerButtons,

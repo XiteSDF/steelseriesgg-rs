@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ssgg macro editor</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="style.css">
+<script src="products.generated.js" defer></script>
+<script src="app.js" defer></script>
+<script src="live.js" defer></script>
+<script src="macros.js" defer></script>
+</head>
+<body>
+<section id="macroEditorBox" class="macro-editor" data-ssgg-macro-popup></section>
+<footer class="foot mono">
+  Record grammar, region and capacity mirror <span class="mono">src/devices/keyboards/apex_7_profile.rs</span>
+  (<span class="mono">decode_macros</span>, <span class="mono">encode_macro_records</span>,
+  <span class="mono">MACRO_REGION_START_B</span>, <span class="mono">MACRO_REGION_LEN_B</span>), which
+  <span class="mono">ssgg gui</span> validates on <span class="mono">POST /api/macros/session</span>: the apply
+  button is refused with the same numbers <span class="mono">ssgg onboard write</span> would refuse with.
+  <span class="mono">[EXPERIMENTAL]</span> reverse-engineered protocol, measured on one Apex 7
+  (<span class="mono">0x1612</span>). This page writes no keyboard - the profile reaches a board through
+  <span class="mono">ssgg onboard write</span>, which recomputes the payload checksum word.
+</footer>
+</body>
+</html>

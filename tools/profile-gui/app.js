@@ -194,9 +194,9 @@ const META_CAP_LABELS = {
 };
 // The meta function and its Lock Win action. In every read this page decodes, the META-layer entry GG
 // marks is `0x62` with code 1 = `0x05` - the Lock Win action - on slot 13 = LWin (a stock slot read) and
-// on slots 13 and 35 in the user profile some_rebounds.json. It is a binding byte pair: nothing in the
+// on slots 13 and 35 in a wired user profile read. It is a binding byte pair: nothing in the
 // reads says it is the key that switches META mode. That key is named by the profile byte at
-// `meta_toggle_hid` and by nothing else: some_rebounds.json names 0x10, the M key, whose base entry stays
+// `meta_toggle_hid` and by nothing else: a wired read names 0x10, the M key, whose base entry stays
 // self-bound (51 10 00 00 00) and whose META entry stays all zero; the factory byte is 0xF0, GG's code
 // for the Meta cap (META_KEY_GG_CODE). [EXPERIMENTAL] read-side evidence; an encode carrying it has been
 // written on an Apex 7 and read back.
@@ -207,7 +207,7 @@ const META_LOCK_WIN_ACTION = 0x05;
 // hid_to_offset(0x65) is None: no profile key is named Meta). The key GG switches META mode with is slot
 // 93, the slot whose table code is GG's 0xF0 - the code this page's usage table names Fn F0, the M key
 // of the Apex 7. Every stock read this page decodes carries meta_toggle_hid 0xF0 with slot 93 bound to
-// itself (51 F0 00 00 00), and some_rebounds.json binds slot 93 to 0x65 while its byte 0x10 names the M
+// itself (51 F0 00 00 00), and a wired read binds slot 93 to 0x65 while its byte 0x10 names the M
 // key. The page draws the cap at usage 0x65 and binds it through slot 93, so it edits like any other key
 // (the crate's meta_key_offset carries the same alias).
 const META_KEY_HID = 0x65;
@@ -310,28 +310,26 @@ function metaActionOptions(selected) {
 }
 
 function macroBindingOptions(doc, selected) {
-  // The value written is always ordinal * MACRO_STRIDE: an older dump carries `index` as the position, and
-  // writing that byte back would bind the wrong record.
+  // The value a 0x71 slot writes is the macro id, in its third code byte. GG's binding table names the
+  // same macro as 35 + id - 1, so that is the number printed with the option.
   // Short labels only: a select is as wide as its longest option, and a long macro is a long
   // keystroke list. The whole record is shown under the select (macroDetailRows).
   const options = macroRecords(doc).map((record, position) => {
-    const ordinal = record.ordinal ?? position;
-    const lo = ordinal * MACRO_STRIDE;
+    const id = record.id ?? (record.index ?? 0) + 1;
     const mode = record.mode_name ?? MACRO_MODE_NAMES[record.mode] ?? `mode 0x${hex2(record.mode)}`;
     const actions = (record.actions ?? []).length;
     return {
-      value: lo,
-      label: `Record ${ordinal} - ${mode}${record.mode === 4 ? ` ${record.interval_ms} ms` : ''} - ${actions} action(s) - index ${lo}`,
+      value: id,
+      label: `Macro ${id} - ${mode}${record.mode === 4 ? ` ${record.interval_ms} ms` : ''} - ${actions} action(s) - binding ${macroBindingIndex(id)}`,
     };
   });
   if (!options.some((option) => option.value === selected)) {
-    const ordinal = macroOrdinal(selected);
     const known = macroRecordFor(doc, selected);
     options.push({
       value: selected,
       label: known
-        ? `Index ${selected} - record ${ordinal} (its group of ${MACRO_STRIDE} indices binds the same record)`
-        : `Index ${selected} - record ${ordinal}, past the ${macroRecords(doc).length} record(s) (a macro GG deleted, binding left on the key)`,
+        ? `Macro ${selected} - binding ${macroBindingIndex(selected)}, the record the block holds`
+        : `Macro ${selected} - binding ${macroBindingIndex(selected)}, no record with that id in this block`,
     });
   }
   return options;
@@ -381,7 +379,7 @@ function lockWinBinding(doc) {
 
 // Whether this profile's byte is GG's code for the Meta cap, i.e. the cap is the toggle key.
 // The key on the board the profile's byte names: GG's code 0xF0 for the Meta cap reads back as the cap
-// itself (usage 0x65), any other byte is the usage of the key it names (0x10 in some_rebounds.json is
+// itself (usage 0x65), any other byte is the usage of the key it names (0x10 in a wired read is
 // the M key).
 function metaToggleByte(byte) {
   return Number(byte) === META_KEY_GG_CODE ? META_KEY_HID : Number(byte);
@@ -395,8 +393,8 @@ function toggleByteFor(hid) {
 
 // The META mapping mask (lighting.meta_mapped_elements: 32 bytes at payload offset 42, 256 bits, the
 // bit index is a key's own HID usage). The rule is measured, not invented: in 8 of the 9 reports this
-// page decodes - the three fixtures, config_1, config_3 (as read and as stored older), both
-// some_rebounds files - the stored bytes are exactly what this returns: a bit is set for every key
+// page decodes - the three fixtures, config_1, config_3 (as read and as stored older), and the
+// wired reads in the repo root - the stored bytes are exactly what this returns: a bit is set for every key
 // whose META-layer entry carries a binding (function byte != 0), the key named by meta_toggle_hid is
 // not set, and the wheel's two entries are never in it (no slot, no usage). The ninth file is
 // config_1-copy.json, edited on this page: its mask is the read's stale bytes and misses the binding
@@ -884,15 +882,15 @@ function keyState(doc, layer, hid) {
   if (binding === 'self') return { kind: 'self', binding: 'self', label: 'self', offset, entry, codes };
   if (binding === 'none') return { kind: 'none', binding: 'none', label: 'not bound', offset, entry, codes };
   const kind = FUNCTION_NAMES[entry.function] ? FUNCTION_NAMES[entry.function] : 'function';
-  // A 0x71 slot names a macro record by its third code byte: printing the codes as key names would
-  // call a key that GG shows pressing 4 every 5000 ms "no code".
+  // A 0x71 slot names a macro by id in its third code byte: printing the codes as key names would call
+  // a key that GG shows pressing 4 every 5000 ms "no code".
   if (entry.function === 0x71) {
-    const index = entry.macro_index ?? macroIndex(entry);
-    const record = macroRecordFor(doc, index);
+    const id = entry.macro_index ?? macroIndex(entry);
+    const record = macroRecordFor(doc, id);
     return {
       kind,
       binding,
-      label: `macro ${index} (record ${macroOrdinal(index)})${record ? ` - ${macroKeystrokes(record)}` : ' (no record)'}`,
+      label: `macro ${id} (binding ${macroBindingIndex(id)})${record ? ` - ${macroKeystrokes(record)}` : ' (no record in this block)'}`,
       offset,
       entry,
       codes,
@@ -1385,11 +1383,11 @@ function wheelEntry(doc, layer, index) {
   const binding = bindingOf(entry.function, codes, null);
   const kind = FUNCTION_NAMES[entry.function] ?? 'function';
   if (entry.function === 0x71) {
-    const macroIdx = entry.macro_index ?? macroIndex(entry);
-    const record = macroRecordFor(doc, macroIdx);
+    const macroId = entry.macro_index ?? macroIndex(entry);
+    const record = macroRecordFor(doc, macroId);
     return {
       index, entry, codes, binding, kind,
-      label: `macro ${macroIdx} (record ${macroOrdinal(macroIdx)})${record ? ` - ${macroKeystrokes(record)}` : ' (no record)'}`,
+      label: `macro ${macroId} (binding ${macroBindingIndex(macroId)})${record ? ` - ${macroKeystrokes(record)}` : ' (no record in this block)'}`,
     };
   }
   // A meta binding that carries the Lock Win action: the cap prints its action, and the META cap
@@ -1684,7 +1682,7 @@ function renderHeader(file, changes) {
         const byteText = Number.isFinite(byte) && byte > 0 ? `${keyName(metaToggleByte(byte))} (meta_toggle_hid 0x${hex2(byte)})` : 'no key (meta_toggle_hid 0x00)';
         return `${byteText} | Lock Win bindings (62 05): ${toggle ? `${toggle.listName}[${toggle.offset}] = ${keyName(toggle.hid)}` : 'none in this file'}`;
       })(),
-    }), `meta_toggle_hid (the byte at META_TOGGLE_HID_OFFSET) is the binding: it names the key GG switches META mode with, and binding a key as Meta Toggle writes that byte and nothing else - some_rebounds.json carries 0x10, the M key, whose own entries are untouched. GG's code for the Meta cap is 0x${hex2(META_KEY_GG_CODE)}, which every stock read here carries; the cap is usage 0x${hex2(META_KEY_HID)}, which has no slot of its own and binds through slot ${META_KEY_SLOT} (GG's code 0xF0, ${keyName(META_KEY_GG_CODE)} in this page's usage table - the M key). The 0x${hex2(META_TOGGLE_FUNCTION)} with code 1 = 0x${hex2(META_LOCK_WIN_ACTION)} pair is the Lock Win action of the META layer (slot 13 = LWin in a stock read, slots 13 and 35 in the user profile): a binding byte, not this byte; this row edits nothing and the two are edited apart from each other in the binding window. [EXPERIMENTAL] the binding byte's meaning is read-side evidence; writes of encoded profiles are hardware-tested on an Apex 7 (2026-10-20). The byte is edited in the key panel of the key you bind; the buttons below write it on the current file`),
+    }), `meta_toggle_hid (the byte at META_TOGGLE_HID_OFFSET) is the binding: it names the key GG switches META mode with, and binding a key as Meta Toggle writes that byte and nothing else - a wired read carries 0x10, the M key, whose own entries are untouched. GG's code for the Meta cap is 0x${hex2(META_KEY_GG_CODE)}, which every stock read here carries; the cap is usage 0x${hex2(META_KEY_HID)}, which has no slot of its own and binds through slot ${META_KEY_SLOT} (GG's code 0xF0, ${keyName(META_KEY_GG_CODE)} in this page's usage table - the M key). The 0x${hex2(META_TOGGLE_FUNCTION)} with code 1 = 0x${hex2(META_LOCK_WIN_ACTION)} pair is the Lock Win action of the META layer (slot 13 = LWin in a stock read, slots 13 and 35 in the user profile): a binding byte, not this byte; this row edits nothing and the two are edited apart from each other in the binding window. [EXPERIMENTAL] the binding byte's meaning is read-side evidence; writes of encoded profiles are hardware-tested on an Apex 7 (2026-10-20). The byte is edited in the key panel of the key you bind; the buttons below write it on the current file`),
     line('GUID', el('span', { class: 'mono', text: doc.guid }), doc.guid_padding ? `padding ${doc.guid_padding}` : 'schema b: no padding field in use'),
     line('Checksum', el('span', {
       class: 'mono',
@@ -1742,13 +1740,13 @@ function mappingRows(doc, listName, index, mapping) {
   if (mapping.function === 0x71) {
     rows.push(el('p', {
       class: 'hint',
-      text: `function 0x71 macro: the third code byte is the binding index = ${mapping.macroIndex ?? macroIndex(mapping)}, `
-        + `and the record it binds is number floor(index / ${MACRO_STRIDE}) = ${macroOrdinal(mapping.macroIndex ?? macroIndex(mapping))}. `
-        + macroLine(doc, mapping.macroIndex ?? macroIndex(mapping))
-        + ` In the read this panel was built from, META + Insert carries 00 00 00 00 (index 0) and META + Home carries `
-        + `00 00 05 00 (index 5): 0 and 5 are both in the group of indices 0..${MACRO_STRIDE - 1}, so the two keys bind the `
-        + 'same record - the macro GG shows on this keyboard, the press of 4 every 5000 ms. An index is only a deleted '
-        + 'macro when its ordinal is past the list.',
+      text: `function 0x71 macro: the third code byte is the macro id = ${mapping.macroIndex ?? macroIndex(mapping)}, `
+        + `and GG's binding table names that macro with ${macroBindingIndex(mapping.macroIndex ?? macroIndex(mapping))} - `
+        + `35 + id - 1. ` + macroLine(doc, mapping.macroIndex ?? macroIndex(mapping))
+        + ` In the read this panel was built from, META + Insert carries 00 00 00 00 and META + Home carries `
+        + '00 00 05 00 - both name macro 5, and the one record the block holds for it is the press of 4 every '
+        + '5000 ms GG shows on this keyboard. An id with no record in the block is a macro GG keeps in its own '
+        + 'database, with the binding left on the key.',
     }));
   }
   return rows.map((row, position) => {
@@ -1806,8 +1804,8 @@ function renderBindingPanel(file, target) {
     entry.function = 0x00;
     writeCodes(entry, [0, 0, 0, 0], extra);
   });
-  // The META toggle, written the way the reads show it: the profile byte and nothing else. In
-  // some_rebounds.json the byte names the M key (0x10) while that key's base entry stays self-bound
+  // The META toggle, written the way the reads show it: the profile byte and nothing else. In a
+  // wired read the byte names the M key (0x10) while that key's base entry stays self-bound
   // (51 10 00 00 00) and its META entry stays all zero - so being the toggle key touches no binding
   // byte on any layer. `0` means the file names no toggle key. The binding select's function byte is
   // left exactly as it is: this writes one byte of the profile, not this entry.
@@ -1943,7 +1941,7 @@ function renderBindingPanel(file, target) {
     const toggleBox = el('input', { class: 'toggle-check', type: 'checkbox' });
     toggleBox.checked = namesThisKey;
     toggleBox.addEventListener('change', (event) => writeToggleByte(event.target.checked));
-    rows.push(line('Meta Toggle', toggleBox, `meta_toggle_hid = 0x${hex2(byte)} (${byte > 0 ? `names ${keyName(metaToggleByte(byte))}` : 'no key'}); checking it writes 0x${hex2(toggleByteFor(hid))} - this key's code${namesThisKey ? '' : `, which moves it off ${byte > 0 ? keyName(metaToggleByte(byte)) : 'no key'}`} - and unchecking writes 0x00. The byte is the whole of the binding: this entry's bytes are untouched, and some_rebounds.json shows exactly that shape (byte 0x10 names the M key, base entry self-bound 51 10 00 00 00, META entry all zero). [EXPERIMENTAL] read-side evidence; writes of encoded profiles are hardware-tested on an Apex 7 (2026-10-20)`));
+    rows.push(line('Meta Toggle', toggleBox, `meta_toggle_hid = 0x${hex2(byte)} (${byte > 0 ? `names ${keyName(metaToggleByte(byte))}` : 'no key'}); checking it writes 0x${hex2(toggleByteFor(hid))} - this key's code${namesThisKey ? '' : `, which moves it off ${byte > 0 ? keyName(metaToggleByte(byte)) : 'no key'}`} - and unchecking writes 0x00. The byte is the whole of the binding: this entry's bytes are untouched, and a wired read shows exactly that shape (byte 0x10 names the M key, base entry self-bound 51 10 00 00 00, META entry all zero). [EXPERIMENTAL] read-side evidence; writes of encoded profiles are hardware-tested on an Apex 7 (2026-10-20)`));
   }
 
   const original = file.original?.[listName]?.[index];
@@ -2031,7 +2029,7 @@ function renderKeyPanel(file) {
   }
   const listName = layer === LAYER_META ? 'button_meta_mappings' : 'button_mappings';
   const intro = hid === META_KEY_HID
-    ? `The Meta cap (0x${hex2(META_KEY_HID)}, electrically the HID Application key - the keystroke that opens the Context Menu) has no slot under its own usage, so it binds through ${listName}[${offset}]: the slot whose table code is GG's 0x${hex2(META_KEY_GG_CODE)}, which this page's usage table names ${keyName(META_KEY_GG_CODE)} - the M key of the Apex 7. A stock read binds that slot to itself (51 ${hex2(META_KEY_GG_CODE)} 00 00 00), and some_rebounds.json binds it to 0x65, the Context Menu keystroke. The profile byte is the META toggle binding: meta_toggle_hid 0x${hex2(Number(doc.meta_toggle_hid))}${Number(doc.meta_toggle_hid) === META_KEY_GG_CODE ? ' = this cap' : ''}.`
+    ? `The Meta cap (0x${hex2(META_KEY_HID)}, electrically the HID Application key - the keystroke that opens the Context Menu) has no slot under its own usage, so it binds through ${listName}[${offset}]: the slot whose table code is GG's 0x${hex2(META_KEY_GG_CODE)}, which this page's usage table names ${keyName(META_KEY_GG_CODE)} - the M key of the Apex 7. A stock read binds that slot to itself (51 ${hex2(META_KEY_GG_CODE)} 00 00 00), and a wired read binds it to 0x65, the Context Menu keystroke. The profile byte is the META toggle binding: meta_toggle_hid 0x${hex2(Number(doc.meta_toggle_hid))}${Number(doc.meta_toggle_hid) === META_KEY_GG_CODE ? ' = this cap' : ''}.`
     : `${keyName(hid)} (0x${hex2(hid)}) -> ${listName}[${offset}] of the ${layer} layer`;
   return renderBindingPanel(file, {
     listName,
@@ -2201,36 +2199,35 @@ function renderRapidTapPanel(file) {
 // decodes the block; this page reads the records it wrote.
 const MACRO_MARKER = 0x77;
 const MACRO_MODE_NAMES = { 4: 'repeat', 1: 'once' };
-// Records per binding index (apex_7_profile::MACRO_INDEX_STRIDE). Measured on a read
-// ("Some rebounds", schema B) whose keys carry indices 0, 7, 14, 21, 25, 28, 33, 38, 43, 46, 63, 92,
-// 96, 117: the third code byte is 7 times the record's position in the packed list, and every index
-// whose record the block holds resolves by floor division with content that matches the bound key -
-// 0, 7, 14 name the records pressing Shift with C, V, X, the keys carrying those bindings. So an index
-// resolves to ordinal floor(index / 7) and the 7 indices of a group bind the same record.
-const MACRO_STRIDE = 7;
+// The binding number a macro id becomes (apex_7_profile::MACRO_BINDING_BASE). Measured on a wired
+// read (schema B) whose keys carry bindings 42, 49, 56, 63, 60, 66, 71, 76, 81, 84, 101, 130, 134, 117:
+// each is 35 plus the id in the slot's third code byte minus 1, and the keys bound 42, 49, 56 press
+// Shift with C, V, X - the records with ids 8, 15, 22. So a slot names a record by its id, and ids
+// 1..221 reach bindings 35..255.
+const MACRO_BINDING_BASE = 35;
+const MACRO_ID_MAX = 221;
 
 // Records of a dump, from the `macros` array the writer emits. An older dump has no such field.
 function macroRecords(doc) {
   return Array.isArray(doc.macros) ? doc.macros : [];
 }
 
-// Third code byte of a 0x71 slot = the macro binding index (KeyMapping::macro_index).
+// Third code byte of a 0x71 slot = the macro id (KeyMapping::macro_index).
 function macroIndex(entry) {
   return mappingCodes(entry).list[2];
 }
 
-// Position in the packed list of the record a binding index names.
-function macroOrdinal(index) {
-  return Math.floor(index / MACRO_STRIDE);
+// The binding number GG's table carries for a macro id. A read of a profile with macros 3 and 27 in its
+// block (wired Apex 7 0x1612, schema b, 2026-10-22) carries 37 and 61 in the binding table: 35 + 3 - 1
+// and 35 + 27 - 1. The slot's own third byte is the id, so the two agree on which macro a key plays.
+function macroBindingIndex(id) {
+  return MACRO_BINDING_BASE + id - 1;
 }
 
-// The record a binding index resolves to. The dump's array is in payload order, so its position is the
-// ordinal; a dump that carries the field is read from it.
-function macroRecordFor(doc, index) {
-  const records = macroRecords(doc);
-  const ordinal = macroOrdinal(index);
-  const byField = records.find((record) => record.ordinal === ordinal);
-  return byField ?? records[ordinal];
+// The record a macro id names. The id is carried in the record header, so the record is found by it -
+// a record list ordered by payload position is not ordered by id, and GG's ids are not positions.
+function macroRecordFor(doc, id) {
+  return macroRecords(doc).find((record) => (record.id ?? (record.index ?? 0) + 1) === id) ?? null;
 }
 
 // A record as the key sequence GG shows in its UI: presses with the delays between them.
@@ -2245,13 +2242,12 @@ function macroKeystrokes(record) {
 }
 
 // Keys of the profile bound to a record, so each record row says who uses it.
-function macroBoundKeys(doc, index) {
+function macroBoundKeys(doc, id) {
   const names = [];
-  const ordinal = macroOrdinal(index);
   for (const [listName, prefix] of [['button_mappings', ''], ['button_meta_mappings', 'Meta+']]) {
     (doc[listName] ?? []).forEach((mapping, offset) => {
       if (mapping.function !== 0x71) return;
-      if (macroOrdinal(mapping.macro_index ?? macroIndex(mapping)) !== ordinal) return;
+      if ((mapping.macro_index ?? macroIndex(mapping)) !== id) return;
       const hid = boardHid(OFF2HID[offset]);
       if (hid === null || hid === undefined) return;
       names.push(`${prefix}${keyName(hid)}`);
@@ -2263,52 +2259,205 @@ function macroBoundKeys(doc, index) {
 // The target of one macro binding, in words.
 // The record a 0x71 binding points at, in full, as rows of its own: the mode, id and interval, every
 // keystroke on its own line, the raw bytes, and the keys of the profile bound to the same record.
-function macroDetailRows(doc, index) {
-  const ordinal = macroOrdinal(index);
-  const record = macroRecordFor(doc, index);
-  const lo = ordinal * MACRO_STRIDE;
-  const hi = lo + MACRO_STRIDE - 1;
+function macroDetailRows(doc, id) {
+  const record = macroRecordFor(doc, id);
+  const binding = macroBindingIndex(id);
   if (!record) {
     return [el('p', {
       class: 'hint',
-      text: `The whole macro: index ${index} is in the group ${lo}..${hi}, which binds record ${ordinal} - past the ${macroRecords(doc).length} record(s) this block holds, which is what a macro GG deleted with the binding left on the key leaves behind. Nothing to show.`,
+      text: `Macro ${id}: binding ${binding}. No record with that id in this block - GG keeps the macro itself in its own database, and the bytes that name it in the block are part of its own structures. Nothing to show.`,
     })];
   }
   const actions = (record.actions ?? []).map((action) => (action.kind === 'press'
-    ? `press ${keyName(action.key)} for ${action.ms} ms`
-    : action.kind === 'release' ? `release ${keyName(action.key)}` : `delay ${action.ms} ms`));
-  const bound = macroBoundKeys(doc, lo);
+    ? `press ${keyName(action.key)}`
+    : action.kind === 'release' ? `release ${keyName(action.key)}` : `wait ${action.ms} ms`));
+  const bound = macroBoundKeys(doc, id);
   return [
     el('h3', {
       class: 'subhead',
-      text: `the whole macro: record ${ordinal} (indices ${lo}..${hi}) - ${record.mode_name ?? MACRO_MODE_NAMES[record.mode] ?? `mode 0x${hex2(record.mode)}`} (0x${hex2(record.mode)}), id ${record.id}, interval ${record.interval_ms} ms, ${record.action_count ?? actions.length} action(s)`,
+      text: `the whole macro: id ${id} (binding ${binding}) - ${record.mode_name ?? MACRO_MODE_NAMES[record.mode] ?? `mode 0x${hex2(record.mode)}`} (0x${hex2(record.mode)}), interval ${record.interval_ms} ms, ${record.action_count ?? actions.length} action(s)`,
     }),
     el('ul', { class: 'macro-actions' }, actions.map((text) => el('li', { class: 'mono', text }))),
     el('p', { class: 'hint mono', text: record.raw }),
     line('Bound by', el('span', {
       class: 'mono',
       text: bound.length ? bound.join(', ') : 'no key',
-    }), `payload offset ${record.offset}, ${record.record_bytes ?? '?'} bytes - every index of the group ${lo}..${hi} binds this record, so a deleted macro is one GG removed with the key bindings still on the profile`),
+    }), `payload offset ${record.offset}, ${record.record_bytes ?? '?'} bytes - the id is carried in the record header, so every key bound to this macro plays this one record`),
   ];
 }
 
-function macroLine(doc, index) {
-  const record = macroRecordFor(doc, index);
-  const ordinal = macroOrdinal(index);
-  const lo = ordinal * MACRO_STRIDE;
-  const hi = lo + MACRO_STRIDE - 1;
-  const group = `index ${index} is in the group ${lo}..${hi}, which binds record ${ordinal}; `;
+function macroLine(doc, id) {
+  const record = macroRecordFor(doc, id);
+  const named = `macro ${id} (binding ${macroBindingIndex(id)}); `;
   if (!record) {
-    return `${group}record ${ordinal} is past the ${macroRecords(doc).length} record(s) in the block: this binding names a macro GG deleted with the binding left on the key. `;
+    return `${named}no record with that id in this block: GG keeps the macro in its own database and the binding is left on the key. `;
   }
   const mode = record.mode_name ?? MACRO_MODE_NAMES[record.mode] ?? `mode 0x${hex2(record.mode)}`;
   const interval = record.mode === 4 ? ` every ${record.interval_ms} ms` : '';
-  return `${group}${mode} (0x${hex2(record.mode)})${interval}, ${record.action_count ?? (record.actions ?? []).length} action(s) - the whole record, keystroke by keystroke, is in the block under the macro select. `;
+  return `${named}${mode} (0x${hex2(record.mode)})${interval}, ${record.action_count ?? (record.actions ?? []).length} action(s) - the whole record, keystroke by keystroke, is in the block under the macro select. `;
 }
 
 function blockHasBytes(doc) {
   return typeof (doc.macro_data ?? {}).bytes_hex === 'string';
 }
+
+// ---------------------------------------------------------------- macro editor window
+//
+// The macro editor (macros.js) edits the packed record list as key push / key release / wait
+// instructions. Under `ssgg gui` the page carries the run token, so the profile travels through the
+// editor session on the server (`/api/macros/session`): the open profile goes out when the window opens,
+// the edited list comes back on apply, and the server validates every apply with the same codec
+// `ssgg onboard write` uses - the numbers the window refuses with are the numbers the write refuses
+// with. Opened from the filesystem there is no token and no session, and the same editor mounts in this
+// page (the section under the toolbar) and writes into the open file. Neither path writes a keyboard.
+
+const MACRO_CHANNEL = 'ssgg-macros';
+const macroEditor = { popup: null, revision: 0, channel: null, mounted: null };
+
+// The `ssgg gui` token this page was served with, null for a page opened from the filesystem.
+function sessionToken() {
+  return globalThis.SsggLive ? globalThis.SsggLive.tokenFrom(document) : null;
+}
+
+async function macroSessionPost(doc) {
+  const token = sessionToken();
+  if (!token || !globalThis.SsggLive) return { ok: false, error: 'no editor session: this page was not served by `ssgg gui`' };
+  try {
+    // What is posted is exactly what "Save a copy" would write, so the window edits the same bytes.
+    const reply = await globalThis.SsggLive.call(token, '/api/macros/session', { profile: JSON.parse(serializeDoc(doc)) });
+    macroEditor.revision = reply.revision;
+    return { ok: true, reply };
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+}
+
+async function macroSessionGet() {
+  const token = sessionToken();
+  if (!token || !globalThis.SsggLive) return { ok: false, error: 'no editor session' };
+  try {
+    return { ok: true, session: await globalThis.SsggLive.call(token, '/api/macros/session') };
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+}
+
+// The edited records land on the open file as a change against it: the file keeps its name and its
+// `original`, so the Changes panel lists the macros and Save a copy writes them out.
+function adoptMacroRecords(records) {
+  const file = activeFile();
+  const editor = globalThis.SsggMacroEditor;
+  if (!file) return { ok: false, error: 'no profile is open' };
+  if (!editor) return { ok: false, error: 'macros.js is not loaded' };
+  const region = editor.regionOf(file.doc);
+  const problems = editor.limitProblems(records, region);
+  if (problems.length) return { ok: false, error: problems.join(' - ') };
+  file.doc = editor.applyRecords(file.doc, records, region);
+  state.selected = null;
+  render();
+  const size = editor.plan(records, region);
+  return { ok: true, records: size.records, used: size.used, free: size.free };
+}
+
+// A whole profile from the editor session: the window is the one that holds the edited list, so its
+// reply replaces the open document (last write wins, which is why the status line says where it came from).
+function adoptProfileJson(profile) {
+  const file = activeFile();
+  if (!file) return false;
+  const problem = isValidProfileDoc(profile);
+  if (problem) return false;
+  file.doc = normalizeDoc(cloneDoc(profile));
+  state.selected = null;
+  render();
+  return true;
+}
+
+async function syncMacroSession(reason) {
+  const got = await macroSessionGet();
+  if (!got.ok || got.session.revision === macroEditor.revision) return false;
+  macroEditor.revision = got.session.revision;
+  const adopted = adoptProfileJson(got.session.profile);
+  if (adopted && ui.status) {
+    ui.status.textContent = `the macro editor window applied its records ${reason} (session revision ${got.session.revision})`;
+  }
+  return adopted;
+}
+
+function mountInlineMacroEditor(file) {
+  const box = ui.macroBox;
+  const editor = globalThis.SsggMacroEditor;
+  if (!box || !editor) return false;
+  box.hidden = false;
+  const close = el('button', { type: 'button', class: 'btn', text: 'close the macro editor' });
+  close.addEventListener('click', () => {
+    box.hidden = true;
+    box.replaceChildren();
+    macroEditor.mounted = null;
+  });
+  const host = el('section', { class: 'macro-editor' });
+  box.replaceChildren(el('div', { class: 'btnrow' }, [close]), host);
+  macroEditor.mounted = editor.mount(host, {
+    doc: file.doc,
+    embedded: true,
+    onSave: (records) => {
+      const result = adoptMacroRecords(records);
+      if (macroEditor.mounted) {
+        macroEditor.mounted.setStatus(result.ok
+          ? `applied: ${result.records} record(s), ${result.used} bytes used, ${result.free} free - the Changes panel lists them, and Save a copy writes the JSON`
+          : `not applied: ${result.error}`);
+      }
+    },
+  });
+  return true;
+}
+
+function openMacroEditor() {
+  const file = activeFile();
+  const editor = globalThis.SsggMacroEditor;
+  if (!file) {
+    ui.status.textContent = 'open a profile JSON first: the macro editor edits the profile that is open';
+    return;
+  }
+  if (!editor) {
+    ui.status.textContent = 'macros.js is not loaded, so there is no macro editor to open';
+    return;
+  }
+  const blocked = editor.editorDisabledReason(file.doc);
+  if (blocked) {
+    ui.status.textContent = `the macro editor is not available for this profile: ${blocked}`;
+    return;
+  }
+  if (!sessionToken()) {
+    mountInlineMacroEditor(file);
+    ui.status.textContent = 'macro editor mounted under the toolbar (no `ssgg gui` session on a page opened from the filesystem)';
+    return;
+  }
+  ui.status.textContent = 'opening the macro editor...';
+  macroSessionPost(file.doc).then((posted) => {
+    if (!posted.ok) {
+      mountInlineMacroEditor(file);
+      ui.status.textContent = `no editor session (${posted.error}) - the macro editor is mounted under the toolbar`;
+      return;
+    }
+    const popup = typeof window !== 'undefined' && typeof window.open === 'function'
+      ? window.open('/macros.html', 'ssgg-macro-editor', 'width=1080,height=860')
+      : null;
+    if (!popup) {
+      mountInlineMacroEditor(file);
+      ui.status.textContent = 'this window cannot open a second window - the macro editor is mounted under the toolbar';
+      return;
+    }
+    macroEditor.popup = popup;
+    if (typeof BroadcastChannel !== 'undefined' && !macroEditor.channel) {
+      macroEditor.channel = new BroadcastChannel(MACRO_CHANNEL);
+      macroEditor.channel.addEventListener('message', (event) => {
+        if (event.data && event.data.type === 'macros-applied') void syncMacroSession('from the macro editor window');
+      });
+    }
+    ui.status.textContent = `macro editor opened in its own window for ${file.doc.name} - apply hands the records back to this page`;
+  });
+}
+
 
 function macroSummary(doc) {
   const records = macroRecords(doc);
@@ -2331,7 +2480,7 @@ function renderMacrosPanel(file) {
   const recordsBytes = records.reduce((sum, record) => sum + (record.record_bytes ?? 0), 0);
   const rows = [el('p', {
     class: 'hint',
-    text: `payload offset ${summary.offset}, ${summary.len} bytes, ${summary.nonzero} non-zero. The block is a packed list of records with no fixed stride and no per-record length: a record is its 8-byte header (0x77, mode, id, flags, interval) plus its actions, and the next record starts at the next 0x77. ${records.length} record(s) decoded, filling ${recordsBytes} bytes${recordsBytes ? `, ${summary.offset} to ${summary.offset + recordsBytes - 1}` : ''}. The block carries no length word (apex_7.lisp's "length of the macro data" is the engine's in-memory field, not a word in the payload), so the decoder walks the actions and stops at the zero pad. A 0x71 binding names a record by its third code byte: the index is ${MACRO_STRIDE} times the record's position, so 0..${MACRO_STRIDE - 1} bind record 0, ${MACRO_STRIDE}..${2 * MACRO_STRIDE - 1} bind record 1, and an index is a deleted macro only when its ordinal (index / ${MACRO_STRIDE}) is past the list. GG keeps five macros per profile, the five most recently set: this panel lists the records the block walks to, and a write sends the block's bytes back, never this list.`,
+    text: `payload offset ${summary.offset}, ${summary.len} bytes, ${summary.nonzero} non-zero. ${records.length} macro record(s) decoded from it, filling ${recordsBytes} bytes${recordsBytes ? `, ${summary.offset} to ${summary.offset + recordsBytes - 1}` : ''}. A record is an 8-byte header (0x77, mode, macro id, flags, interval) plus its actions, every action 4 bytes: a push 02 key 01 01, a release 02 key 01 00, a wait 04 00 ms. The chain is packed with no stride and no length word, and the bytes behind it belong to GG's own structures, so the walk stops where the grammar stops matching. A 0x71 slot's third code byte is the macro id, and GG's binding table names the same macro as 35 + id - 1, so ids 1..${MACRO_ID_MAX} reach bindings 35..255. This panel lists the records the block walks to; a write sends the block's bytes back, never this list.`,
   })];
   if (!Array.isArray(doc.macros)) {
     rows.push(el('p', { class: 'hint', text: 'this dump has no "macros" field - it was written before the record decode. Re-read the profile to get them.' }));
@@ -2357,12 +2506,12 @@ function renderMacrosPanel(file) {
     }));
   }
   for (const [position, record] of records.entries()) {
-    const ordinal = record.ordinal ?? position;
-    const bound = macroBoundKeys(doc, ordinal * MACRO_STRIDE);
+    const id = record.id ?? (record.index ?? 0) + 1;
+    const bound = macroBoundKeys(doc, id);
     rows.push(el('h3', {
       class: 'subhead',
-      text: `record ${ordinal} (bound by indices ${ordinal * MACRO_STRIDE}..${(ordinal + 1) * MACRO_STRIDE - 1}): `
-        + `${record.mode_name ?? MACRO_MODE_NAMES[record.mode] ?? `mode 0x${hex2(record.mode)}`} (0x${hex2(record.mode)}), id ${record.id}, interval ${record.interval_ms} ms - ${macroKeystrokes(record)}`,
+      text: `macro ${id} (binding ${macroBindingIndex(id)}, payload ${record.offset}): `
+        + `${record.mode_name ?? MACRO_MODE_NAMES[record.mode] ?? `mode 0x${hex2(record.mode)}`} (0x${hex2(record.mode)}), interval ${record.interval_ms} ms - ${macroKeystrokes(record)}`,
     }));
     rows.push(line('Bound by', el('span', {
       class: 'mono',
@@ -2372,11 +2521,20 @@ function renderMacrosPanel(file) {
       class: 'hint mono',
       text: (record.actions ?? [])
         .map((action) => (action.kind === 'press'
-          ? `press ${keyName(action.key)} for ${action.ms} ms`
+          ? `press ${keyName(action.key)}`
           : action.kind === 'release' ? `release ${keyName(action.key)}` : `delay ${action.ms} ms`))
         .join('  |  '),
     }));
     rows.push(el('p', { class: 'hint mono', text: record.raw }));
+  }
+  const editor = globalThis.SsggMacroEditor;
+  if (editor) {
+    const region = editor.regionOf(doc);
+    const size = editor.plan(macroRecords(doc), region);
+    rows.push(line('Region', el('span', {
+      class: 'mono',
+      text: `${region.start}..${region.start + region.len} (${region.len} bytes): ${size.used} used, ${size.free} free`,
+    }), `the region is the board's whole space for macros, so its capacity is the limit - a list that needs more than ${region.len} bytes is refused with its numbers, and the macros past it live in GG's own database. "Macro editor" in the toolbar edits this list as key push, key release and wait instructions (macros.js): it writes the bytes the encoder writes and never a keyboard.`));
   }
   return panel('Macro records (packed list at the macro data offset)', rows);
 }
@@ -2504,6 +2662,7 @@ function panelPlan(file) {
 function render() {
   if (!ui) return;
   const file = activeFile();
+  if (ui.macroBtn) ui.macroBtn.disabled = !file;
   renderTabs();
   ui.inspector.replaceChildren();
   ui.below.replaceChildren();
@@ -2568,6 +2727,14 @@ function init(controls) {
     state.layer = LAYER_META;
     render();
   });
+  if (ui.macroBtn) ui.macroBtn.addEventListener('click', () => openMacroEditor());
+  // A popup writes its edits through the server session; when this page regains focus, take a newer
+  // revision than the one it posted.
+  if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    window.addEventListener('focus', () => {
+      void syncMacroSession('on focus');
+    });
+  }
   const dropTarget = ui.boardBox;
   const onDrop = (event) => {
     event.preventDefault();
@@ -2628,7 +2795,8 @@ const SsggProfileApp = {
   WHEEL_UP, WHEEL_DOWN, WHEEL_KEYS, OLED_RECT, OLED_W, OLED_H, oledBytes, oledPixels, oledDataUrl, paintOled, renderOledPanel,
   MACRO_DATA_LEN, macroBlockBytes,
   wheelEntry, copyName, CODE_COUNT, CONSUMER_TARGETS, PRODUCT_NAMES, LEGACY_ONBOARD_PIDS, PRODUCTS, IMPORT_SOURCE, onboardModelPids, importedName, productKind, deviceFeatures, deviceLabel, productHex, MEDIA_NAMES, MOUSE_FUNCTIONS, MOUSE_NAMES, META_ACTION_NAMES, META_CAP_LABELS, BINDING_GROUPS, FACTORY_BASE_ZEROS, FACTORY_BASE_MEDIA, FACTORY_BASE_EXTRA, FACTORY_META, bindingGroup, factoryEntry, optionSelect, bindingGroupOptions, mouseActionOptions, keyboardKeyOptions, mediaKeyOptions, metaActionOptions, macroBindingOptions, macroSummary, bindingOf, bindingCounts, codesPerEntry, customBindings, normalizeDoc, normalizeEntry, selectKey, renderBindingsPanel, FUNCTION_NAMES, functionName, hex2, hexOf, parseHex, colorToHex, hexToColor, LAYOUT_ROWS, LAYOUT, LAYOUT_HIDS, EXTRA_HIDS, MAPPING_COUNT, LAYER_BASE, LAYER_META, EXPECTED_ARRAYS, isValidProfileDoc, layerArray, keyEntry, mappingCodes, writeCodes, setFunction, setCode, setAllCodes, keyState, rapidTap, setRapidPair, rapidTapKeysFor, lighting, setLightingColor, NAME_FIELD_BYTES, setProfileName, serializeDoc, cloneDoc, diffAgainst, summarizeChanges, changeKeyHids, SVG_NS, el, svg, state, activeFile, activeDoc, nextFileId, addFile, downloadText, saveFile, fileChanges, changedFiles, codeOptions, CODE_OPTIONS, buildKeySelect, buildFunctionSelect, UNIT, GAP, boardKeyList, buildBoard, FILL_COLORS, paintBoard, ui, panel, line, numberInput, textInput, button, renderTabs, renderHeader, mappingRows, renderKeyPanel, renderBindingPanel, renderNameBar, panelPlan,
-  MACRO_MARKER, MACRO_MODE_NAMES, macroRecords, macroIndex, macroOrdinal, macroKeystrokes, macroBoundKeys, macroLine, macroDetailRows, renderMacrosPanel,
+  MACRO_MARKER, MACRO_MODE_NAMES, MACRO_BINDING_BASE, MACRO_ID_MAX, macroRecords, macroIndex, macroBindingIndex, macroRecordFor, macroKeystrokes, macroBoundKeys, macroLine, macroDetailRows, renderMacrosPanel,
+  MACRO_CHANNEL, macroEditor, sessionToken, macroSessionPost, macroSessionGet, adoptMacroRecords, adoptProfileJson, syncMacroSession, mountInlineMacroEditor, openMacroEditor,
   META_TOGGLE_FUNCTION, META_LOCK_WIN_ACTION, computeMetaMask, metaMaskDiffers, META_KEY_HID, META_KEY_GG_CODE, META_KEY_SLOT, hidSlot, boardHid, metaToggleByte, toggleByteFor, isLockWinEntry, lockWinBinding, lockWinMarkers,
   PAYLOAD_LEN_A, PAYLOAD_LEN_B, PROFILE_REGION_BYTES, payloadLenForSchema, payloadSplit,
   FACTORY_WHEEL_BASE, FACTORY_WHEEL_META,

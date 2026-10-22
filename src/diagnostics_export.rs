@@ -367,7 +367,7 @@ mod tests {
 
     // Since GLOBAL_ERROR_LOG is static, tests running in parallel can conflict.
     // We use a local static Mutex to serialize access to the global error log in tests.
-    static TEST_MUTEX: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+    static TEST_MUTEX: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     fn clear_global_logs() {
         if let Some(log_mutex) = GLOBAL_ERROR_LOG.get() {

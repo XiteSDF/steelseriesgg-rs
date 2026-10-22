@@ -7,8 +7,9 @@
 <link rel="stylesheet" href="style.css">
 <script src="products.generated.js" defer></script>
 <script src="app.js" defer></script>
-<script src="main.js" defer></script>
 <script src="live.js" defer></script>
+<script src="macros.js" defer></script>
+<script src="main.js" defer></script>
 </head>
 <body>
 <header class="bar">
@@ -21,6 +22,7 @@
   <div class="toolbar">
     <label class="btn file">Open JSON<input id="fileInput" type="file" accept=".json,application/json"></label>
     <button id="saveBtn" class="btn primary">Save a copy</button>
+    <button id="macroBtn" class="btn">Macro editor</button>
     <span class="seg">
       <button id="layerBaseBtn" class="btn seg active">Base layer</button>
       <button id="layerMetaBtn" class="btn seg">META layer</button>
@@ -30,6 +32,7 @@
 </header>
 <p id="status" class="status mono"></p>
 <section id="liveBox" class="panel live" hidden></section>
+<section id="macroBox" class="panel macro-box" hidden></section>
 <main>
   <section id="boardBox" class="board-box">
     <div id="nameBar" class="name-bar"></div>

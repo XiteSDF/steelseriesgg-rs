@@ -249,3 +249,44 @@ table.grid tr.clickable:hover td { background: #20262f; }
 .live { margin: 12px 16px; }
 .live[hidden] { display: none; }
 .live-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 6px 0; }
+
+/* macro editor (macros.js): the record list, the record being edited, and its add rows. The popup
+   window (`macros.html`) and the in-page mount (`#macroBox`) share these classes. */
+.macro-box { margin: 12px 16px; }
+.macro-box[hidden] { display: none; }
+.macro-editor { display: block; }
+.macro-head h2 { margin: 0 0 6px; font-size: 15px; color: var(--accent); }
+.macro-profile-name { color: var(--muted); font-weight: 400; }
+.macro-meter { margin: 6px 0 0; color: var(--muted); }
+.macro-meter.over { color: var(--warn); }
+.macro-columns { display: grid; grid-template-columns: minmax(300px, 1fr) minmax(420px, 1.4fr); gap: 12px; margin-top: 8px; }
+@media (max-width: 900px) { .macro-columns { grid-template-columns: 1fr; } }
+.macro-column { border: 1px solid var(--line); border-radius: 8px; padding: 8px; background: #10161e; }
+.macro-list { display: flex; flex-direction: column; gap: 4px; }
+.macro-item {
+  text-align: left;
+  background: #0a0d11;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 6px 8px;
+  cursor: pointer;
+}
+.macro-item:hover { border-color: var(--accent); }
+.macro-item.active { border-color: var(--accent); background: #16202b; }
+.macro-fields { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.macro-fields label, .macro-add-row label { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); }
+.macro-actions-list { display: flex; flex-direction: column; gap: 3px; margin: 8px 0; }
+.macro-action-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; border-top: 1px solid #222c37; padding: 3px 0; }
+.macro-action-kind { min-width: 56px; color: var(--muted); }
+.mono-press { color: #7ac78f; }
+.mono-release { color: #7fb3e8; }
+.mono-delay { color: #d0b46a; }
+.macro-add-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 4px 0; }
+.macro-add-label { min-width: 84px; color: var(--muted); }
+.macro-status { margin: 8px 0 0; color: var(--text); }
+.btn.tiny { padding: 2px 6px; font-size: 11px; }
+input[type="number"] { background: #0a0d11; border: 1px solid var(--line); border-radius: 5px; color: var(--text); font-family: var(--mono); padding: 3px 5px; }
+input[type="number"]:focus { outline: none; border-color: var(--accent); }

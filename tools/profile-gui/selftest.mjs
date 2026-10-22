@@ -6,6 +6,8 @@
 // its change list, board geometry (the cap box is the click and focus target), the wheel
 // and OLED panels, the macro block, panel render - and the Rust-side tables in
 // src/devices/keyboards/apex_7_profile.rs, src/devices/mod.rs and src/devices/discovery.rs.
+// The macro editor (macros.js) runs in the same fake DOM: its record math, its limits and the
+// buttons a real click reaches.
 
 // Model names and the per-model feature set are imported from Rust by sync-products.mjs into
 // products.generated.js. Run `node tools/profile-gui/sync-products.mjs` after changing the Rust
@@ -17,7 +19,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import { spawnSync } from 'node:child_process';
-import { installFakeDom, loadApp } from './fake-dom.mjs';
+import { installFakeDom, loadApp, loadClassic, document as fakeDocument } from './fake-dom.mjs';
 
 // The generator's output is a classic script that sets globalThis.SsggProducts; index.html loads it
 // before app.js, so the suite does the same before it loads app.js. vm.runInThisContext runs the file
@@ -67,6 +69,12 @@ const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 // A check can return SKIP: the checks that measure the profile JSONs in the repo root (the operator's
 // captures, which are not committed) skip and say so in a checkout without them.
 const SKIP = 'skip';
+// A check the machine cannot run right now: counted, reported with the reason, and not a failure.
+const skip = (label, reason) => {
+  checks += 1;
+  skipped += 1;
+  console.log(`  skip ${label} - ${reason}`);
+};
 const rootText = (name) => (existsSync(`../../${name}`) ? readFileSync(`../../${name}`, 'utf8') : null);
 // A check that measures the real macro decode runs only when that file is here; without it, skip.
 const okMacros = (label, thunk, detail = () => '') => ok(label, () => (macrosDoc ? thunk() : SKIP), detail);
@@ -749,21 +757,25 @@ okMacros('macroKeystrokes reads the keys and delays a record runs', () => {
   const text = app.macroKeystrokes(record);
   return typeof text === 'string' && text.length > 0 && !/undefined/.test(text);
 }, () => app.macroKeystrokes(app.macroRecords(macrosDoc)[0]));
-ok('macroBoundKeys lists the keys bound to a macro index', () => {
-  const doc = app.cloneDoc(identityDoc);
-  doc.button_mappings.forEach((e) => { e.function = 0; e.key_codes = '00 00 00 00'; e.macro_index = null; });
-  doc.button_mappings[27] = { offset: 27, hid_code: 7, function: 0x71, key_codes: '00 00 07 00', macro_index: 7 };
-  doc.button_mappings[28] = { offset: 28, hid_code: 8, function: 0x71, key_codes: '00 00 14 00', macro_index: 14 };
-  app.normalizeDoc(doc);
-  const bound7 = app.macroBoundKeys(doc, 7);
-  const bound14 = app.macroBoundKeys(doc, 14);
-  // An index resolves by ordinal, so 8 (record 1) finds the key bound at 7, and 99 (record 14) finds none.
-  return bound7.length === 1 && bound7[0] === app.keyName(app.OFF2HID[27])
-    && bound14.length === 1 && bound14[0] === app.keyName(app.OFF2HID[28])
-    && eq(app.macroBoundKeys(doc, 8), bound7)
-    && app.macroBoundKeys(doc, 6).length === 0
-    && app.macroBoundKeys(doc, 99).length === 0;
-}, () => JSON.stringify(app.macroBoundKeys({ button_mappings: [{ offset: 27, hid_code: 7, function: 0x71, key_codes: '00 00 07 00' }] }, 7)));
+const boundDoc = app.cloneDoc(identityDoc);
+boundDoc.button_mappings.forEach((e) => { e.function = 0; e.key_codes = '00 00 00 00'; e.macro_index = null; });
+boundDoc.button_mappings[27] = { offset: 27, hid_code: app.OFF2HID[27], function: 0x71, key_codes: '00 00 07 00', macro_index: 7 };
+boundDoc.button_mappings[28] = { offset: 28, hid_code: app.OFF2HID[28], function: 0x71, key_codes: '00 00 14 00', macro_index: 20 };
+boundDoc.button_mappings[31] = { offset: 31, hid_code: app.OFF2HID[31], function: 0x71, key_codes: '00 00 14 00', macro_index: 20 };
+app.normalizeDoc(boundDoc);
+const bound7 = app.macroBoundKeys(boundDoc, 7);
+const bound20 = app.macroBoundKeys(boundDoc, 20);
+ok('macroBoundKeys lists the keys bound to a macro id', () =>
+  // A key is bound to a macro by the id its slot carries, so the slots bound by id 7 and by id 20 (the
+  // 0x14 in key_codes[2]) are found by those ids and nothing else is: id 8 and id 99 name macros no key
+  // on this profile plays.
+  bound7.length === 1 && bound7[0] === app.keyName(app.OFF2HID[27])
+    && bound20.length === 2 && bound20.join(' ') === [28, 31].map((off) => app.keyName(app.OFF2HID[off])).join(' ')
+    && app.macroBoundKeys(boundDoc, 8).length === 0
+    && app.macroBoundKeys(boundDoc, 6).length === 0
+    && app.macroBoundKeys(boundDoc, 99).length === 0,
+  () => [bound7, bound20, [27, 28, 31].map((off) => app.keyName(app.OFF2HID[off])),
+    boundDoc.button_mappings.filter((e) => e.function === 0x71).map((e) => [e.offset, e.hid_code, e.macro_index])]);
 okMacros('macroLine names the record a binding index resolves to',
   () => app.macroLine(macrosDoc, 0).includes('binds record 0')
     && app.macroLine(macrosDoc, 7).includes('binds record 1')
@@ -771,8 +783,10 @@ okMacros('macroLine names the record a binding index resolves to',
     && app.macroLine(macrosDoc, 0).includes('action(s)')
     && !app.macroLine(macrosDoc, 0).includes('press '),
   () => [app.macroLine(macrosDoc, 0), app.macroLine(macrosDoc, 7)]);
-ok('a binding index past the records explains what GG left behind',
-  () => app.macroLine(identityDoc, 7).includes('past the 0 record(s) in the block'), () => app.macroLine(identityDoc, 7));
+ok('a macro id with no record in the block says where the macro is',
+  () => app.macroLine(identityDoc, 7).includes('no record with that id in this block')
+    && app.macroLine(identityDoc, 7).includes('binding 41'),
+  () => app.macroLine(identityDoc, 7));
 okMacros('the whole macro of a binding is a block of its own, keystroke by keystroke', () => {
   const record = app.macroRecords(macrosDoc)[1];
   const rows = app.macroDetailRows(macrosDoc, 7);
@@ -785,7 +799,8 @@ okMacros('the whole macro of a binding is a block of its own, keystroke by keyst
 ok('a macro binding index past the records says there is nothing to show', () => {
   const rows = app.macroDetailRows(identityDoc, 7);
   const text = rows.map((node) => node.textContent).join(' ');
-  return rows.length === 1 && text.includes('record 1') && text.includes('Nothing to show');
+  return rows.length === 1 && text.includes('Macro 7') && text.includes('binding 41')
+    && text.includes('Nothing to show');
 }, () => app.macroDetailRows(identityDoc, 7).map((n) => n.textContent).join(' '));
 okMacros('the macro select labels records shortly, with no keystrokes in the option text', () => {
   const options = app.macroBindingOptions(macrosDoc, 0);
@@ -802,7 +817,8 @@ okMacros('the macro select labels records shortly, with no keystrokes in the opt
 }, () => [app.macroBindingOptions(macrosDoc, 0).map((o) => o.label), app.macroRecords(macrosDoc).map((r) => [r.index, r.mode_name, r.interval_ms, r.actions.length])]);
 ok('the macro select keeps an index it cannot name, and says which record it resolves to', () => {
   const options = app.macroBindingOptions(identityDoc, 7);
-  return options.length === 1 && options[0].value === 7 && /Index 7 - record 1, past the 0 record/.test(options[0].label);
+  return options.length === 1 && options[0].value === 7
+    && /^Macro 7 - binding 41, no record with that id in this block$/.test(options[0].label);
 }, () => app.macroBindingOptions(identityDoc, 7).map((o) => o.label));
 
 // --- board geometry -------------------------------------------------------
@@ -1621,16 +1637,14 @@ ok('the byte is a field of its own: undo and factory reset never move it, and it
   return Object.values(cond).every(Boolean);
 }), () => [globalThis.lastCond, app.renderKeyPanel(metaOffFile).textContent.slice(-320), app.diffAgainst(metaOffFile.original, metaOffFile.doc).map((c) => c.path)]);
 ok('the META mask is the measured rule: bound META-layer keys by their own HID code, the key the byte names and the wheel left out', () => {
-  const rootNames = ['config_1.json', 'config_3.json', 'some_rebounds.json', 'some_rebounds_prev.json', 'config_1-copy.json', 'sample-macros.json'];
+  const rootNames = ['config_1.json', 'config_3.json', 'config_1-copy.json', 'sample-macros.json'];
   const rootTexts = rootNames.map(rootText);
   if (rootTexts.some((text) => text === null)) return SKIP;
-  const readDocs = [apex, identityDoc, parseExample('sample-remap.json'), JSON.parse(rootTexts[5]),
+  const readDocs = [apex, identityDoc, parseExample('sample-remap.json'), JSON.parse(rootTexts[3]),
     app.addFile('mask-config1.json', rootTexts[0]).file.doc,
-    app.addFile('mask-config3.json', rootTexts[1]).file.doc,
-    app.addFile('mask-some.json', rootTexts[2]).file.doc,
-    app.addFile('mask-some-prev.json', rootTexts[3]).file.doc];
+    app.addFile('mask-config3.json', rootTexts[1]).file.doc];
   const matches = readDocs.map((doc) => app.computeMetaMask(doc) === String(doc.lighting.meta_mapped_elements).toUpperCase());
-  const copyDoc = app.addFile('mask-copy.json', rootTexts[4]).file.doc;
+  const copyDoc = app.addFile('mask-copy.json', rootTexts[2]).file.doc;
   // The copy is the file a page edit made: its binding table carries one META binding more than a stock
   // read, and its mask carries the bit that binding needs and the stock mask has no bit for. That extra
   // bit is the measurement that the mask follows the META layer (the stored bytes were the read's stale ones).
@@ -1650,7 +1664,7 @@ ok('the META mask is the measured rule: bound META-layer keys by their own HID c
   unnamedDoc.meta_toggle_hid = 0x00;
   app.normalizeDoc(unnamedDoc);
   const cond = {
-    allReadsMatch: matches.length === 8 && matches.every(Boolean),
+    allReadsMatch: matches.length === 6 && matches.every(Boolean),
     copyGainsABitTheStockMaskHasNoBitFor: extraBits > 0,
     wheelLeftOut: app.computeMetaMask(wheelDoc) === app.computeMetaMask(apex),
     namedKeyDropped: bitOf(app.computeMetaMask(namedDoc), app.OFF2HID[13]) === 0,
@@ -1872,6 +1886,325 @@ ok('index.html loads live.js after app.js with a hidden panel, and app.js itself
   return html.indexOf('src="app.js"') > 0 && html.indexOf('src="app.js"') < html.indexOf('src="live.js"')
     && /id="liveBox"[^>]*hidden/.test(html) && !/\bfetch\s*\(/.test(app.source) && /\.live\[hidden\]/.test(style);
 });
+
+// --- macro editor (macros.js) ---------------------------------------------
+console.log('macro editor window (macros.js)');
+// The page loads macros.js as a classic script; do the same, so the editor lands on the same global
+// app.js reads, exactly as in the browser.
+loadClassic('macros.js');
+const macro = globalThis.SsggMacroEditor;
+
+ok("the editor's grammar bytes match the codec's constants", () => {
+  const rust = read('src/devices/keyboards/apex_7_profile.rs');
+  const rustConst = (name) => {
+    const found = new RegExp(`pub const ${name}: (?:usize|u8|u16) = ([0-9a-fA-Fx_]+);`).exec(rust);
+    if (!found) return null;
+    const text = found[1].replace(/_/g, '');
+    return text.startsWith('0x') ? Number.parseInt(text.slice(2), 16) : Number.parseInt(text, 10);
+  };
+  // Every action is 4 bytes in the codec (MACRO_ACTION_LEN), and the editor's three action lengths are
+  // the same number, so the same rust name is compared three times.
+  const pairs = [
+    ['HEADER_LEN', 'MACRO_HEADER_LEN'], ['PRESS_LEN', 'MACRO_ACTION_LEN'], ['RELEASE_LEN', 'MACRO_ACTION_LEN'],
+    ['DELAY_LEN', 'MACRO_ACTION_LEN'], ['ACTION_LEN', 'MACRO_ACTION_LEN'],
+    ['REGION_START_B', 'MACRO_REGION_START_B'], ['REGION_LEN_B', 'MACRO_DATA_LEN'],
+    ['RECORD_MARKER', 'MACRO_RECORD_MARKER'], ['ACTION_KEY', 'MACRO_ACTION_KEY'],
+    ['ACTION_DELAY', 'MACRO_ACTION_DELAY'], ['BINDING_BASE', 'MACRO_BINDING_BASE'],
+    ['ID_MAX', 'MACRO_ID_MAX'], ['MODE_MAX', 'MACRO_MODE_MAX'],
+  ];
+  const drift = pairs.filter(([js, rustName]) => macro[js] !== rustConst(rustName))
+    .map(([js, rustName]) => `${js}=${macro[js]} rust ${rustName}=${rustConst(rustName)}`);
+  // The flags are an array in Rust, so the number literal regex above does not reach it: taken here, and
+  // 0x0101 is what every record with actions of every read surveyed carries.
+  const flags = /pub const MACRO_RECORD_FLAGS_KNOWN: \[u16; 2\] = \[([^\]]+)\]/.exec(rust);
+  const flagsKnown = flags ? flags[1].split(',').map((word) => Number.parseInt(word.trim(), 16)) : [];
+  return drift.length === 0 && flagsKnown.includes(macro.RECORD_FLAGS);
+}, () => `header ${macro.HEADER_LEN} push ${macro.PRESS_LEN} release ${macro.RELEASE_LEN} delay ${macro.DELAY_LEN} region ${macro.REGION_START_B}+${macro.REGION_LEN_B}`);
+
+ok('a record is its 8-byte header plus 4 bytes per action, and a push carries no duration', () => {
+  const record = { mode: 4, id: 3, flags: macro.RECORD_FLAGS, interval_ms: 5000, actions: [macro.makePress(0x22), macro.makeRelease(0x22)] };
+  return macro.recordBytes(record) === 16
+    && macro.actionLen(macro.makePress(4)) === 4
+    && macro.actionLen(macro.makeRelease(4)) === 4
+    && macro.actionLen(macro.makeDelay(50)) === 4
+    && !('ms' in macro.makePress(4)) && !('word' in macro.makePress(4))
+    && macro.recordRaw(record) === '77 04 03 00 01 01 88 13 02 22 01 01 02 22 01 00';
+}, () => {
+  const record = { mode: 4, id: 3, flags: macro.RECORD_FLAGS, interval_ms: 5000, actions: [macro.makePress(0x22), macro.makeRelease(0x22)] };
+  return `${macro.recordBytes(record)} bytes: ${macro.recordRaw(record)}`;
+});
+
+ok('the macro block is the limit: 86 records of 112 bytes do not fit and the editor says it with numbers', () => {
+  const region = macro.regionOf({ schema: 0x000b });
+  // 112 bytes: the 8-byte header plus 26 pushes of 4 bytes. 85 of them are 9520 of the block's 9600
+  // bytes, the 86th runs 480 past the end.
+  const big = (position) => ({
+    mode: 4,
+    id: position + 1,
+    flags: macro.RECORD_FLAGS,
+    interval_ms: 100,
+    actions: Array.from({ length: 26 }, () => macro.makePress(0x04 + position)),
+  });
+  const many = Array.from({ length: 86 }, (unused, position) => big(position));
+  const size = macro.plan(many, region);
+  const problems = macro.limitProblems(many, region);
+  const fits = macro.plan(many.slice(0, 85), region);
+  return region.start === 2076 && region.len === 9600
+    && size.used === 9632 && !size.fits && size.over === 32
+    && problems.some((text) => text.includes('9632 bytes') && text.includes('has 9600'))
+    && fits.fits && fits.records === 85 && fits.used === 9520;
+}, () => {
+  const region = macro.regionOf({ schema: 0x000b });
+  const many = Array.from({ length: 86 }, (unused, position) => ({ mode: 4, id: position + 1, flags: macro.RECORD_FLAGS, interval_ms: 100, actions: Array.from({ length: 26 }, () => macro.makePress(0x04 + position)) }));
+  const size = macro.plan(many, region);
+  return `${size.used}/${size.len} used, ${size.over} over`;
+});
+
+ok('packing renumbers the list the way the encoder packs it: offsets, ordinals, binding indices, raw bytes', () => {
+  const region = macro.regionOf({ schema: 0x000b });
+  const packed = macro.packRecords([
+    { mode: 4, id: 3, flags: macro.RECORD_FLAGS, interval_ms: 5000, actions: [macro.makePress(0x22), macro.makeRelease(0x22)] },
+    { mode: 1, id: 27, flags: macro.RECORD_FLAGS, interval_ms: 15, actions: [macro.makePress(0x55), macro.makeRelease(0x55), macro.makeDelay(15)] },
+    { mode: 4, id: 8, flags: macro.RECORD_FLAGS, interval_ms: 100, actions: [macro.makeDelay(1)] },
+  ], region);
+  return packed.map((record) => record.offset).join(' ') === '2076 2092 2112'
+    && packed.map((record) => record.record_bytes).join(' ') === '16 20 12'
+    && packed.map((record) => record.index).join(' ') === '37 61 42'
+    && packed.map((record) => record.ordinal).join(' ') === '0 1 2'
+    && packed.map((record) => record.action_count).join(' ') === '2 3 1'
+    && packed.every((record) => record.raw.split(/\s+/).length === record.record_bytes)
+    && packed[0].raw === '77 04 03 00 01 01 88 13 02 22 01 01 02 22 01 00';
+}, () => {
+  const region = macro.regionOf({ schema: 0x000b });
+  const packed = macro.packRecords([{ mode: 4, id: 3, flags: 0x0101, interval_ms: 5000, actions: [macro.makePress(0x22), macro.makeRelease(0x22)] }], region);
+  return packed.map((record) => `${record.offset}+${record.record_bytes}`).join(' ');
+});
+
+ok('a report with only the block bytes still gives the editor its records', () => {
+  const region = macro.regionOf({ schema: 0x000b });
+  const block = new Array(9600).fill(0);
+  const record = { mode: 4, id: 3, flags: macro.RECORD_FLAGS, interval_ms: 5000, actions: [macro.makePress(0x22), macro.makeRelease(0x22)] };
+  macro.recordRaw(record).split(' ').forEach((word, position) => {
+    block[region.start + position] = Number.parseInt(word, 16);
+  });
+  const hex = block.map((byte) => byte.toString(16).padStart(2, '0')).join(' ');
+  const records = macro.recordsFromBlock(hex, region);
+  return records.length === 1 && records[0].id === 3 && records[0].interval_ms === 5000
+    && records[0].record_bytes === 16 && records[0].index === 37
+    && JSON.stringify(records[0].actions) === JSON.stringify([macro.makePress(0x22), macro.makeRelease(0x22)]);
+}, () => `a 9600-byte block with one 16-byte record at ${macro.REGION_START_B}`);
+
+ok('every limit that stops a write is named before the editor lets the list through', () => {
+  const region = macro.regionOf({ schema: 0x000b });
+  const check = (record) => macro.limitProblems([record], region).join(' | ');
+  const base = { mode: 4, id: 1, flags: macro.RECORD_FLAGS, interval_ms: 100, actions: [macro.makePress(4)] };
+  return check(base) === ''
+    && check({ ...base, actions: [] }).includes('no action')
+    && check({ ...base, flags: 0x0100 }).includes('0x0101')
+    && check({ ...base, id: 70000 }).includes('id must be a whole number 1..221')
+    && check({ ...base, id: 0 }).includes('id must be a whole number 1..221')
+    && check({ ...base, mode: 0 }).includes('mode must be a whole number 1..8')
+    && check({ ...base, mode: 9 }).includes('mode must be a whole number 1..8')
+    && check({ ...base, interval_ms: -5 }).includes('interval must be a whole number 1..65535')
+    && check({ ...base, interval_ms: 0 }).includes('interval must be a whole number 1..65535')
+    && check({ ...base, actions: [macro.makeDelay(70000)] }).includes('ms must be a whole number 0..65535')
+    && check({ ...base, actions: [{ kind: 'press', key: 300 }] }).includes('key code must be a whole number 0..255')
+    && check({ ...base, actions: [{ kind: 'hold', key: 4 }] }).includes('grammar knows only push, release and wait')
+    && check({ ...base, actions: Array.from({ length: 2400 }, () => macro.makePress(4)) }).includes('most one record can hold')
+    && check({ ...base, actions: Array.from({ length: 2398 }, () => macro.makePress(4)) }) === '';
+}, () => macro.limitProblems([{ mode: 0, id: 0, flags: 0x0100, interval_ms: 0, actions: [] }], macro.regionOf({ schema: 0x000b })).join(' | '));
+
+ok('a slot the codec decodes no macros for gets no editor', () => {
+  const schemaA = macro.editorDisabledReason({ schema: 0x000a, macros: [], macro_data: { bytes_hex: '00 00' } });
+  const noBytes = macro.editorDisabledReason({ schema: 0x000b });
+  const withList = macro.editorDisabledReason({ schema: 0x000b, macros: [] });
+  return /not decoded/.test(schemaA) && /neither a macro record list nor the block bytes/.test(noBytes) && withList === null;
+}, () => `${macro.editorDisabledReason({ schema: 0x000a })} / ${macro.editorDisabledReason({ schema: 0x000b })}`);
+
+ok('the mounted editor adds a macro, adds a key push, and hands over exactly the packed list', () => {
+  const doc = { schema: 0x000b, name: 'Config 1', macros: [] };
+  const root = fakeDocument.createElement('section');
+  let handed = null;
+  const editor = macro.mount(root, { doc, embedded: true, onSave: (records) => { handed = records; } });
+  // Header buttons come first: 0 add macro, 1 delete, 2 apply. The record detail's controls follow.
+  const buttons = () => root.querySelectorAll('.btn');
+  buttons()[0].click();
+  const meter = root.querySelector('.macro-meter').textContent;
+  // The record detail's controls: the mode select, the macro id and interval inputs, then the add rows
+  // (key push, key release, wait) in that order. A push takes only its key - it carries no duration.
+  const selects = root.querySelectorAll('select');
+  selects[1].value = '34';
+  buttons()[3].click();
+  const meterAfter = root.querySelector('.macro-meter').textContent;
+  const inputs = root.querySelectorAll('input');
+  buttons()[2].click();
+  const status = root.querySelector('.macro-status').textContent;
+  const applied = macro.applyRecords(doc, handed, macro.regionOf(doc));
+  return /1 record\(s\) - 8 of the block's 9600 bytes used, 9592 free/.test(meter)
+    && /12 of the block's 9600 bytes used, 9588 free/.test(meterAfter)
+    && handed.length === 1 && handed[0].actions.length === 1
+    && handed[0].actions[0].kind === 'press' && handed[0].actions[0].key === 0x22 && !('ms' in handed[0].actions[0])
+    && handed[0].record_bytes === 12 && handed[0].offset === 2076 && handed[0].index === 35
+    && status === "1 record(s) 12 bytes handed to the profile editor"
+    && inputs[0].value === String(handed[0].id) && inputs[1].value === String(handed[0].interval_ms)
+    && applied.macro_region.used_bytes === 12 && applied.macro_region.records === 1
+    && applied.macros[0].raw === macro.recordRaw(applied.macros[0])
+    && typeof editor.setStatus === 'function' && typeof editor.refresh === 'function';
+}, () => 'the meter line and the status line of the mounted editor');
+
+ok('the editor refuses to hand over a list that cannot be written', () => {
+  // 86 records of 112 bytes (8-byte header plus 26 pushes) need 9,632 of the block's 9,600 bytes. The
+  // meter counts them, and applying hands nothing over.
+  const doc = {
+    schema: 0x000b,
+    name: 'Big',
+    macros: Array.from({ length: 86 }, (unused, position) => ({
+      mode: 4,
+      id: position + 1,
+      flags: macro.RECORD_FLAGS,
+      interval_ms: 100,
+      actions: Array.from({ length: 26 }, () => macro.makePress(0x04 + position)),
+    })),
+  };
+  const root = fakeDocument.createElement('section');
+  let handed = null;
+  macro.mount(root, { doc, embedded: true, onSave: (records) => { handed = records; } });
+  const buttons = () => root.querySelectorAll('.btn');
+  const meter = root.querySelector('.macro-meter').textContent;
+  buttons()[2].click();
+  const status = root.querySelector('.macro-status').textContent;
+  return /9632 of the block's 9600 bytes used, -32 free|9632 of the block's 9600 bytes/.test(meter)
+    && meter.includes('32 bytes too many') && handed === null
+    && /not applied:/.test(status) && status.includes('9632') && status.includes('has 9600');
+}, () => 'the meter line and the apply answer of a list past the block');
+
+ok('the edited records land on the open profile as a change, with the region numbers recomputed', () => {
+  const file = app.addFile('adopt.json', app.serializeDoc(app.cloneDoc(identityDoc))).file;
+  const records = macro.packRecords(
+    [{ mode: 4, id: 3, flags: macro.RECORD_FLAGS, interval_ms: 5000, actions: [macro.makePress(0x22), macro.makeRelease(0x22)] }],
+    macro.regionOf(file.doc),
+  );
+  const out = app.adoptMacroRecords(records);
+  const paths = app.fileChanges(file).map((change) => change.path);
+  return out.ok === true && out.records === 1 && out.used === 16 && out.free === 9584
+    && file.doc.macros.length === 1 && file.doc.macros[0].record_bytes === 16
+    && file.doc.macros[0].raw === macro.recordRaw(file.doc.macros[0])
+    && file.doc.macro_region.used_bytes === 16 && file.doc.macro_region.records === 1
+    && file.doc.macro_region.len === 9600 && file.doc.macro_region.start === 2076
+    && paths.includes('macros[0]') && paths.includes('macro_region');
+}, () => 'adoptMacroRecords answer and the change paths');
+
+ok('the page wires the macro editor: a toolbar button, a mount point, the session channel, and no fetch of its own', () => {
+  const html = read('tools/profile-gui/index.html');
+  const main = read('tools/profile-gui/main.js');
+  const popup = read('tools/profile-gui/macros.html');
+  const source = app.source;
+  return source.includes('function openMacroEditor') && source.includes('function mountInlineMacroEditor')
+    && source.includes("ui.macroBtn.addEventListener('click', () => openMacroEditor())")
+    && source.includes("'ssgg-macros'") && source.includes('/api/macros/session')
+    && !/\bfetch\s*\(/.test(source)
+    && /id="macroBtn"/.test(html) && /id="macroBox"[^>]*hidden/.test(html)
+    && html.indexOf('src="app.js"') < html.indexOf('src="macros.js"')
+    && main.includes("macroBtn: document.getElementById('macroBtn')") && main.includes("macroBox: document.getElementById('macroBox')")
+    && /data-ssgg-macro-popup/.test(popup) && /src="macros.js"/.test(popup)
+    && /\.macro-item/.test(style) && /\.macro-meter\.over/.test(style);
+}, () => `openMacroEditor ${app.source.includes('function openMacroEditor')}, macroBtn in index.html ${read('tools/profile-gui/index.html').includes('macroBtn')}`);
+
+// --- the session channel against a live `ssgg gui` -----------------------------------
+//
+// The macro editor windows talk to the server only through `POST /api/macros/session`, so these checks
+// run against a running `ssgg gui`. Set SSGG_GUI_URL to its http://127.0.0.1:<port> and SSGG_GUI_TOKEN
+// to the token in the page's meta tag; without them they skip. `node tools/profile-gui/live-check.mjs`
+// runs the same round trip with the answers printed.
+const guiUrl = (process.env.SSGG_GUI_URL ?? '').replace(/\/$/, '');
+const guiToken = process.env.SSGG_GUI_TOKEN ?? '';
+const okGui = (label, thunk, detail = () => '') => (
+  guiUrl && guiToken
+    ? ok(label, thunk, detail)
+    : skip(label, 'set SSGG_GUI_URL and SSGG_GUI_TOKEN, then run the suite again, or run node tools/profile-gui/live-check.mjs')
+);
+const guiCall = async (method, body) => {
+  const res = await fetch(`${guiUrl}/api/macros/session`, {
+    method,
+    headers: {
+      origin: new URL(guiUrl).origin,
+      'x-ssgg-token': guiToken,
+      ...(body ? { 'content-type': 'application/json' } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text();
+  return { status: res.status, json: text ? JSON.parse(text) : null, text };
+};
+const guiRecord = (id, keys) => ({
+  mode: 4,
+  id,
+  flags: macro.RECORD_FLAGS,
+  interval_ms: 100,
+  actions: keys.flatMap((key) => [macro.makePress(key), macro.makeRelease(key)]),
+});
+// The editor keeps one file open, so a live check opens the sample first: its payload is a schema A
+// profile, and the codec's own answer says where its macro block is.
+const guiOpenSample = () => app.addFile('live.json', read('tools/profile-gui/examples/sample-identity.json')).file;
+const guiSerialized = () => JSON.parse(app.serializeDoc(app.activeDoc()));
+let guiAnswer = '';
+
+okGui('the live session answers the profile as it was read with the codec numbers, and hands it back', async () => {
+  guiOpenSample();
+  const asRead = guiSerialized();
+  const save = await guiCall('POST', { profile: asRead });
+  const read2 = await guiCall('GET', null);
+  guiAnswer = `save ${save.status} ${JSON.stringify(save.json).slice(0, 200)} get ${read2.status}`;
+  const region = save.json?.region ?? {};
+  return save.status === 200 && save.json.ok === true
+    && Number.isInteger(save.json.revision)
+    && region.records === (asRead.macros ?? []).length
+    && region.used_bytes === (asRead.macros ?? []).reduce((sum, r) => sum + (r.record_bytes ?? 0), 0)
+    && region.used_bytes + region.free_bytes === region.len && region.len === macro.REGION_LEN_B
+    && read2.status === 200 && read2.json.revision === save.json.revision
+    && JSON.stringify(read2.json.region) === JSON.stringify(region)
+    && JSON.stringify(read2.json.profile.macros) === JSON.stringify(asRead.macros);
+}, () => guiAnswer);
+
+okGui('the live session refuses an edited record list, the way the write path refuses it', async () => {
+  guiOpenSample();
+  const edited = app.adoptMacroRecords([guiRecord(1, [0x22, 0x26]), guiRecord(2, [0x25, 0x26, 0x22])]);
+  const refused = await guiCall('POST', { profile: guiSerialized() });
+  guiAnswer = `adopted ${JSON.stringify(edited)} wire ${refused.status} ${refused.text.slice(0, 200)}`;
+  return edited.ok === true && edited.used === 56 && edited.records === 2
+    && refused.status === 422
+    && String(refused.json.error).includes('the record list does not match the macro block')
+    && String(refused.json.error).includes('GG');
+}, () => guiAnswer);
+
+okGui('the live session refuses a record list past the block with the codec numbers', async () => {
+  guiOpenSample();
+  const records = macro.packRecords(
+    Array.from({ length: 86 }, (unused, position) => guiRecord(position + 1, Array.from({ length: 13 }, (u, key) => 0x04 + key))),
+    macro.regionOf(app.activeDoc()),
+  );
+  const needed = 86 * (macro.HEADER_LEN + 26 * macro.ACTION_LEN);
+  const big = await guiCall('POST', { profile: { ...guiSerialized(), macros: records } });
+  guiAnswer = `wire ${big.status} ${big.text.slice(0, 200)} (needed ${needed})`;
+  return big.status === 413 && String(big.json.error).includes('macro records need')
+    && String(big.json.error).includes(`${needed}`) && String(big.json.error).includes(`has ${macro.REGION_LEN_B}`);
+}, () => guiAnswer);
+
+okGui('the live session answers no token and a foreign origin with 403', async () => {
+  const profile = guiSerialized();
+  const noToken = await fetch(`${guiUrl}/api/macros/session`, {
+    method: 'POST',
+    headers: { origin: new URL(guiUrl).origin, 'content-type': 'application/json' },
+    body: JSON.stringify({ profile }),
+  });
+  const foreign = await fetch(`${guiUrl}/api/macros/session`, {
+    method: 'POST',
+    headers: { origin: 'http://127.0.0.1:9', 'x-ssgg-token': guiToken, 'content-type': 'application/json' },
+    body: JSON.stringify({ profile }),
+  });
+  guiAnswer = `no token ${noToken.status}, foreign origin ${foreign.status}`;
+  return noToken.status === 403 && foreign.status === 403;
+}, () => guiAnswer);
 
 await Promise.all(pending);
 
