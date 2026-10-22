@@ -922,12 +922,13 @@ pub struct KeyMapping {
     pub binding: &'static str,
     /// Four raw key-code bytes, hex.
     pub key_codes: String,
-    /// For a `0x71` macro binding, the binding index this slot carries; `None` for every other
-    /// function: `key_codes[2]`, the third code byte. An index at or above [`MACRO_BINDING_BASE`] names
-    /// macro id `index - MACRO_BINDING_BASE + 1` ([`MACRO_BINDING_BASE`] carries the measurement); below
-    /// it the byte is a key code, not a macro. An id no record carries is the deleted-macro state - GG
-    /// deletes the macro and leaves the key bound. `[EXPERIMENTAL]`: the record list has no length word,
-    /// and a block the walker cannot walk is refused by [`encode_json`] instead of written back.
+    /// For a `0x71` macro binding, the binding byte this slot carries; `None` for every other
+    /// function: `key_codes[2]`, the third code byte. It is the byte offset of the macro it reaches from
+    /// the block start, in [`MACRO_INDEX_UNIT`] units ([`macro_index`] carries the measurement), so a byte
+    /// whose offset the block holds no macro at names no macro - that is the deleted-macro state, where GG
+    /// deletes the macro and leaves the key bound. A byte past [`MACRO_BINDING_REACH_BYTES`] cannot name a
+    /// macro at all. `[EXPERIMENTAL]`: the record list has no length word, and a block the walker cannot
+    /// walk is refused by [`encode_json`] instead of written back.
     pub macro_index: Option<u8>,
 }
 
@@ -1039,6 +1040,16 @@ pub struct MacroRecordRegion {
 pub const MACRO_RECORD_MARKER: u8 = 0x77;
 /// Action byte of a key press or release inside a macro record.
 pub const MACRO_ACTION_KEY: u8 = 0x02;
+/// Action byte of a mouse button press or release inside a macro record: the mask byte says which
+/// buttons, the last byte says press (`0x01`) or release (`0x00`). `[EXPERIMENTAL]`: measured on a wired
+/// read (Apex 7 `0x1612`, firmware 4.16.8, schema b, 2026-10-22) whose number row `3` to `7` is bound to
+/// macros that press mouse masks `0x03`, `0x08`, `0x10`, `0x20` and `0x07` - left+right, mouse 4, mouse 5,
+/// mouse 6 and left+right+middle - and a mask of `0` is refused, which is what stops the action walk on the
+/// block's zero padding.
+pub const MACRO_ACTION_MOUSE: u8 = 0x00;
+/// Highest mouse mask a write carries. The bits the reads measured are `0x01` button 1 through `0x20`
+/// button 6, so a mask with any higher bit names nothing this codec can spell and is refused.
+pub const MACRO_MOUSE_MASK_MAX: u8 = 0x3F;
 /// Action byte of a timed pause inside a macro record.
 pub const MACRO_ACTION_DELAY: u8 = 0x04;
 /// Start of the macro block in a schema b payload, and its length: [`MACRO_DATA_LEN`] bytes, the last 20
@@ -1047,10 +1058,11 @@ pub const MACRO_REGION_START_B: usize = 2076;
 pub const MACRO_REGION_LEN_B: usize = MACRO_DATA_LEN;
 /// Bytes of a macro record header: `0x77 | mode | id u16 | flags u16 | interval u16`.
 pub const MACRO_HEADER_LEN: usize = 8;
-/// Bytes of one macro action: press `0x02 | key u8 | 0x01 0x01`, release `0x02 | key u8 | 0x01 0x00`,
+/// Bytes of one macro action: key press `0x02 | key u8 | 0x01 0x01`, key release `0x02 | key u8 |
+/// 0x01 0x00`, mouse press `0x00 | mask u8 | 0x00 0x01`, mouse release `0x00 | mask u8 | 0x00 0x00`,
 /// delay `0x04 | 0x00 | ms u16 LE`. `[EXPERIMENTAL]`: measured on a read (Apex 7 `0x1612`, firmware
-/// 4.16.8, schema b, slot 3, 2026-10-22) whose nine records of 87 actions split into exactly these
-/// three forms, with nothing left over.
+/// 4.16.8, schema b, slot 3, 2026-10-22) whose 14 macros of 168 actions split into exactly these five
+/// forms, with nothing left over.
 pub const MACRO_ACTION_LEN: usize = 4;
 /// Macro mode GG writes for a record that plays again every `interval`: the META + Insert binding of
 /// profile 1 in the read round is a mode 4 record that presses `4` with `interval` 5000 ms, and a
@@ -1066,15 +1078,20 @@ pub const MACRO_MODE_MAX: u8 = 8;
 /// the header that carries none. `[EXPERIMENTAL]`: measured on the read named on [`MACRO_ACTION_LEN`];
 /// a record with other bytes there is reported by [`OnboardMacro::flags_ok`].
 pub const MACRO_RECORD_FLAGS_KNOWN: [u16; 2] = [0x0101, 0x0100];
-/// The binding number a `0x71` mapping row carries for macro id `n`: `MACRO_BINDING_BASE + n - 1`.
-/// `[EXPERIMENTAL]`: measured on a wired read (Apex 7 `0x1612`, firmware 4.16.8, schema b,
-/// 2026-10-22) whose META mapping 15 carries 117 and whose records carry id 83 - the only id above
-/// 34 in that profile - and `35 + 83 - 1 = 117`.
-pub const MACRO_BINDING_BASE: usize = 35;
-/// Highest macro id a binding can name: the binding number lives in one byte, so ids `1..=221` reach
-/// bindings `35..=255`, and GG's bound macro slots stop there. `[EXPERIMENTAL]`: the ceiling follows
-/// from [`MACRO_BINDING_BASE`] and the one-byte field; the reads surveyed use ids 1 to 83.
-pub const MACRO_ID_MAX: u16 = 221;
+/// Unit a binding byte counts in: the macro's byte offset from the block start, divided by this. A
+/// binding byte `b` names the macro that starts at `start + 4 × b`.
+/// `[EXPERIMENTAL]`: measured on a wired read (Apex 7 `0x1612`, firmware 4.16.8, schema b, 2026-10-22)
+/// with 14 macros and 14 bindings: every one of the 14 bytes lands on a macro start, and the keys `c`,
+/// `v`, `x` carry 0, 7, 14 for the macros at offsets 2076, 2104, 2132 - the keystrokes (LCtrl with `c`,
+/// `v`, `x`) match at all three. Those macros are 28 bytes each, which is why the byte also reads as
+/// `7 × position` there; the offset rule is what the other 11 bindings follow.
+pub const MACRO_INDEX_UNIT: usize = MACRO_ACTION_LEN;
+/// Highest value the binding byte field carries, and so the farthest byte of the block a binding can
+/// name: [`MACRO_BINDING_BYTE_MAX`] × [`MACRO_INDEX_UNIT`] bytes from the block start. The block's
+/// capacity is not what limits binding.
+pub const MACRO_BINDING_BYTE_MAX: u8 = 255;
+/// Bytes from the block start that a binding byte can reach.
+pub const MACRO_BINDING_REACH_BYTES: usize = (MACRO_BINDING_BYTE_MAX as usize) * MACRO_INDEX_UNIT;
 /// Milliseconds whose low byte is the record marker (`119`, `375`, `631`, ...): a delay writes that byte
 /// inside its own four bytes, and [`macro_action_at`] reads it as part of the delay, so a record is not
 /// ended by it. `[EXPERIMENTAL]`: measured on the read surveyed, whose delays are 10, 15, 20, 63,
@@ -1084,11 +1101,17 @@ pub const MACRO_DELAY_MARKER_LOW_BYTE: u16 = 0x77;
 /// One action of a packed macro record, [`MACRO_ACTION_LEN`] bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct MacroAction {
-    /// `press`, `release` or `delay`.
+    /// `press`, `release`, `press_mouse`, `release_mouse` or `delay`.
     pub kind: &'static str,
-    /// Key code of a press or release, absent on a delay.
+    /// Key code of a key press or release, absent on a mouse action and on a delay.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key: Option<u8>,
+    /// Mouse mask of a mouse press or release, absent on a key action and on a delay. Bit `0x01` is
+    /// mouse 1, `0x02` mouse 2, `0x04` mouse 3, `0x08` mouse 4, `0x10` mouse 5, `0x20` mouse 6, and a
+    /// mask can set several bits at once. `[EXPERIMENTAL]`: the bit order is read off the number-row
+    /// macros named on [`MACRO_ACTION_MOUSE`], where `3` is left+right and `7` left+right+middle.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mask: Option<u8>,
     /// Milliseconds of a delay, absent on a press or release.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ms: Option<u16>,
@@ -1097,10 +1120,11 @@ pub struct MacroAction {
 /// One packed record of the macro data block.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OnboardMacro {
-    /// The number a `0x71` binding carries for this record's macro id: [`MACRO_BINDING_BASE`] + id - 1.
+    /// The binding byte a `0x71` row carries for this record: its offset from the block start in
+    /// [`MACRO_INDEX_UNIT`] units ([`macro_index`]).
     pub index: usize,
-    /// Position in the list [`decode_macros`] walked, from 0. GG stores one macro id in several records
-    /// (one per mode), so this orders the list and says nothing about GG's numbering.
+    /// Position in the list [`decode_macros`] walked, from 0. Display order only: a binding names a
+    /// macro by its offset, not by this number.
     pub ordinal: usize,
     /// `false` when this record's `+4` bytes are not one of [`MACRO_RECORD_FLAGS_KNOWN`], which every
     /// record of the read surveyed is: a record that differs is shown, not listed as if it matched.
@@ -1111,10 +1135,11 @@ pub struct OnboardMacro {
     pub mode: u8,
     /// Mode as a word, for the summary line.
     pub mode_name: &'static str,
-    /// Macro id as the record header carries it: GG's macro number, the number a binding is built from
-    /// ([`MACRO_BINDING_BASE`], [`MACRO_ID_MAX`]). The read surveyed carries ids 2, 5, 15, 19, 27
-    /// and 83, and its bindings name 117 = 35 + 83 - 1.
-    pub id: u16,
+    /// The header's u16 at `+2`, carried through as the read had it. `[EXPERIMENTAL]`: it equals
+    /// [`OnboardMacro::action_count`] in 8 of the 9 records measured (the ninth carries 83 with 48
+    /// actions), so it reads as an action count, and a binding does not name it - a binding names the
+    /// position.
+    pub header_word: u16,
     /// The two bytes every record seen carries as `01 01`, unexplained.
     pub flags: u16,
     /// Repeat interval in mode [`MACRO_MODE_REPEAT`], inter-action delay in mode [`MACRO_MODE_ONCE`].
@@ -1129,6 +1154,48 @@ pub struct OnboardMacro {
     pub actions: Vec<MacroAction>,
     /// Raw record bytes, hex.
     pub raw: String,
+}
+
+/// The binding byte a `0x71` row carries for the macro at payload offset `offset` of a block that
+/// starts at `start`: [`MACRO_INDEX_UNIT`] units of offset. A binding names a macro by where it sits,
+/// never by its header word.
+#[must_use]
+pub const fn macro_index(offset: usize, start: usize) -> usize {
+    offset.saturating_sub(start) / MACRO_INDEX_UNIT
+}
+
+/// Payload offset of the macro a binding byte names. A byte whose offset no macro starts at names no
+/// macro, and an offset past [`MACRO_BINDING_REACH_BYTES`] from the block start cannot be named at all.
+#[must_use]
+pub const fn macro_offset_for_binding_byte(byte: u8, start: usize) -> usize {
+    start + (byte as usize) * MACRO_INDEX_UNIT
+}
+
+/// Mouse mask as words: the buttons it presses at once. `[EXPERIMENTAL]`: the bit order is the one
+/// measured on the number-row macros named on [`MACRO_ACTION_MOUSE`].
+#[must_use]
+pub fn macro_mouse_mask_name(mask: Option<u8>) -> String {
+    let mask = mask.unwrap_or(0);
+    if mask == 0 {
+        return "mouse 0".to_string();
+    }
+    const BUTTONS: [(u8, &str); 6] = [
+        (0x01, "mouse 1"),
+        (0x02, "mouse 2"),
+        (0x04, "mouse 3"),
+        (0x08, "mouse 4"),
+        (0x10, "mouse 5"),
+        (0x20, "mouse 6"),
+    ];
+    let named: Vec<&str> = BUTTONS
+        .iter()
+        .filter(|(bit, _)| mask & bit != 0)
+        .map(|(_, name)| *name)
+        .collect();
+    if named.is_empty() {
+        return format!("mouse mask 0x{mask:02X}");
+    }
+    named.join("+")
 }
 
 /// Mode byte as a word.
@@ -1154,17 +1221,21 @@ pub const fn macro_region_bounds(schema: u16) -> (usize, usize) {
 }
 
 /// Header fields of a macro record at `at`, when the bytes there are one: a mode in `1..=MACRO_MODE_MAX`,
-/// a macro id in `1..=MACRO_ID_MAX`, and a non-zero interval. `[EXPERIMENTAL]`: the shape measured on
-/// the read named on [`MACRO_ACTION_LEN`]; GG's own per-macro structures in the same block pass this
-/// test too, and the walk drops them by their empty action list.
+/// a non-zero header word, and a non-zero interval. `[EXPERIMENTAL]`: the shape measured on the read
+/// named on [`MACRO_ACTION_LEN`]; GG's own per-macro structures in the same block pass this test too,
+/// and the walk drops them by their empty action list.
 fn macro_record_header(block: &[u8], at: usize) -> Option<(u8, u16, u16, u16)> {
     let rest = block.get(at..at + MACRO_HEADER_LEN)?;
     let mode = rest[1];
-    let id = u16::from_le_bytes([rest[2], rest[3]]);
+    let header_word = u16::from_le_bytes([rest[2], rest[3]]);
     let flags = u16::from_le_bytes([rest[4], rest[5]]);
     let interval = u16::from_le_bytes([rest[6], rest[7]]);
-    ((1..=MACRO_MODE_MAX).contains(&mode) && (1..=MACRO_ID_MAX).contains(&id) && interval >= 1)
-        .then_some((mode, id, flags, interval))
+    ((1..=MACRO_MODE_MAX).contains(&mode) && header_word >= 1 && interval >= 1).then_some((
+        mode,
+        header_word,
+        flags,
+        interval,
+    ))
 }
 
 /// The [`MACRO_ACTION_LEN`] bytes at `pos` as one action, when they are one.
@@ -1174,16 +1245,31 @@ fn macro_action_at(block: &[u8], pos: usize) -> Option<MacroAction> {
         [MACRO_ACTION_KEY, key, 0x01, 0x01] => Some(MacroAction {
             kind: "press",
             key: Some(*key),
+            mask: None,
             ms: None,
         }),
         [MACRO_ACTION_KEY, key, 0x01, 0x00] => Some(MacroAction {
             kind: "release",
             key: Some(*key),
+            mask: None,
+            ms: None,
+        }),
+        [MACRO_ACTION_MOUSE, mask @ 1..=0xFF, 0x00, 0x01] => Some(MacroAction {
+            kind: "press_mouse",
+            key: None,
+            mask: Some(*mask),
+            ms: None,
+        }),
+        [MACRO_ACTION_MOUSE, mask @ 1..=0xFF, 0x00, 0x00] => Some(MacroAction {
+            kind: "release_mouse",
+            key: None,
+            mask: Some(*mask),
             ms: None,
         }),
         [MACRO_ACTION_DELAY, 0x00, lo, hi] => Some(MacroAction {
             kind: "delay",
             key: None,
+            mask: None,
             ms: Some(u16::from_le_bytes([*lo, *hi])),
         }),
         _ => None,
@@ -1261,13 +1347,13 @@ pub fn decode_macros(data: &[u8], offset: usize, len: usize) -> (Vec<OnboardMacr
         }
         let ordinal = records.len();
         records.push(OnboardMacro {
-            index: MACRO_BINDING_BASE + usize::from(id) - 1,
+            index: macro_index(start + at, start),
             ordinal,
             flags_ok: MACRO_RECORD_FLAGS_KNOWN.contains(&flags),
             offset: start + at,
             mode,
             mode_name: macro_mode_name(mode),
-            id,
+            header_word: id,
             flags,
             interval_ms,
             record_bytes: pos - at,
@@ -1947,8 +2033,8 @@ struct JsonMacro {
     raw: String,
     #[serde(default)]
     mode: u8,
-    #[serde(default)]
-    id: u16,
+    #[serde(default, rename = "header_word")]
+    header_word: u16,
     #[serde(default = "default_macro_flags")]
     flags: u16,
     #[serde(default)]
@@ -1970,6 +2056,8 @@ fn default_macro_flags() -> u16 {
 struct JsonMacroAction {
     kind: String,
     key: Option<u8>,
+    #[serde(default)]
+    mask: Option<u8>,
     ms: Option<u16>,
 }
 
@@ -2255,13 +2343,32 @@ fn macro_record_bytes(record: &JsonMacro) -> Result<Vec<u8>> {
         return Ok(raw);
     }
     let mut out = vec![MACRO_RECORD_MARKER, record.mode];
-    out.extend_from_slice(&record.id.to_le_bytes());
+    out.extend_from_slice(&record.header_word.to_le_bytes());
     out.extend_from_slice(&record.flags.to_le_bytes());
     out.extend_from_slice(&record.interval_ms.to_le_bytes());
     for action in &record.actions {
         match action.kind.as_str() {
             "press" => out.extend_from_slice(&[MACRO_ACTION_KEY, action.key.unwrap_or(0), 0x01, 0x01]),
             "release" => out.extend_from_slice(&[MACRO_ACTION_KEY, action.key.unwrap_or(0), 0x01, 0x00]),
+            "press_mouse" | "release_mouse" => {
+                let flag = u8::from(action.kind == "press_mouse");
+                out.extend_from_slice(&[
+                    MACRO_ACTION_MOUSE,
+                    action
+                        .mask
+                        .filter(|mask| *mask != 0 && *mask <= MACRO_MOUSE_MASK_MAX)
+                        .ok_or_else(|| {
+                            Error::Profile(format!(
+                                "macro action {other} at {} carries no mouse mask in 1..={:#04X}",
+                                record.offset,
+                                MACRO_MOUSE_MASK_MAX,
+                                other = action.kind
+                            ))
+                        })?,
+                    0x00,
+                    flag,
+                ]);
+            }
             "delay" => {
                 out.push(MACRO_ACTION_DELAY);
                 out.push(0x00);
@@ -2269,7 +2376,7 @@ fn macro_record_bytes(record: &JsonMacro) -> Result<Vec<u8>> {
             }
             other => {
                 return Err(Error::Profile(format!(
-                    "macro action {other} is not press, release or delay"
+                    "macro action {other} is not press, release, press_mouse, release_mouse or delay"
                 )));
             }
         }
@@ -2285,7 +2392,8 @@ fn macro_record_bytes(record: &JsonMacro) -> Result<Vec<u8>> {
 /// this grammar does not represent, so packing an edited list would erase them. Macros are edited in GG,
 /// and the bytes a read produced are what a write sends back.
 ///
-/// The record count a binding can reach is [`MACRO_ID_MAX`], not a capacity of the block.
+/// A binding reaches [`MACRO_BINDING_REACH_BYTES`] bytes of the block; the block's capacity is what
+/// bounds the list.
 fn encode_macro_records(profile: &JsonProfile, region_start: usize, region_len: usize, data: &mut [u8]) -> Result<()> {
     if profile.macro_note.is_some() && profile.macro_data.bytes_hex.is_none() {
         return Err(Error::Profile(format!(
@@ -2577,12 +2685,18 @@ fn macro_lines(profile: &OnboardProfile) -> Vec<String> {
     fn key_label(key: Option<u8>) -> String {
         key.map_or_else(|| "key ?".to_string(), |key| format!("key 0x{key:02X}"))
     }
+    fn mouse_mask_label(mask: Option<u8>) -> String {
+        macro_mouse_mask_name(mask)
+    }
+
     fn actions_line(actions: &[MacroAction]) -> String {
         actions
             .iter()
             .map(|action| match action.kind {
                 "press" => format!("push {}", key_label(action.key)),
                 "release" => format!("release {}", key_label(action.key)),
+                "press_mouse" => format!("push {}", mouse_mask_label(action.mask)),
+                "release_mouse" => format!("release {}", mouse_mask_label(action.mask)),
                 _ => format!("wait {} ms", action.ms.unwrap_or(0)),
             })
             .collect::<Vec<_>>()
@@ -2599,31 +2713,25 @@ fn macro_lines(profile: &OnboardProfile) -> Vec<String> {
         };
     }
 
-    let mut ids: Vec<u16> = profile.macros.iter().map(|rec| rec.id).collect();
-    ids.sort_unstable();
-    ids.dedup();
     let modes: Vec<String> = profile
         .macros
         .iter()
-        .map(|rec| format!("id {} mode {}", rec.id, rec.mode))
+        .map(|rec| format!("#{} mode {}", rec.ordinal, rec.mode))
         .collect();
     let mut lines = vec![format!(
-        "  macro records [EXPERIMENTAL]: {} record(s) of {} macro id(s) ({}) packed in the block at {} - {} of its {} bytes are records; a key binds macro id `n` as index {} + n - 1, so ids 1..={MACRO_ID_MAX} are reachable",
+        "  macro records [EXPERIMENTAL]: {} record(s) packed in the block at {} - {} of its {} bytes are records; a key binds the macro at block offset `4 × byte`, so bytes 0..={MACRO_BINDING_BYTE_MAX} reach the first {MACRO_BINDING_REACH_BYTES} bytes of the block",
         profile.macros.len(),
-        ids.len(),
-        ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", "),
         profile.macro_region.start,
         profile.macro_region.used_bytes,
         profile.macro_region.len,
-        MACRO_BINDING_BASE,
     )];
     for line in &modes {
         lines.push(format!("    {line}"));
     }
     for rec in &profile.macros {
         lines.push(format!(
-            "    id {} {} at {} (mode {} {}, interval {} ms, bound by index {}): {} action(s), {} bytes",
-            rec.id,
+            "    #{} {} at {} (mode {} {}, interval {} ms, binding byte {}): {} action(s), {} bytes, header word {}",
+            rec.ordinal,
             if rec.flags_ok {
                 ""
             } else {
@@ -2635,43 +2743,40 @@ fn macro_lines(profile: &OnboardProfile) -> Vec<String> {
             rec.interval_ms,
             rec.index,
             rec.action_count,
-            rec.record_bytes
+            rec.record_bytes,
+            rec.header_word
         ));
         lines.push(format!("      keys: {}", actions_line(&rec.actions)));
         lines.push(format!("      raw:  {}", rec.raw));
     }
+    let start = profile.macro_region.start;
     for (offset, entry) in profile.button_meta_mappings.iter().enumerate() {
         let Some(index) = entry.macro_index else { continue };
         let index = usize::from(index);
-        // Below the binding base the byte is a key code, not a macro index.
-        if index < MACRO_BINDING_BASE {
-            continue;
-        }
-        let Ok(id) = u16::try_from(index - MACRO_BINDING_BASE + 1) else {
-            continue;
-        };
+        // A byte names a block offset; a macro has to start there for the binding to reach it.
+        let at = macro_offset_for_binding_byte(u8::try_from(index).unwrap_or(MACRO_BINDING_BYTE_MAX), start);
         let bound: Vec<&crate::devices::keyboards::apex_7_profile::OnboardMacro> =
-            profile.macros.iter().filter(|rec| rec.id == id).collect();
+            profile.macros.iter().filter(|rec| rec.offset == at).collect();
         match bound.as_slice() {
             [] => lines.push(format!(
-                "    bound at META mapping {}: index {} -> macro id {} - the block holds no record of that id, so the binding names a macro this profile does not carry",
-                offset, index, id
+                "    bound at META mapping {}: byte {} -> block offset {at} - no macro starts there, so the binding names a macro this profile does not carry",
+                offset, index
             )),
             [rec] => lines.push(format!(
-                "    bound at META mapping {}: index {} -> macro id {} ({} at {}, {} ms): {}",
+                "    bound at META mapping {}: byte {} -> record #{} ({} at {}, {} ms): {}",
                 offset,
                 index,
-                id,
+                rec.ordinal,
                 rec.mode_name,
                 rec.offset,
                 rec.interval_ms,
                 actions_line(&rec.actions)
             )),
             many => lines.push(format!(
-                "    bound at META mapping {}: index {} -> macro id {} in {} records (modes {}), which is how GG stores one macro; the board plays them in list order",
+                "    bound at META mapping {}: byte {} -> record #{} in {} records (modes {}), which is how GG stores one macro; the board plays them in list order",
                 offset,
                 index,
-                id,
+                many[0].ordinal,
                 many.len(),
                 many.iter()
                     .map(|rec| rec.mode.to_string())
@@ -2769,15 +2874,16 @@ mod tests {
         let (macro_offset, _) = macro_region_bounds(schema);
         data[macro_offset..macro_offset + SYNTH_MACRO_BLOCK.len()].copy_from_slice(&SYNTH_MACRO_BLOCK);
         // Four META-layer macro bindings, in the shape the measurement says GG writes: a binding carries
-        // `MACRO_BINDING_BASE + macro id - 1`. Offset 114 carries 43 (macro id 9, the repeat record),
-        // offsets 30 and 31 both carry 45 (macro id 11: two keys on one macro), and offset 22 carries 255
-        // - macro id 221, which no record carries: the deleted-macro state, with no real profile behind it.
+        // the macro's offset from the block start in 4-byte units. Offset 114 carries 4 (the record at
+        // start + 16, the mode-1 record), offsets 30 and 31 both carry 14 (start + 56, a byte no record
+        // starts at: two keys bound to an absent macro), and offset 22 carries 255 - the farthest byte a
+        // binding can name, deep in the block's zero padding.
         data[BUTTON_META_MAPPINGS_OFFSET + 114 * KEY_MAPPING_LEN] = 0x71;
-        data[BUTTON_META_MAPPINGS_OFFSET + 114 * KEY_MAPPING_LEN + 3] = 43;
+        data[BUTTON_META_MAPPINGS_OFFSET + 114 * KEY_MAPPING_LEN + 3] = 4;
         data[BUTTON_META_MAPPINGS_OFFSET + 30 * KEY_MAPPING_LEN] = 0x71;
-        data[BUTTON_META_MAPPINGS_OFFSET + 30 * KEY_MAPPING_LEN + 3] = 45;
+        data[BUTTON_META_MAPPINGS_OFFSET + 30 * KEY_MAPPING_LEN + 3] = 14;
         data[BUTTON_META_MAPPINGS_OFFSET + 31 * KEY_MAPPING_LEN] = 0x71;
-        data[BUTTON_META_MAPPINGS_OFFSET + 31 * KEY_MAPPING_LEN + 3] = 45;
+        data[BUTTON_META_MAPPINGS_OFFSET + 31 * KEY_MAPPING_LEN + 3] = 14;
         data[BUTTON_META_MAPPINGS_OFFSET + 22 * KEY_MAPPING_LEN] = 0x71;
         data[BUTTON_META_MAPPINGS_OFFSET + 22 * KEY_MAPPING_LEN + 3] = 255;
         data[guid_offset_for_schema(schema)] = 0xAB;
@@ -2881,6 +2987,52 @@ mod tests {
     }
 
     /// A record list the block's bytes do not match is an edit, and the write is refused: the block carries
+    /// A mouse mask past the bits the reads measured names no button, so the encoder refuses it.
+    #[test]
+    fn a_mouse_mask_past_the_measured_bits_is_refused() {
+        let record = JsonMacro {
+            offset: 2076,
+            record_bytes: 16,
+            // Header plus one action: an edited list, so the encoder rebuilds the record from its actions.
+            raw: "77 04 02 00 01 01 88 13 00 40 00 01 00 03 00 00".to_owned(),
+            mode: 4,
+            header_word: 2,
+            flags: MACRO_RECORD_FLAGS_KNOWN[0],
+            interval_ms: 5000,
+            actions: vec![JsonMacroAction {
+                kind: "press_mouse".to_owned(),
+                key: None,
+                mask: Some(MACRO_MOUSE_MASK_MAX + 1),
+                ms: None,
+            }],
+        };
+        let reason = macro_record_bytes(&record)
+            .expect_err("a mask with no measured bit behind it is not a button")
+            .to_string();
+        assert!(
+            reason.contains(&format!("no mouse mask in 1..={:#04X}", MACRO_MOUSE_MASK_MAX)),
+            "the refusal names the mask range: {reason}"
+        );
+        let measured = JsonMacroAction {
+            kind: "press_mouse".to_owned(),
+            key: None,
+            mask: Some(MACRO_MOUSE_MASK_MAX),
+            ms: None,
+        };
+        let ok = JsonMacro {
+            actions: vec![measured],
+            ..record
+        };
+        assert!(
+            macro_record_bytes(&ok).is_ok_and(|bytes| bytes[9] == MACRO_MOUSE_MASK_MAX),
+            "the highest measured mask writes"
+        );
+        assert!(
+            macro_record_bytes(&ok).is_ok_and(|bytes| bytes[9] == MACRO_MOUSE_MASK_MAX),
+            "the highest measured mask writes"
+        );
+    }
+
     /// GG's own per-macro structures between and behind the records, and packing an edited list in their
     /// place is not a write this crate can make. The check that decides between "the list is the bytes
     /// already there" and "the list is an edit" counts the 8-byte record header on the `raw` side, so a
@@ -3531,11 +3683,11 @@ mod tests {
                 repeat.index,
                 repeat.ordinal,
                 repeat.mode,
-                repeat.id,
+                repeat.header_word,
                 repeat.flags
             ),
-            (0, 43, 0, 4, 9, 0x0101),
-            "macro id 9 is carried by binding number 35 + 9 - 1"
+            (0, 0, 0, 4, 9, 0x0101),
+            "the record at the block start is carried by the binding byte 0 (0 / 4)"
         );
         assert_eq!(
             (repeat.mode_name, repeat.interval_ms, repeat.flags_ok),
@@ -3547,11 +3699,13 @@ mod tests {
                 MacroAction {
                     kind: "press",
                     key: Some(0x04),
+                    mask: None,
                     ms: None
                 },
                 MacroAction {
                     kind: "release",
                     key: Some(0x04),
+                    mask: None,
                     ms: None
                 },
             ],
@@ -3565,11 +3719,11 @@ mod tests {
                 once.index,
                 once.ordinal,
                 once.mode,
-                once.id,
+                once.header_word,
                 once.interval_ms
             ),
-            (16, 45, 1, 1, 11, 15),
-            "the record packed behind the first is macro id 11, bound by number 45"
+            (16, 4, 1, 1, 11, 15),
+            "the record packed 16 bytes into the block is carried by the binding byte 16 / 4"
         );
         assert_eq!(once.mode_name, "once");
         assert_eq!(once.actions.len(), 15);
@@ -3590,9 +3744,9 @@ mod tests {
         );
     }
 
-    /// A `0x71` binding row names a macro by number, and the record list carries that macro: the number is
-    /// [`MACRO_BINDING_BASE`] + id - 1, two rows can name one macro, and a number whose id no record carries
-    /// is the deleted-macro state.
+    /// A `0x71` binding row names a macro by its offset in the block: the byte is that offset in
+    /// [`MACRO_INDEX_UNIT`] units, two rows can name one macro, and a byte no macro starts at is the
+    /// deleted-macro state.
     #[test]
     fn a_meta_layer_macro_binding_names_the_macro_it_points_at() {
         let profile = decode(&synthetic_payload(SCHEMA_B)).unwrap();
@@ -3602,33 +3756,48 @@ mod tests {
             .find(|mapping| mapping.hid_code == Some(0x49))
             .expect("the fixture binds META + Insert");
         assert_eq!((insert.function, insert.function_name.as_str()), (0x71, "macro"));
-        assert_eq!(insert.key_codes, "00 00 2B 00", "43 is 0x2B");
-        let index = usize::from(insert.macro_index.expect("the binding carries its index"));
-        let id = u16::try_from(index - MACRO_BINDING_BASE + 1).expect("an in-range binding number");
+        assert_eq!(
+            insert.key_codes, "00 00 04 00",
+            "4 is the byte for the macro 16 bytes into the block"
+        );
+        let byte = insert.macro_index.expect("the binding carries its byte");
+        let at = macro_offset_for_binding_byte(byte, profile.macro_region.start);
         let target = profile
             .macros
             .iter()
-            .find(|rec| rec.id == id)
-            .expect("the binding resolves to the macro its number names");
+            .find(|rec| rec.offset == at)
+            .expect("the binding resolves to the macro its byte names");
+        assert_eq!(
+            (at, target.index),
+            (
+                profile.macro_region.start + 16,
+                macro_index(at, profile.macro_region.start)
+            ),
+            "the byte counts 4-byte units of offset, and the macro's own byte is that count"
+        );
         assert_eq!(
             (target.mode_name, target.interval_ms, target.actions[0].key),
-            ("repeat", 5000, Some(0x04)),
+            ("once", 15, Some(0x1E)),
             "the record names its keys by HID code, not by mapping slot"
         );
-        assert_eq!((target.record_bytes, target.action_count), (16, 2));
+        assert_eq!((target.record_bytes, target.action_count), (68, 15));
         assert_eq!(profile.macros.iter().map(|rec| rec.record_bytes).sum::<usize>(), 84);
-        // Two bindings of one macro: 30 and 31 both carry 45, the number of macro id 11.
+        // Two bindings of one offset: 30 and 31 both carry 14, the byte of block offset 56.
         let pair: Vec<(usize, u8)> = profile
             .button_meta_mappings
             .iter()
             .filter(|mapping| mapping.offset == 30 || mapping.offset == 31)
-            .map(|mapping| (mapping.offset, mapping.macro_index.expect("both carry an index")))
+            .map(|mapping| (mapping.offset, mapping.macro_index.expect("both carry a byte")))
             .collect();
-        assert_eq!(pair, vec![(30, 45), (31, 45)]);
+        assert_eq!(pair, vec![(30, 14), (31, 14)]);
         assert_eq!(
-            profile.macros.iter().filter(|rec| rec.id == 11).count(),
-            1,
-            "both rows play the one record of macro id 11"
+            profile
+                .macros
+                .iter()
+                .filter(|rec| rec.offset == macro_offset_for_binding_byte(14, profile.macro_region.start))
+                .count(),
+            0,
+            "no macro starts at block offset 56, so both rows name an absent macro"
         );
         // The binding whose number names a macro no record carries: the macro is gone, the binding stays.
         let ghost = profile
@@ -3641,13 +3810,18 @@ mod tests {
             (0x71, "00 00 FF 00", Some(255))
         );
         assert_eq!(
-            u16::try_from(255 - MACRO_BINDING_BASE + 1).expect("in range"),
-            MACRO_ID_MAX,
-            "255 is the highest number a binding row can carry, naming the highest id"
+            macro_offset_for_binding_byte(MACRO_BINDING_BYTE_MAX, profile.macro_region.start)
+                - profile.macro_region.start,
+            MACRO_BINDING_REACH_BYTES,
+            "255 is the highest byte a row can carry, and it names the farthest byte of the block"
         );
         assert!(
-            profile.macros.iter().all(|rec| rec.id != MACRO_ID_MAX),
-            "id 221 is past the records the block holds"
+            profile
+                .macros
+                .iter()
+                .all(|rec| rec.offset
+                    != macro_offset_for_binding_byte(MACRO_BINDING_BYTE_MAX, profile.macro_region.start)),
+            "the farthest byte a binding can name sits in the block's padding, past its macros"
         );
 
         // Every non-macro slot leaves the field empty.
@@ -3677,14 +3851,14 @@ mod tests {
             "the scan walks the block in payload order"
         );
         assert_eq!(
-            macros.iter().map(|rec| rec.id).collect::<Vec<_>>(),
+            macros.iter().map(|rec| rec.header_word).collect::<Vec<_>>(),
             vec![9, 11, 9],
-            "the record behind the gap is a second record of macro id 9"
+            "the record behind the gap repeats the first record's header word"
         );
         assert_eq!(
             macros.iter().map(|rec| rec.index).collect::<Vec<_>>(),
-            vec![43, 45, 43],
-            "the binding number is the macro id, not the position in the list"
+            vec![0, 4, 75],
+            "the binding byte counts 4-byte units of offset from the block start"
         );
     }
 

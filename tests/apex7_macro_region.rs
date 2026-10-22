@@ -12,9 +12,10 @@
 
 use serde_json::Value;
 use steelseries_gg::devices::keyboards::apex_7_profile::{
-    BUTTON_META_MAPPINGS_OFFSET, KEY_MAPPING_LEN, MACRO_ACTION_LEN, MACRO_BINDING_BASE, MACRO_HEADER_LEN, MACRO_ID_MAX,
-    MACRO_RECORD_FLAGS_KNOWN, MacroRecordRegion, SCHEMA_B, compute_checksum, decode, encode_json, macro_region_bounds,
-    profile_json,
+    BUTTON_MAPPINGS_OFFSET, BUTTON_META_MAPPINGS_OFFSET, KEY_MAPPING_LEN, MACRO_ACTION_LEN, MACRO_BINDING_BYTE_MAX,
+    MACRO_BINDING_REACH_BYTES, MACRO_HEADER_LEN, MACRO_INDEX_UNIT, MACRO_RECORD_FLAGS_KNOWN, MacroAction,
+    MacroRecordRegion, SCHEMA_B, compute_checksum, decode, encode_json, macro_index, macro_mouse_mask_name,
+    macro_offset_for_binding_byte, macro_region_bounds, profile_json,
 };
 
 const PAYLOAD_LEN: usize = 11_696;
@@ -42,10 +43,20 @@ fn delay(ms: u16) -> Vec<u8> {
     bytes
 }
 
+/// A mouse press: `0x00 | mask | 0x00 0x01`. The mask says which buttons go down together.
+fn press_mouse(mask: u8) -> Vec<u8> {
+    vec![0x00, mask, 0x00, 0x01]
+}
+
+/// A mouse release: `0x00 | mask | 0x00 0x00`.
+fn release_mouse(mask: u8) -> Vec<u8> {
+    vec![0x00, mask, 0x00, 0x00]
+}
+
 /// A record header and the actions packed behind it.
-fn record(mode: u8, id: u16, interval_ms: u16, actions: &[Vec<u8>]) -> Vec<u8> {
+fn record(mode: u8, header_word: u16, interval_ms: u16, actions: &[Vec<u8>]) -> Vec<u8> {
     let mut bytes = vec![0x77, mode];
-    bytes.extend_from_slice(&id.to_le_bytes());
+    bytes.extend_from_slice(&header_word.to_le_bytes());
     bytes.extend_from_slice(&MACRO_RECORD_FLAGS_KNOWN[0].to_le_bytes());
     bytes.extend_from_slice(&interval_ms.to_le_bytes());
     for action in actions {
@@ -84,6 +95,12 @@ fn stock_records() -> Vec<Vec<u8>> {
 /// `0x71` mapping rows of the META layer (slot, binding number), the region zero behind the last record as
 /// every read surveyed had it, and the checksum its bytes hash to.
 fn payload(records: &[Vec<u8>], bindings: &[(usize, u8)]) -> Vec<u8> {
+    payload_layers(records, &[], bindings)
+}
+
+/// The same payload with `0x71` rows in both mapping layers: `base` rows go in the base table, `meta` rows
+/// in the META table, each as (slot, binding byte).
+fn payload_layers(records: &[Vec<u8>], base: &[(usize, u8)], meta: &[(usize, u8)]) -> Vec<u8> {
     let mut data = vec![0u8; PAYLOAD_LEN];
     data[0..2].copy_from_slice(&SCHEMA_B.to_le_bytes());
     data[2..19].copy_from_slice(b"Macro Region Test");
@@ -93,8 +110,15 @@ fn payload(records: &[Vec<u8>], bindings: &[(usize, u8)]) -> Vec<u8> {
         data[at..at + bytes.len()].copy_from_slice(bytes);
         at += bytes.len();
     }
-    for (slot, index) in bindings {
-        let row = BUTTON_META_MAPPINGS_OFFSET + slot * KEY_MAPPING_LEN;
+    let rows = base
+        .iter()
+        .map(|(slot, index)| (BUTTON_MAPPINGS_OFFSET, slot, index))
+        .chain(
+            meta.iter()
+                .map(|(slot, index)| (BUTTON_META_MAPPINGS_OFFSET, slot, index)),
+        );
+    for (table, slot, index) in rows {
+        let row = table + slot * KEY_MAPPING_LEN;
         data[row] = 0x71;
         data[row + 3] = *index;
     }
@@ -140,19 +164,29 @@ fn the_record_region_of_a_schema_b_profile_is_measured() {
     assert_eq!(
         SURVEYED_CHAIN_START + 8 + 8 + 16,
         3632,
-        "the two META rows carrying binding 61 (macro id 27) played the record at 3632 in the read that \
-         carried binding 61: 8 bytes of the id 3 record, 8 of the id 3 record's second copy, 8 of the id 27 \
-         record's header, and its first action byte is 3632"
+        "the two META rows carrying binding 61 played the record at 3632 in the read that carried \
+         binding 61: 8 bytes of the first record, 8 of the second, 8 of the third record's header, and its \
+         first action byte is 3632"
     );
     assert_eq!(
-        MACRO_BINDING_BASE + usize::from(MACRO_ID_MAX) - 1,
-        255,
-        "a binding row is one byte, so ids 1..={MACRO_ID_MAX} reach bindings {MACRO_BINDING_BASE}..=255"
+        MACRO_BINDING_REACH_BYTES, 1020,
+        "a binding row is one byte counting 4-byte units, so it names block offsets 0, 4, ... 1020 and no \
+         further; the block is 9600 bytes, so the last part of it is out of reach of any binding"
     );
     assert_eq!(
-        MACRO_BINDING_BASE + 83 - 1,
-        117,
-        "the read whose META binding carried 117 held a record of macro id 83: 35 + 83 - 1"
+        (
+            macro_offset_for_binding_byte(0, 2076),
+            macro_offset_for_binding_byte(7, 2076),
+            macro_offset_for_binding_byte(14, 2076)
+        ),
+        (2076, 2104, 2132),
+        "the read whose keys c, v, x carry the bytes 0, 7, 14 presses LCtrl with c, v, x in the macros at \
+         block offsets 0, 28, 56 - the keystrokes are the measurement"
+    );
+    assert_eq!(
+        (MACRO_INDEX_UNIT, MACRO_ACTION_LEN),
+        (4, 4),
+        "the unit a binding counts is one action: a macro 28 bytes into the block is reached by byte 7"
     );
 }
 
@@ -183,11 +217,11 @@ fn all_records_of_the_region_decode_and_report_their_capacity() {
         profile
             .macros
             .iter()
-            .map(|rec| (rec.id, rec.mode, rec.interval_ms, rec.record_bytes, rec.index))
+            .map(|rec| (rec.header_word, rec.mode, rec.interval_ms, rec.record_bytes, rec.index))
             .collect::<Vec<_>>(),
-        vec![(3, 4, 5000, 16, 37), (3, 4, 5000, 16, 37), (27, 1, 15, 88, 61)],
+        vec![(3, 4, 5000, 16, 0), (3, 4, 5000, 16, 4), (27, 1, 15, 88, 8)],
         "every record of the region, in payload order: 8 header bytes plus 4 per action, and the binding \
-         number of its macro id"
+         byte that reaches it - its offset from the block start over {MACRO_INDEX_UNIT}"
     );
     assert!(
         profile.macros.iter().all(|rec| rec.flags_ok),
@@ -232,9 +266,78 @@ fn all_records_of_the_region_decode_and_report_their_capacity() {
     );
 }
 
+/// A macro that drives the mouse instead of the keyboard: the shape a wired read carries when a number-row
+/// key is bound to a macro that clicks mouse buttons. The binding byte is the macro's offset from the block
+/// start in 4-byte units, and a mask of 0 is not an action - that is what keeps the walk off the block's
+/// zero padding.
+#[test]
+fn a_mouse_macro_decodes_and_a_binding_reaches_it() {
+    let key_macro = record(
+        1,
+        5,
+        15,
+        &[press(0xE0), press(0x06), delay(20), release(0x06), release(0xE0)],
+    );
+    let click = record(1, 1, 15, &[press_mouse(0x03)]);
+    let toggle = record(2, 3, 15, &[press_mouse(0x08), delay(1), release_mouse(0x08)]);
+    let bytes = payload(&[key_macro, click, toggle], &[(8, 7), (9, 10)]);
+    let profile = decode(&bytes).expect("decodes");
+    assert_eq!(
+        profile.macros.iter().map(|rec| rec.record_bytes).sum::<usize>(),
+        60,
+        "28 + 12 + 20 bytes of macros, and the zero padding behind them is not actions"
+    );
+    assert_eq!(
+        profile.macros.iter().map(|rec| rec.index).collect::<Vec<_>>(),
+        vec![0, 7, 10],
+        "the binding byte is each macro's offset from the block start over {MACRO_INDEX_UNIT}"
+    );
+    let click = &profile.macros[1];
+    assert_eq!(
+        click.actions,
+        vec![MacroAction {
+            kind: "press_mouse",
+            key: None,
+            mask: Some(0x03),
+            ms: None,
+        }],
+        "one mouse press, no key code"
+    );
+    assert_eq!(
+        macro_mouse_mask_name(click.actions[0].mask),
+        "mouse 1+mouse 2",
+        "mask 0x03 presses the two buttons together, which is how a macro makes a middle click"
+    );
+    let toggle = &profile.macros[2];
+    assert_eq!(
+        toggle.actions.iter().map(|a| a.kind).collect::<Vec<_>>(),
+        vec!["press_mouse", "delay", "release_mouse"],
+        "press, one millisecond, release: a click"
+    );
+    assert_eq!(
+        macro_mouse_mask_name(toggle.actions[0].mask),
+        "mouse 4",
+        "mask 0x08 is the fourth button"
+    );
+    for (slot, byte) in [(8usize, 7u8), (9, 10)] {
+        let row = profile
+            .button_meta_mappings
+            .iter()
+            .find(|mapping| mapping.offset == slot)
+            .expect("the row is bound");
+        assert_eq!((row.function, row.macro_index), (0x71, Some(byte)));
+        let at = macro_offset_for_binding_byte(byte, profile.macro_region.start);
+        assert!(
+            profile.macros.iter().any(|rec| rec.offset == at),
+            "byte {byte} names the macro at block offset {}",
+            at - profile.macro_region.start
+        );
+    }
+}
+
 #[test]
 fn a_write_of_the_same_report_is_the_payload_byte_for_byte() {
-    let bytes = payload(&stock_records(), &[(8, 61)]);
+    let bytes = payload(&stock_records(), &[(8, 7)]);
     let profile = decode(&bytes).expect("decodes");
     let written = write_back(&json_of(&bytes));
     assert_eq!(
@@ -251,8 +354,8 @@ fn a_write_of_the_same_report_is_the_payload_byte_for_byte() {
 }
 
 #[test]
-fn a_binding_number_names_the_macro_its_record_sits_in() {
-    let bytes = payload(&stock_records(), &[(8, 61), (9, 61), (10, 255)]);
+fn a_binding_byte_names_the_record_it_points_at() {
+    let bytes = payload(&stock_records(), &[(8, 4), (9, 4), (10, 255)]);
     let profile = decode(&bytes).expect("decodes");
     let bound: Vec<(usize, u8)> = profile
         .button_meta_mappings
@@ -261,32 +364,38 @@ fn a_binding_number_names_the_macro_its_record_sits_in() {
         .map(|mapping| {
             (
                 mapping.offset,
-                mapping.macro_index.expect("a 0x71 row carries its number"),
+                mapping.macro_index.expect("a 0x71 row carries its byte"),
             )
         })
         .collect();
     assert_eq!(
         bound,
-        vec![(8, 61), (9, 61), (10, 255)],
+        vec![(8, 4), (9, 4), (10, 255)],
         "three META rows bound to macros, in the shape the read carried"
     );
-    let id = u16::try_from(61 - MACRO_BINDING_BASE + 1).expect("an in-range binding number");
-    assert_eq!(id, 27, "61 is the binding number of macro id 27");
+    let at = macro_offset_for_binding_byte(4, profile.macro_region.start);
+    assert_eq!(at, 2092, "the byte 4 names the macro 16 bytes into the block");
     let hits: Vec<usize> = profile
         .macros
         .iter()
-        .filter(|rec| rec.id == id)
+        .filter(|rec| rec.offset == at)
         .map(|rec| rec.offset)
         .collect();
     assert_eq!(
         hits,
-        vec![2108],
-        "the two rows play the one record of macro id 27, packed behind the two records of id 3"
+        vec![2092],
+        "both rows play the one macro at that offset, packed behind the macro at the block start"
+    );
+    let far = macro_offset_for_binding_byte(MACRO_BINDING_BYTE_MAX, profile.macro_region.start);
+    assert_eq!(
+        far - profile.macro_region.start,
+        MACRO_BINDING_REACH_BYTES,
+        "255 names the farthest byte of the block a binding can reach"
     );
     assert!(
-        profile.macros.iter().all(|rec| rec.id != MACRO_ID_MAX),
-        "the row carrying 255 names macro id 221, which this profile has no record for: the deleted-macro \
-         state, with the binding left standing"
+        profile.macros.iter().all(|rec| rec.offset != far),
+        "no macro starts at the farthest byte a binding can name: the deleted-macro state, with the \
+         binding left standing"
     );
 }
 
@@ -305,9 +414,11 @@ fn the_capacity_is_the_region_and_not_the_ui_grid() {
         "one more does not fit"
     );
     assert_eq!(
-        usize::from(MACRO_ID_MAX),
-        221,
-        "a binding row reaches 221 macros, so the UI grid is not the board's limit either way"
+        MACRO_BINDING_REACH_BYTES / long.len(),
+        11,
+        "a binding byte reaches the first 1020 bytes of the block - 11 of the longest records - while the \
+         block's capacity is 109 of them: the byte, not the block, is what limits binding, and the UI grid \
+         is neither"
     );
 }
 
@@ -316,21 +427,21 @@ fn a_record_list_over_capacity_is_refused_with_the_numbers() {
     let mut doc = json_of(&payload(&stock_records(), &[]));
     let record_json = |position: usize| {
         let key = 0x04 + (position % 0x70) as u8;
-        let id = (position as u16 % MACRO_ID_MAX) + 1;
+        let header_word = (position as u16 % 200) + 1;
         let actions = (0..20)
             .map(|_| serde_json::json!({ "kind": "press", "key": key }))
             .collect::<Vec<_>>();
-        let raw: Vec<String> = std::iter::once(format!("77 04 {id:02x} 00 01 01 64 00"))
+        let raw: Vec<String> = std::iter::once(format!("77 04 {header_word:02x} 00 01 01 64 00"))
             .chain(actions.iter().map(|_| format!("02 {key:02x} 01 01")))
             .collect();
         serde_json::json!({
-            "offset": 3600 + position * 88,
+            "offset": 2076 + position * 88,
             "ordinal": position,
-            "index": MACRO_BINDING_BASE + usize::from(id) - 1,
+            "index": macro_index(2076 + position * 88, 2076),
             "flags_ok": true,
             "mode": 4,
             "mode_name": "repeat",
-            "id": id,
+            "header_word": header_word,
             "flags": MACRO_RECORD_FLAGS_KNOWN[0],
             "interval_ms": 100,
             "record_bytes": 88,
@@ -422,4 +533,177 @@ fn an_empty_region_is_empty() {
     );
     assert_eq!((profile.macro_region.records, profile.macro_region.used_bytes), (0, 0));
     assert_eq!(profile.macro_region.free_bytes, profile.macro_region.len);
+}
+
+/// `n` actions of key typing: press, wait, release triplets on invented key codes, so a record of a measured
+/// size can be built without carrying the keystrokes a person typed into their own macro.
+fn typed_actions(n: usize) -> Vec<Vec<u8>> {
+    (0x30u8..0x3A)
+        .cycle()
+        .take(n.div_ceil(3))
+        .flat_map(|key| [press(key), delay(15), release(key)])
+        .take(n)
+        .collect()
+}
+
+/// The board the binding rule was measured on: a wired `0x1612` read (firmware 4.16.8, schema b, 2026-10-22)
+/// whose number row `3` to `7` is built from mouse macros. Its 14 records are packed from the block start with
+/// no gap, its 14 binding bytes are the third code byte of their rows, and every one of them names a record the
+/// block holds. The record sizes, modes, header words and intervals are the read's own; the mouse masks are what
+/// its number-row macros press; the key codes of the typing records are invented.
+fn mouse_board_records() -> Vec<Vec<u8>> {
+    vec![
+        record(
+            1,
+            5,
+            15,
+            &[press(0xE0), press(0x06), delay(20), release(0x06), release(0xE0)],
+        ),
+        record(
+            1,
+            5,
+            15,
+            &[press(0xE0), press(0x19), delay(20), release(0x19), release(0xE0)],
+        ),
+        record(
+            1,
+            5,
+            15,
+            &[press(0xE0), press(0x1B), delay(20), release(0x1B), release(0xE0)],
+        ),
+        record(4, 2, 15, &[press(0x25), release(0x25)]),
+        record(1, 1, 15, &[press_mouse(0x03)]),
+        record(2, 3, 15, &[press_mouse(0x08), delay(1), release_mouse(0x08)]),
+        record(3, 3, 25, &[press_mouse(0x10), delay(1), release_mouse(0x10)]),
+        record(4, 3, 30, &[press_mouse(0x20), delay(1), release_mouse(0x20)]),
+        record(5, 1, 15, &[press_mouse(0x07)]),
+        record(1, 15, 15, &typed_actions(15)),
+        record(1, 27, 15, &typed_actions(27)),
+        record(1, 2, 15, &[press(0x25), release(0x25)]),
+        record(1, 19, 15, &typed_actions(19)),
+        record(1, 83, 15, &typed_actions(83)),
+    ]
+}
+
+/// A layer's macro bindings: (slot, binding byte).
+type Bindings = Vec<(usize, u8)>;
+
+/// The read's 14 macro bindings: (slot, binding byte) in the base layer and the META layer.
+fn mouse_board_bindings() -> (Bindings, Bindings) {
+    (
+        vec![(28, 14), (36, 0), (44, 7)],
+        vec![
+            (15, 117),
+            (20, 21),
+            (25, 25),
+            (33, 28),
+            (39, 92),
+            (41, 33),
+            (49, 38),
+            (57, 43),
+            (63, 46),
+            (79, 63),
+            (86, 96),
+        ],
+    )
+}
+
+#[test]
+fn every_binding_of_a_mouse_macro_board_resolves_to_a_record() {
+    let (base, meta) = mouse_board_bindings();
+    let bytes = payload_layers(&mouse_board_records(), &base, &meta);
+    let profile = decode(&bytes).expect("decodes");
+    assert_eq!(profile.macros.len(), 14, "every record the block holds is decoded");
+    assert_eq!(
+        profile
+            .macros
+            .iter()
+            .map(|rec| rec.offset - profile.macro_region.start)
+            .collect::<Vec<_>>(),
+        vec![0, 28, 56, 84, 100, 112, 132, 152, 172, 184, 252, 368, 384, 468],
+        "records packed with no gap, the mouse records 100 to 172 bytes into the block"
+    );
+    assert!(
+        profile
+            .macros
+            .iter()
+            .all(|rec| rec.header_word as usize == rec.action_count),
+        "the header word is the action count in every record of this board, not a macro id"
+    );
+    let mut bindings: Vec<(usize, u8)> = profile
+        .button_mappings
+        .iter()
+        .chain(profile.button_meta_mappings.iter())
+        .filter(|mapping| mapping.function == 0x71)
+        .map(|mapping| {
+            (
+                mapping.offset,
+                mapping.macro_index.expect("a 0x71 row carries its byte"),
+            )
+        })
+        .collect();
+    bindings.sort();
+    assert_eq!(bindings.len(), 14, "the board's 14 macro bindings");
+    for (slot, byte) in &bindings {
+        let at = macro_offset_for_binding_byte(*byte, profile.macro_region.start);
+        assert!(
+            profile.macros.iter().any(|rec| rec.offset == at),
+            "slot {slot} carries byte {byte}, which names offset {at} - the block holds a record there"
+        );
+    }
+    // The five number-row keys the mouse macros are built from, in the order the read carried them.
+    let masks: Vec<String> = [25usize, 33, 41, 49, 57]
+        .iter()
+        .map(|slot| {
+            let byte = profile
+                .button_meta_mappings
+                .iter()
+                .find(|mapping| mapping.offset == *slot)
+                .and_then(|mapping| mapping.macro_index)
+                .expect("the key is bound to a macro");
+            let at = macro_offset_for_binding_byte(byte, profile.macro_region.start);
+            let rec = profile
+                .macros
+                .iter()
+                .find(|rec| rec.offset == at)
+                .expect("the binding names a record");
+            macro_mouse_mask_name(
+                rec.actions
+                    .iter()
+                    .find(|action| action.kind == "press_mouse")
+                    .and_then(|action| action.mask),
+            )
+        })
+        .collect();
+    assert_eq!(
+        masks,
+        vec![
+            "mouse 1+mouse 2",
+            "mouse 4",
+            "mouse 5",
+            "mouse 6",
+            "mouse 1+mouse 2+mouse 3"
+        ],
+        "keys 3, 4, 5, 6, 7 press the buttons their records carry - the measurement that fixed the rule"
+    );
+    // The superseded rule (byte = 7 x the record's position in the chain) agrees only on the four bindings
+    // whose records are 28 bytes apart, and that is the whole board the rule was measured on.
+    let mut agree: Vec<u8> = bindings
+        .iter()
+        .filter(|(_, byte)| {
+            let legacy = profile
+                .macros
+                .iter()
+                .find(|rec| rec.ordinal == usize::from(*byte) / 7)
+                .map(|rec| rec.offset);
+            legacy == Some(macro_offset_for_binding_byte(*byte, profile.macro_region.start))
+        })
+        .map(|(_, byte)| *byte)
+        .collect();
+    agree.sort();
+    assert_eq!(
+        agree,
+        vec![0, 7, 14, 21],
+        "the four bindings whose record 7 x position names are the ones the old measurement saw; the other          ten name a record the board plays differently - keys 5, 6, 7 land on the mouse buttons of 3 and 4"
+    );
 }

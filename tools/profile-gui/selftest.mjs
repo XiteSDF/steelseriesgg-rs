@@ -752,6 +752,32 @@ ok('macroIndex reads the index a macro-bound entry carries',
     return app.macroIndex(bound) === 7 && app.macroIndex(bound) === app.mappingCodes(bound).list[2]
       && app.macroIndex(apex.button_mappings[27]) === 0;
   }, () => app.macroIndex({ offset: 27, hid_code: 7, function: 0x71, key_codes: '00 00 07 00' }));
+ok('the binding byte is the offset a macro starts at, counted in 4-byte units', () => {
+  // The measurement, from two wired reads (schema B, 0x1612). One carries keys c, v, x bound to bytes
+  // 0, 7, 14 and their macros press LCtrl with c, v, x 0, 28, 56 bytes into the block. The other
+  // carries the number row 3..7 bound to 25, 28, 33, 38, 43 and those macros press mouse masks 0x03,
+  // 0x08, 0x10, 0x20, 0x07 at 100, 112, 132, 152, 172 bytes in. The byte counts 4-byte units - the
+  // same unit an action fills - and one code byte reaches 1020 bytes of a 9600-byte block.
+  const unit = Number(app.MACRO_INDEX_UNIT);
+  const maxByte = Number(app.MACRO_BINDING_BYTE_MAX);
+  const reach = Number(app.MACRO_BINDING_REACH_BYTES);
+  const keys = [[0, 0], [7, 28], [14, 56]];
+  const mouse = [[25, 100], [28, 112], [33, 132], [38, 152], [43, 172]];
+  const measured = keys.every(([byte, offset]) => app.macroOffsetForBindingByte(byte) === offset
+    && app.macroBindingByte(offset) === byte);
+  const mouseMeasured = mouse.every(([byte, offset]) => app.macroOffsetForBindingByte(byte) === offset
+    && app.macroBindingByte(offset) === byte);
+  const roundTrip = [0, 4, 28, 100, 172, 1020].every((offset) => app.macroOffsetForBindingByte(app.macroBindingByte(offset)) === offset);
+  return unit === 4 && maxByte === 255 && reach === 1020 && measured && mouseMeasured && roundTrip
+    && reach < Number(app.MACRO_DATA_LEN);
+}, () => [app.MACRO_INDEX_UNIT, app.MACRO_BINDING_REACH_BYTES]);
+ok('the mouse mask a macro action presses is named by its bits', () => {
+  const names = [[0x03, 'mouse 1+mouse 2'], [0x08, 'mouse 4'], [0x10, 'mouse 5'], [0x20, 'mouse 6'],
+    [0x07, 'mouse 1+mouse 2+mouse 3']];
+  return names.every(([mask, want]) => app.macroMouseMaskName(mask) === want)
+    && app.macroKeystrokes({ actions: [{ kind: 'press_mouse', mask: 0x03 }] }).includes('mouse 1+mouse 2 down')
+    && app.macroKeystrokes({ actions: [{ kind: 'press_mouse', mask: 0x10 }, { kind: 'delay', ms: 1 }, { kind: 'release_mouse', mask: 0x10 }] }).includes('mouse 5 down');
+}, () => [0x03, 0x07, 0x08, 0x10, 0x20].map((mask) => app.macroMouseMaskName(mask)));
 okMacros('macroKeystrokes reads the keys and delays a record runs', () => {
   const record = app.macroRecords(macrosDoc)[0];
   const text = app.macroKeystrokes(record);
@@ -759,49 +785,56 @@ okMacros('macroKeystrokes reads the keys and delays a record runs', () => {
 }, () => app.macroKeystrokes(app.macroRecords(macrosDoc)[0]));
 const boundDoc = app.cloneDoc(identityDoc);
 boundDoc.button_mappings.forEach((e) => { e.function = 0; e.key_codes = '00 00 00 00'; e.macro_index = null; });
-boundDoc.button_mappings[27] = { offset: 27, hid_code: app.OFF2HID[27], function: 0x71, key_codes: '00 00 07 00', macro_index: 7 };
-boundDoc.button_mappings[28] = { offset: 28, hid_code: app.OFF2HID[28], function: 0x71, key_codes: '00 00 14 00', macro_index: 20 };
-boundDoc.button_mappings[31] = { offset: 31, hid_code: app.OFF2HID[31], function: 0x71, key_codes: '00 00 14 00', macro_index: 20 };
+// Two macros packed at the block start: the first is 28 bytes, so the second starts 28 in - byte 7.
+boundDoc.macro_data = { ...boundDoc.macro_data, offset: 2076, len: 9600 };
+boundDoc.macros = [
+  { offset: 2076, ordinal: 0, index: 0, mode: 1, mode_name: 'once', interval_ms: 15, record_bytes: 28, action_count: 5, actions: [{ kind: 'press', key: 0xe0 }] },
+  { offset: 2104, ordinal: 1, index: 7, mode: 2, mode_name: 'unknown', interval_ms: 15, record_bytes: 20, action_count: 3, actions: [{ kind: 'press_mouse', mask: 0x08 }] },
+];
+boundDoc.button_mappings[27] = { offset: 27, hid_code: app.OFF2HID[27], function: 0x71, key_codes: '00 00 00 00', macro_index: 0 };
+boundDoc.button_mappings[28] = { offset: 28, hid_code: app.OFF2HID[28], function: 0x71, key_codes: '00 00 07 00', macro_index: 7 };
+boundDoc.button_mappings[31] = { offset: 31, hid_code: app.OFF2HID[31], function: 0x71, key_codes: '00 00 07 00', macro_index: 7 };
 app.normalizeDoc(boundDoc);
-const bound7 = app.macroBoundKeys(boundDoc, 7);
-const bound20 = app.macroBoundKeys(boundDoc, 20);
-ok('macroBoundKeys lists the keys bound to a macro id', () =>
-  // A key is bound to a macro by the id its slot carries, so the slots bound by id 7 and by id 20 (the
-  // 0x14 in key_codes[2]) are found by those ids and nothing else is: id 8 and id 99 name macros no key
-  // on this profile plays.
-  bound7.length === 1 && bound7[0] === app.keyName(app.OFF2HID[27])
-    && bound20.length === 2 && bound20.join(' ') === [28, 31].map((off) => app.keyName(app.OFF2HID[off])).join(' ')
-    && app.macroBoundKeys(boundDoc, 8).length === 0
-    && app.macroBoundKeys(boundDoc, 6).length === 0
-    && app.macroBoundKeys(boundDoc, 99).length === 0,
-  () => [bound7, bound20, [27, 28, 31].map((off) => app.keyName(app.OFF2HID[off])),
+const at0 = app.macroRecordFor(boundDoc, 0);
+const at7 = app.macroRecordFor(boundDoc, 7);
+const bound0 = app.macroBoundKeys(boundDoc, at0);
+const bound7 = app.macroBoundKeys(boundDoc, at7);
+ok('macroBoundKeys lists the keys bound to the macro a binding byte reaches', () =>
+  // A key is bound to the macro its byte names: 0 reaches the macro at the block start, 7 the one 28
+  // bytes in, and no other byte names either of them.
+  at0.offset === 2076 && at7.offset === 2104
+    && bound0.length === 1 && bound0[0] === app.keyName(app.OFF2HID[27])
+    && bound7.length === 2 && bound7.join(' ') === [28, 31].map((off) => app.keyName(app.OFF2HID[off])).join(' ')
+    && app.macroRecordFor(boundDoc, 1) === null
+    && app.macroRecordFor(boundDoc, 255) === null,
+  () => [bound0, bound7, [27, 28, 31].map((off) => app.keyName(app.OFF2HID[off])),
     boundDoc.button_mappings.filter((e) => e.function === 0x71).map((e) => [e.offset, e.hid_code, e.macro_index])]);
-okMacros('macroLine names the record a binding index resolves to',
-  () => app.macroLine(macrosDoc, 0).includes('binds record 0')
-    && app.macroLine(macrosDoc, 7).includes('binds record 1')
-    && app.macroLine(macrosDoc, 6).includes('binds record 0')
+okMacros('macroLine names the record a binding byte resolves to',
+  () => app.macroLine(macrosDoc, 0).includes('binding byte 0 -> the macro 0 bytes into the block')
+    && app.macroLine(macrosDoc, 7).includes('binding byte 7 -> the macro 28 bytes into the block')
+    && app.macroLine(macrosDoc, 14).includes('56 bytes into the block')
     && app.macroLine(macrosDoc, 0).includes('action(s)')
     && !app.macroLine(macrosDoc, 0).includes('press '),
-  () => [app.macroLine(macrosDoc, 0), app.macroLine(macrosDoc, 7)]);
-ok('a macro id with no record in the block says where the macro is',
-  () => app.macroLine(identityDoc, 7).includes('no record with that id in this block')
-    && app.macroLine(identityDoc, 7).includes('binding 41'),
+  () => [app.macroLine(macrosDoc, 0), app.macroLine(macrosDoc, 7), app.macroLine(macrosDoc, 14)]);
+ok('a binding byte with no macro at the offset it names says what it means',
+  () => app.macroLine(identityDoc, 7).includes('no macro starts at that byte')
+    && app.macroLine(identityDoc, 7).includes('binding byte 7'),
   () => app.macroLine(identityDoc, 7));
 okMacros('the whole macro of a binding is a block of its own, keystroke by keystroke', () => {
   const record = app.macroRecords(macrosDoc)[1];
-  const rows = app.macroDetailRows(macrosDoc, 7);
+  const rows = app.macroDetailRows(macrosDoc, 1);
   const list = rows.find((node) => node.tagName === 'UL');
   const text = rows.map((node) => node.textContent).join(' ');
   return list !== undefined && list.children.length === (record.actions ?? []).length
-    && text.includes('the whole macro: record 1') && text.includes(`interval ${record.interval_ms} ms`)
+    && text.includes('the whole macro: record #1') && text.includes(`interval ${record.interval_ms} ms`)
     && text.includes('press ') && text.includes(record.raw) && text.includes('Bound by');
-}, () => [app.macroDetailRows(macrosDoc, 7).map((n) => n.tagName), app.macroDetailRows(macrosDoc, 7).map((n) => n.textContent).join(' ').slice(0, 200)]);
-ok('a macro binding index past the records says there is nothing to show', () => {
-  const rows = app.macroDetailRows(identityDoc, 7);
+}, () => [app.macroDetailRows(macrosDoc, 1).map((n) => n.tagName), app.macroDetailRows(macrosDoc, 1).map((n) => n.textContent).join(' ').slice(0, 200)]);
+ok('a binding byte naming an offset the block does not hold says there is nothing to show', () => {
+  const rows = app.macroDetailRows(identityDoc, 255);
   const text = rows.map((node) => node.textContent).join(' ');
-  return rows.length === 1 && text.includes('Macro 7') && text.includes('binding 41')
-    && text.includes('Nothing to show');
-}, () => app.macroDetailRows(identityDoc, 7).map((n) => n.textContent).join(' '));
+  return rows.length === 1 && text.includes('Binding byte 255 names the macro starting 1020 bytes into the block')
+    && text.includes('no macro at that byte') && text.includes('Nothing to show');
+}, () => app.macroDetailRows(identityDoc, 255).map((n) => n.textContent).join(' '));
 okMacros('the macro select labels records shortly, with no keystrokes in the option text', () => {
   const options = app.macroBindingOptions(macrosDoc, 0);
   const labels = options.map((o) => o.label);
@@ -815,11 +848,11 @@ okMacros('the macro select labels records shortly, with no keystrokes in the opt
     && repeatAt >= 0 && labels[repeatAt].includes(`${records[repeatAt].interval_ms} ms`)
     && longest <= 60;
 }, () => [app.macroBindingOptions(macrosDoc, 0).map((o) => o.label), app.macroRecords(macrosDoc).map((r) => [r.index, r.mode_name, r.interval_ms, r.actions.length])]);
-ok('the macro select keeps an index it cannot name, and says which record it resolves to', () => {
-  const options = app.macroBindingOptions(identityDoc, 7);
-  return options.length === 1 && options[0].value === 7
-    && /^Macro 7 - binding 41, no record with that id in this block$/.test(options[0].label);
-}, () => app.macroBindingOptions(identityDoc, 7).map((o) => o.label));
+ok('the macro select keeps a binding byte it cannot name, and says where it points', () => {
+  const options = app.macroBindingOptions(identityDoc, 255);
+  return options.length === 1 && options[0].value === 255
+    && /^Binding byte 255: no macro starts at 1020 bytes into the block$/.test(options[0].label);
+}, () => app.macroBindingOptions(identityDoc, 255).map((o) => o.label));
 
 // --- board geometry -------------------------------------------------------
 console.log('the keyboard board');
@@ -1897,20 +1930,31 @@ const macro = globalThis.SsggMacroEditor;
 ok("the editor's grammar bytes match the codec's constants", () => {
   const rust = read('src/devices/keyboards/apex_7_profile.rs');
   const rustConst = (name) => {
-    const found = new RegExp(`pub const ${name}: (?:usize|u8|u16) = ([0-9a-fA-Fx_]+);`).exec(rust);
-    if (!found) return null;
-    const text = found[1].replace(/_/g, '');
-    return text.startsWith('0x') ? Number.parseInt(text.slice(2), 16) : Number.parseInt(text, 10);
+    // The codec types a few of these as `isize` (a constant used in `usize` position), so the type
+    // part of the line is not matched by name.
+    const numeric = (name) => {
+      const found = new RegExp(`pub const ${name}: [a-z_0-9]+ = ([0-9a-fA-Fx_]+);`).exec(rust);
+      if (!found) return null;
+      const text = found[1].replace(/_/g, '');
+      return text.startsWith('0x') ? Number.parseInt(text.slice(2), 16) : Number.parseInt(text, 10);
+    };
+    const direct = numeric(name);
+    if (direct !== null) return direct;
+    // A constant defined as an expression - `MACRO_INDEX_UNIT: usize = MACRO_ACTION_LEN` - names
+    // another constant; resolve that name once, the same number the editor carries.
+    const alias = new RegExp(`pub const ${name}: [a-z_0-9]+ = ([A-Z][0-9A-Za-z_]*);`).exec(rust);
+    return alias ? numeric(alias[1]) : null;
   };
-  // Every action is 4 bytes in the codec (MACRO_ACTION_LEN), and the editor's three action lengths are
-  // the same number, so the same rust name is compared three times.
+  // Every action is 4 bytes in the codec (MACRO_ACTION_LEN), and the editor's four action lengths are
+  // the same number, so the same rust name is compared four times.
   const pairs = [
     ['HEADER_LEN', 'MACRO_HEADER_LEN'], ['PRESS_LEN', 'MACRO_ACTION_LEN'], ['RELEASE_LEN', 'MACRO_ACTION_LEN'],
     ['DELAY_LEN', 'MACRO_ACTION_LEN'], ['ACTION_LEN', 'MACRO_ACTION_LEN'],
     ['REGION_START_B', 'MACRO_REGION_START_B'], ['REGION_LEN_B', 'MACRO_DATA_LEN'],
     ['RECORD_MARKER', 'MACRO_RECORD_MARKER'], ['ACTION_KEY', 'MACRO_ACTION_KEY'],
-    ['ACTION_DELAY', 'MACRO_ACTION_DELAY'], ['BINDING_BASE', 'MACRO_BINDING_BASE'],
-    ['ID_MAX', 'MACRO_ID_MAX'], ['MODE_MAX', 'MACRO_MODE_MAX'],
+    ['ACTION_DELAY', 'MACRO_ACTION_DELAY'], ['ACTION_MOUSE', 'MACRO_ACTION_MOUSE'],
+    ['MASK_MAX', 'MACRO_MOUSE_MASK_MAX'], ['INDEX_UNIT', 'MACRO_INDEX_UNIT'],
+    ['BINDING_BYTE_MAX', 'MACRO_BINDING_BYTE_MAX'], ['MODE_MAX', 'MACRO_MODE_MAX'],
   ];
   const drift = pairs.filter(([js, rustName]) => macro[js] !== rustConst(rustName))
     .map(([js, rustName]) => `${js}=${macro[js]} rust ${rustName}=${rustConst(rustName)}`);
@@ -1922,7 +1966,7 @@ ok("the editor's grammar bytes match the codec's constants", () => {
 }, () => `header ${macro.HEADER_LEN} push ${macro.PRESS_LEN} release ${macro.RELEASE_LEN} delay ${macro.DELAY_LEN} region ${macro.REGION_START_B}+${macro.REGION_LEN_B}`);
 
 ok('a record is its 8-byte header plus 4 bytes per action, and a push carries no duration', () => {
-  const record = { mode: 4, id: 3, flags: macro.RECORD_FLAGS, interval_ms: 5000, actions: [macro.makePress(0x22), macro.makeRelease(0x22)] };
+  const record = { mode: 4, header_word: 3, flags: macro.RECORD_FLAGS, interval_ms: 5000, actions: [macro.makePress(0x22), macro.makeRelease(0x22)] };
   return macro.recordBytes(record) === 16
     && macro.actionLen(macro.makePress(4)) === 4
     && macro.actionLen(macro.makeRelease(4)) === 4
@@ -1930,7 +1974,7 @@ ok('a record is its 8-byte header plus 4 bytes per action, and a push carries no
     && !('ms' in macro.makePress(4)) && !('word' in macro.makePress(4))
     && macro.recordRaw(record) === '77 04 03 00 01 01 88 13 02 22 01 01 02 22 01 00';
 }, () => {
-  const record = { mode: 4, id: 3, flags: macro.RECORD_FLAGS, interval_ms: 5000, actions: [macro.makePress(0x22), macro.makeRelease(0x22)] };
+  const record = { mode: 4, header_word: 3, flags: macro.RECORD_FLAGS, interval_ms: 5000, actions: [macro.makePress(0x22), macro.makeRelease(0x22)] };
   return `${macro.recordBytes(record)} bytes: ${macro.recordRaw(record)}`;
 });
 
@@ -1940,7 +1984,7 @@ ok('the macro block is the limit: 86 records of 112 bytes do not fit and the edi
   // bytes, the 86th runs 480 past the end.
   const big = (position) => ({
     mode: 4,
-    id: position + 1,
+    header_word: position + 1,
     flags: macro.RECORD_FLAGS,
     interval_ms: 100,
     actions: Array.from({ length: 26 }, () => macro.makePress(0x04 + position)),
@@ -1955,7 +1999,7 @@ ok('the macro block is the limit: 86 records of 112 bytes do not fit and the edi
     && fits.fits && fits.records === 85 && fits.used === 9520;
 }, () => {
   const region = macro.regionOf({ schema: 0x000b });
-  const many = Array.from({ length: 86 }, (unused, position) => ({ mode: 4, id: position + 1, flags: macro.RECORD_FLAGS, interval_ms: 100, actions: Array.from({ length: 26 }, () => macro.makePress(0x04 + position)) }));
+  const many = Array.from({ length: 86 }, (unused, position) => ({ mode: 4, header_word: position + 1, flags: macro.RECORD_FLAGS, interval_ms: 100, actions: Array.from({ length: 26 }, () => macro.makePress(0x04 + position)) }));
   const size = macro.plan(many, region);
   return `${size.used}/${size.len} used, ${size.over} over`;
 });
@@ -1963,13 +2007,14 @@ ok('the macro block is the limit: 86 records of 112 bytes do not fit and the edi
 ok('packing renumbers the list the way the encoder packs it: offsets, ordinals, binding indices, raw bytes', () => {
   const region = macro.regionOf({ schema: 0x000b });
   const packed = macro.packRecords([
-    { mode: 4, id: 3, flags: macro.RECORD_FLAGS, interval_ms: 5000, actions: [macro.makePress(0x22), macro.makeRelease(0x22)] },
-    { mode: 1, id: 27, flags: macro.RECORD_FLAGS, interval_ms: 15, actions: [macro.makePress(0x55), macro.makeRelease(0x55), macro.makeDelay(15)] },
-    { mode: 4, id: 8, flags: macro.RECORD_FLAGS, interval_ms: 100, actions: [macro.makeDelay(1)] },
+    { mode: 4, header_word: 3, flags: macro.RECORD_FLAGS, interval_ms: 5000, actions: [macro.makePress(0x22), macro.makeRelease(0x22)] },
+    { mode: 1, header_word: 27, flags: macro.RECORD_FLAGS, interval_ms: 15, actions: [macro.makePress(0x55), macro.makeRelease(0x55), macro.makeDelay(15)] },
+    { mode: 4, header_word: 8, flags: macro.RECORD_FLAGS, interval_ms: 100, actions: [macro.makeDelay(1)] },
   ], region);
   return packed.map((record) => record.offset).join(' ') === '2076 2092 2112'
     && packed.map((record) => record.record_bytes).join(' ') === '16 20 12'
-    && packed.map((record) => record.index).join(' ') === '37 61 42'
+    // The binding byte is where each macro sits: 0, 16 and 36 bytes into the block, in 4-byte units.
+    && packed.map((record) => record.index).join(' ') === '0 4 9'
     && packed.map((record) => record.ordinal).join(' ') === '0 1 2'
     && packed.map((record) => record.action_count).join(' ') === '2 3 1'
     && packed.every((record) => record.raw.split(/\s+/).length === record.record_bytes)
@@ -1983,36 +2028,42 @@ ok('packing renumbers the list the way the encoder packs it: offsets, ordinals, 
 ok('a report with only the block bytes still gives the editor its records', () => {
   const region = macro.regionOf({ schema: 0x000b });
   const block = new Array(9600).fill(0);
-  const record = { mode: 4, id: 3, flags: macro.RECORD_FLAGS, interval_ms: 5000, actions: [macro.makePress(0x22), macro.makeRelease(0x22)] };
+  const record = { mode: 4, header_word: 3, flags: macro.RECORD_FLAGS, interval_ms: 5000, actions: [macro.makePress(0x22), macro.makeRelease(0x22)] };
   macro.recordRaw(record).split(' ').forEach((word, position) => {
     block[region.start + position] = Number.parseInt(word, 16);
   });
   const hex = block.map((byte) => byte.toString(16).padStart(2, '0')).join(' ');
   const records = macro.recordsFromBlock(hex, region);
-  return records.length === 1 && records[0].id === 3 && records[0].interval_ms === 5000
-    && records[0].record_bytes === 16 && records[0].index === 37
+  return records.length === 1 && records[0].header_word === 3 && records[0].interval_ms === 5000
+    && records[0].record_bytes === 16 && records[0].index === 0
     && JSON.stringify(records[0].actions) === JSON.stringify([macro.makePress(0x22), macro.makeRelease(0x22)]);
 }, () => `a 9600-byte block with one 16-byte record at ${macro.REGION_START_B}`);
 
 ok('every limit that stops a write is named before the editor lets the list through', () => {
   const region = macro.regionOf({ schema: 0x000b });
   const check = (record) => macro.limitProblems([record], region).join(' | ');
-  const base = { mode: 4, id: 1, flags: macro.RECORD_FLAGS, interval_ms: 100, actions: [macro.makePress(4)] };
+  const base = { mode: 4, header_word: 1, flags: macro.RECORD_FLAGS, interval_ms: 100, actions: [macro.makePress(4)] };
   return check(base) === ''
     && check({ ...base, actions: [] }).includes('no action')
     && check({ ...base, flags: 0x0100 }).includes('0x0101')
-    && check({ ...base, id: 70000 }).includes('id must be a whole number 1..221')
-    && check({ ...base, id: 0 }).includes('id must be a whole number 1..221')
+    && check({ ...base, header_word: 70000 }).includes('header word must be a whole number 1..65535')
+    && check({ ...base, header_word: 0 }).includes('header word must be a whole number 1..65535')
     && check({ ...base, mode: 0 }).includes('mode must be a whole number 1..8')
     && check({ ...base, mode: 9 }).includes('mode must be a whole number 1..8')
     && check({ ...base, interval_ms: -5 }).includes('interval must be a whole number 1..65535')
     && check({ ...base, interval_ms: 0 }).includes('interval must be a whole number 1..65535')
     && check({ ...base, actions: [macro.makeDelay(70000)] }).includes('ms must be a whole number 0..65535')
     && check({ ...base, actions: [{ kind: 'press', key: 300 }] }).includes('key code must be a whole number 0..255')
-    && check({ ...base, actions: [{ kind: 'hold', key: 4 }] }).includes('grammar knows only push, release and wait')
+    && check({ ...base, actions: [{ kind: 'hold', key: 4 }] }).includes('grammar knows only key push')
+    && check({ ...base, actions: [{ kind: 'press_mouse', mask: 0 }] }).includes('mask must be a whole number 1..63')
+    && check({ ...base, actions: [{ kind: 'release_mouse', mask: 64 }] }).includes('mask must be a whole number 1..63')
+    && check({ ...base, actions: [{ kind: 'press_mouse', mask: 0x03 }, { kind: 'release_mouse', mask: 0x03 }] }) === ''
+    // A record packed past the last byte a binding can name is written and read back, and no key plays it.
+    && macro.limitProblems(Array.from({ length: 65 }, () => ({ ...base, actions: [macro.makePress(4), macro.makeRelease(4)] })), region).join(' | ').includes('no binding byte reaches')
+    && macro.limitProblems(Array.from({ length: 60 }, () => ({ ...base, actions: [macro.makePress(4), macro.makeRelease(4)] })), region).join(' | ') === ''
     && check({ ...base, actions: Array.from({ length: 2400 }, () => macro.makePress(4)) }).includes('most one record can hold')
     && check({ ...base, actions: Array.from({ length: 2398 }, () => macro.makePress(4)) }) === '';
-}, () => macro.limitProblems([{ mode: 0, id: 0, flags: 0x0100, interval_ms: 0, actions: [] }], macro.regionOf({ schema: 0x000b })).join(' | '));
+}, () => macro.limitProblems([{ mode: 0, header_word: 0, flags: 0x0100, interval_ms: 0, actions: [] }], macro.regionOf({ schema: 0x000b })).join(' | '));
 
 ok('a slot the codec decodes no macros for gets no editor', () => {
   const schemaA = macro.editorDisabledReason({ schema: 0x000a, macros: [], macro_data: { bytes_hex: '00 00' } });
@@ -2044,9 +2095,9 @@ ok('the mounted editor adds a macro, adds a key push, and hands over exactly the
     && /12 of the block's 9600 bytes used, 9588 free/.test(meterAfter)
     && handed.length === 1 && handed[0].actions.length === 1
     && handed[0].actions[0].kind === 'press' && handed[0].actions[0].key === 0x22 && !('ms' in handed[0].actions[0])
-    && handed[0].record_bytes === 12 && handed[0].offset === 2076 && handed[0].index === 35
+    && handed[0].record_bytes === 12 && handed[0].offset === 2076 && handed[0].index === 0
     && status === "1 record(s) 12 bytes handed to the profile editor"
-    && inputs[0].value === String(handed[0].id) && inputs[1].value === String(handed[0].interval_ms)
+    && inputs[0].value === String(handed[0].header_word) && inputs[1].value === String(handed[0].interval_ms)
     && applied.macro_region.used_bytes === 12 && applied.macro_region.records === 1
     && applied.macros[0].raw === macro.recordRaw(applied.macros[0])
     && typeof editor.setStatus === 'function' && typeof editor.refresh === 'function';
@@ -2060,7 +2111,7 @@ ok('the editor refuses to hand over a list that cannot be written', () => {
     name: 'Big',
     macros: Array.from({ length: 86 }, (unused, position) => ({
       mode: 4,
-      id: position + 1,
+      header_word: position + 1,
       flags: macro.RECORD_FLAGS,
       interval_ms: 100,
       actions: Array.from({ length: 26 }, () => macro.makePress(0x04 + position)),

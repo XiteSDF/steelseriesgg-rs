@@ -502,7 +502,7 @@ mod tests {
         assert_eq!((region.free_bytes, region.over_capacity, note), (block, false, None));
 
         // A payload whose block already holds one record: header, a push of `5`, its release - 8 + 2 x 4
-        // bytes. Macro id 3 is carried by binding number 35 + 3 - 1 = 37.
+        // bytes. The record sits at position 0, so the binding byte that reaches it is 7 x 0 = 0.
         let mut data = vec![0u8; apex_7_profile::PAYLOAD_LEN_B];
         data[0..2].copy_from_slice(&apex_7_profile::SCHEMA_B.to_le_bytes());
         data[apex_7_profile::NAME_OFFSET..apex_7_profile::NAME_OFFSET + 6].copy_from_slice(b"Macros");
@@ -528,9 +528,9 @@ mod tests {
         assert_eq!(payload, data, "the report writes back the bytes the read produced");
         let back = apex_7_profile::decode(&payload).expect("the payload re-decodes");
         assert_eq!(
-            (back.macros.len(), back.macros[0].id, back.macros[0].index),
-            (1, 3, 37),
-            "the record reaches the bytes and carries the binding number of its macro id"
+            (back.macros.len(), back.macros[0].header_word, back.macros[0].index),
+            (1, 3, 0),
+            "the record reaches the bytes and carries the binding byte of its position"
         );
         assert!(back.crc_ok, "the payload carries the checksum it hashes to");
 
@@ -542,20 +542,24 @@ mod tests {
             (0..300)
                 .map(|position| {
                     let key = 0x04 + (position % 0x70) as u8;
-                    let id = (position as u16 % apex_7_profile::MACRO_ID_MAX) + 1;
+                    let header_word = (position as u16 % 200) + 1;
                     let actions = (0..50)
                         .map(|_| json!({ "kind": "press", "key": key }))
                         .collect::<Vec<_>>();
                     // 8 header bytes + 50 x 4-byte pushes = 208, the same bytes `raw` carries.
-                    let raw = format!("77 04 {:02x} 00 01 01 64 00 {}", id, vec![press(key); 50].join(" "));
+                    let raw = format!(
+                        "77 04 {:02x} 00 01 01 64 00 {}",
+                        header_word,
+                        vec![press(key); 50].join(" ")
+                    );
                     json!({
                         "offset": start + position * 208,
                         "ordinal": position,
-                        "index": 35 + usize::from(id) - 1,
+                        "index": apex_7_profile::macro_index(start + position * 208, start),
                         "flags_ok": true,
                         "mode": 4,
                         "mode_name": "repeat",
-                        "id": id,
+                        "header_word": header_word,
                         "flags": 0x0101u64,
                         "interval_ms": 100,
                         "record_bytes": 208,

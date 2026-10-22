@@ -310,17 +310,18 @@ function metaActionOptions(selected) {
 }
 
 function macroBindingOptions(doc, selected) {
-  // The value a 0x71 slot writes is the macro id, in its third code byte. GG's binding table names the
-  // same macro as 35 + id - 1, so that is the number printed with the option.
+  // The value a 0x71 slot writes is the binding byte, in its third code byte: the byte counts 4-byte
+  // units from the block start, so it reaches the macro packed `byte x 4` bytes into the block.
   // Short labels only: a select is as wide as its longest option, and a long macro is a long
   // keystroke list. The whole record is shown under the select (macroDetailRows).
   const options = macroRecords(doc).map((record, position) => {
-    const id = record.id ?? (record.index ?? 0) + 1;
+    const ordinal = macroRecordOrdinal(record);
+    const byte = macroBindingByte(record.offset - macroRegionStart(doc));
     const mode = record.mode_name ?? MACRO_MODE_NAMES[record.mode] ?? `mode 0x${hex2(record.mode)}`;
     const actions = (record.actions ?? []).length;
     return {
-      value: id,
-      label: `Macro ${id} - ${mode}${record.mode === 4 ? ` ${record.interval_ms} ms` : ''} - ${actions} action(s) - binding ${macroBindingIndex(id)}`,
+      value: byte,
+      label: `Record #${ordinal} - ${mode}${record.mode === 4 ? ` ${record.interval_ms} ms` : ''} - ${actions} action(s) - binding byte ${byte}`,
     };
   });
   if (!options.some((option) => option.value === selected)) {
@@ -328,8 +329,8 @@ function macroBindingOptions(doc, selected) {
     options.push({
       value: selected,
       label: known
-        ? `Macro ${selected} - binding ${macroBindingIndex(selected)}, the record the block holds`
-        : `Macro ${selected} - binding ${macroBindingIndex(selected)}, no record with that id in this block`,
+        ? `Record #${macroRecordOrdinal(known)} - binding byte ${selected}, the macro at ${macroOffsetForBindingByte(selected)} bytes into the block`
+        : `Binding byte ${selected}: no macro starts at ${macroOffsetForBindingByte(selected)} bytes into the block`,
     });
   }
   return options;
@@ -550,6 +551,8 @@ const PROFILE_REGION_BYTES = 40_960;
 // `bytearray` of `(macro-data-size)` = 9600 (`lisp/apex_7.lisp:62, 101`, `lisp/base_apex_legacy.lisp:109`), so a
 // write sends the block's bytes back verbatim and the parsed record list under it is display only.
 const MACRO_DATA_LEN = 9_600;
+// Where the schema b macro block starts on the payload.
+const MACRO_DATA_OFFSET_B = 2_076;
 
 function payloadLenForSchema(schema) {
   const word = Number(schema) & 0xffff;
@@ -882,15 +885,15 @@ function keyState(doc, layer, hid) {
   if (binding === 'self') return { kind: 'self', binding: 'self', label: 'self', offset, entry, codes };
   if (binding === 'none') return { kind: 'none', binding: 'none', label: 'not bound', offset, entry, codes };
   const kind = FUNCTION_NAMES[entry.function] ? FUNCTION_NAMES[entry.function] : 'function';
-  // A 0x71 slot names a macro by id in its third code byte: printing the codes as key names would call
-  // a key that GG shows pressing 4 every 5000 ms "no code".
+  // A 0x71 slot carries a binding byte in its third code byte: printing the codes as key names would
+  // call a key that GG shows pressing 4 every 5000 ms "no code".
   if (entry.function === 0x71) {
-    const id = entry.macro_index ?? macroIndex(entry);
-    const record = macroRecordFor(doc, id);
+    const byte = entry.macro_index ?? macroIndex(entry);
+    const record = macroRecordFor(doc, byte);
     return {
       kind,
       binding,
-      label: `macro ${id} (binding ${macroBindingIndex(id)})${record ? ` - ${macroKeystrokes(record)}` : ' (no record in this block)'}`,
+      label: `binding byte ${byte} -> the macro ${macroOffsetForBindingByte(byte)} B into the block${record ? ` - ${macroKeystrokes(record)}` : ' (no macro at that byte)'}`,
       offset,
       entry,
       codes,
@@ -1383,11 +1386,11 @@ function wheelEntry(doc, layer, index) {
   const binding = bindingOf(entry.function, codes, null);
   const kind = FUNCTION_NAMES[entry.function] ?? 'function';
   if (entry.function === 0x71) {
-    const macroId = entry.macro_index ?? macroIndex(entry);
-    const record = macroRecordFor(doc, macroId);
+    const byte = entry.macro_index ?? macroIndex(entry);
+    const record = macroRecordFor(doc, byte);
     return {
       index, entry, codes, binding, kind,
-      label: `macro ${macroId} (binding ${macroBindingIndex(macroId)})${record ? ` - ${macroKeystrokes(record)}` : ' (no record in this block)'}`,
+      label: `binding byte ${byte} -> the macro ${macroOffsetForBindingByte(byte)} B into the block${record ? ` - ${macroKeystrokes(record)}` : ' (no macro at that byte)'}`,
     };
   }
   // A meta binding that carries the Lock Win action: the cap prints its action, and the META cap
@@ -1740,13 +1743,13 @@ function mappingRows(doc, listName, index, mapping) {
   if (mapping.function === 0x71) {
     rows.push(el('p', {
       class: 'hint',
-      text: `function 0x71 macro: the third code byte is the macro id = ${mapping.macroIndex ?? macroIndex(mapping)}, `
-        + `and GG's binding table names that macro with ${macroBindingIndex(mapping.macroIndex ?? macroIndex(mapping))} - `
-        + `35 + id - 1. ` + macroLine(doc, mapping.macroIndex ?? macroIndex(mapping))
-        + ` In the read this panel was built from, META + Insert carries 00 00 00 00 and META + Home carries `
-        + '00 00 05 00 - both name macro 5, and the one record the block holds for it is the press of 4 every '
-        + '5000 ms GG shows on this keyboard. An id with no record in the block is a macro GG keeps in its own '
-        + 'database, with the binding left on the key.',
+      text: `function 0x71 macro: the third code byte is the binding byte = ${mapping.macroIndex ?? macroIndex(mapping)}, `
+        + `the record's offset in the block in 4-byte units. `
+        + macroLine(doc, mapping.macroIndex ?? macroIndex(mapping))
+        + ` Measured on a wired read (schema B) whose number row 3 to 7 is bound to macros: the bytes 25, 28, 33, `
+        + '38 and 43 land on records at offsets 100, 112, 132, 152 and 172, and those records press mouse 1+2, 4, '
+        + '5, 6 and 1+2+3 - which is what those keys do on that board. A byte whose record the block does not hold '
+        + 'is a macro GG deleted with the binding left on the key.',
     }));
   }
   return rows.map((row, position) => {
@@ -2199,55 +2202,84 @@ function renderRapidTapPanel(file) {
 // decodes the block; this page reads the records it wrote.
 const MACRO_MARKER = 0x77;
 const MACRO_MODE_NAMES = { 4: 'repeat', 1: 'once' };
-// The binding number a macro id becomes (apex_7_profile::MACRO_BINDING_BASE). Measured on a wired
-// read (schema B) whose keys carry bindings 42, 49, 56, 63, 60, 66, 71, 76, 81, 84, 101, 130, 134, 117:
-// each is 35 plus the id in the slot's third code byte minus 1, and the keys bound 42, 49, 56 press
-// Shift with C, V, X - the records with ids 8, 15, 22. So a slot names a record by its id, and ids
-// 1..221 reach bindings 35..255.
-const MACRO_BINDING_BASE = 35;
-const MACRO_ID_MAX = 221;
+// The unit a binding byte counts (apex_7_profile::MACRO_INDEX_UNIT): the macro a `0x71` row plays
+// starts at `byte x 4` bytes into the block. Measured on a wired read (schema B) whose keys c, v, x
+// carry the bytes 0, 7, 14 and whose macros 0, 28, 56 bytes into the block press LCtrl with c, v, x,
+// and on a read whose number row carries 25, 28, 33, 38, 43 over macros at 100, 112, 132, 152, 172
+// pressing mouse masks 0x03, 0x08, 0x10, 0x20, 0x07. The byte is one code byte, so it reaches
+// 255 x 4 = 1020 bytes of the block, not the block's 9600.
+const MACRO_INDEX_UNIT = 4;
+const MACRO_BINDING_BYTE_MAX = 255;
+const MACRO_BINDING_REACH_BYTES = MACRO_BINDING_BYTE_MAX * MACRO_INDEX_UNIT;
+// The mouse-button mask bits, same order as the codec names them.
+const MACRO_MOUSE_BITS = [[0x01, 'mouse 1'], [0x02, 'mouse 2'], [0x04, 'mouse 3'], [0x08, 'mouse 4'], [0x10, 'mouse 5'], [0x20, 'mouse 6']];
 
 // Records of a dump, from the `macros` array the writer emits. An older dump has no such field.
 function macroRecords(doc) {
   return Array.isArray(doc.macros) ? doc.macros : [];
 }
 
-// Third code byte of a 0x71 slot = the macro id (KeyMapping::macro_index).
+// Third code byte of a 0x71 slot = the binding byte (KeyMapping::macro_index).
 function macroIndex(entry) {
   return mappingCodes(entry).list[2];
 }
 
-// The binding number GG's table carries for a macro id. A read of a profile with macros 3 and 27 in its
-// block (wired Apex 7 0x1612, schema b, 2026-10-22) carries 37 and 61 in the binding table: 35 + 3 - 1
-// and 35 + 27 - 1. The slot's own third byte is the id, so the two agree on which macro a key plays.
-function macroBindingIndex(id) {
-  return MACRO_BINDING_BASE + id - 1;
+// Where this report's macro block starts. The read reports it; a report without one is schema b.
+function macroRegionStart(doc) {
+  const offset = (doc.macro_data ?? {}).offset;
+  return Number.isInteger(offset) ? offset : MACRO_DATA_OFFSET_B;
 }
 
-// The record a macro id names. The id is carried in the record header, so the record is found by it -
-// a record list ordered by payload position is not ordered by id, and GG's ids are not positions.
-function macroRecordFor(doc, id) {
-  return macroRecords(doc).find((record) => (record.id ?? (record.index ?? 0) + 1) === id) ?? null;
+// The binding byte that reaches the macro packed `bytesFromStart` into the block.
+function macroBindingByte(bytesFromStart) {
+  return Math.floor(bytesFromStart / MACRO_INDEX_UNIT);
 }
 
-// A record as the key sequence GG shows in its UI: presses with the delays between them.
+// The block offset a binding byte names. The macro that starts there is the one it plays; a byte
+// pointing inside a record - not at its first byte - names no macro.
+function macroOffsetForBindingByte(byte) {
+  return byte * MACRO_INDEX_UNIT;
+}
+
+// Position of a record in the list the decoder walked. Labels use it; a binding never does.
+function macroRecordOrdinal(record) {
+  return record.ordinal ?? 0;
+}
+
+// The macro a binding byte names. A binding names a place in the block, never the header word.
+function macroRecordFor(doc, byte) {
+  const at = macroRegionStart(doc) + macroOffsetForBindingByte(byte);
+  return macroRecords(doc).find((record) => record.offset === at) ?? null;
+}
+
+// A mouse mask in words: 0x03 presses the left and right buttons together.
+function macroMouseMaskName(mask) {
+  if (!Number.isInteger(mask)) return 'no mask';
+  const bits = MACRO_MOUSE_BITS.filter(([bit]) => mask & bit).map(([, name]) => name);
+  return bits.length ? bits.join('+') : `mask 0x${hex2(mask)}`;
+}
+
+// A record as the key sequence GG shows in its UI: presses with the delays between them. A macro that
+// drives the mouse is named by the mask it presses.
 function macroKeystrokes(record) {
   if (!record || !Array.isArray(record.actions)) return 'no actions';
   const out = [];
   for (const action of record.actions) {
     if (action.kind === 'press') out.push(keyName(action.key));
+    else if (action.kind === 'press_mouse') out.push(`${macroMouseMaskName(action.mask)} down`);
     else if (action.kind === 'delay') out.push(`${action.ms} ms`);
   }
   return out.length ? out.join(' > ') : 'no keys';
 }
 
 // Keys of the profile bound to a record, so each record row says who uses it.
-function macroBoundKeys(doc, id) {
+function macroBoundKeys(doc, record) {
   const names = [];
   for (const [listName, prefix] of [['button_mappings', ''], ['button_meta_mappings', 'Meta+']]) {
     (doc[listName] ?? []).forEach((mapping, offset) => {
       if (mapping.function !== 0x71) return;
-      if ((mapping.macro_index ?? macroIndex(mapping)) !== id) return;
+      const byte = mapping.macro_index ?? macroIndex(mapping);
+      if (macroRegionStart(doc) + macroOffsetForBindingByte(byte) !== record.offset) return;
       const hid = boardHid(OFF2HID[offset]);
       if (hid === null || hid === undefined) return;
       names.push(`${prefix}${keyName(hid)}`);
@@ -2259,38 +2291,41 @@ function macroBoundKeys(doc, id) {
 // The target of one macro binding, in words.
 // The record a 0x71 binding points at, in full, as rows of its own: the mode, id and interval, every
 // keystroke on its own line, the raw bytes, and the keys of the profile bound to the same record.
-function macroDetailRows(doc, id) {
-  const record = macroRecordFor(doc, id);
-  const binding = macroBindingIndex(id);
+function macroDetailRows(doc, byte) {
+  const record = macroRecordFor(doc, byte);
+  const at = macroRegionStart(doc) + macroOffsetForBindingByte(byte);
   if (!record) {
     return [el('p', {
       class: 'hint',
-      text: `Macro ${id}: binding ${binding}. No record with that id in this block - GG keeps the macro itself in its own database, and the bytes that name it in the block are part of its own structures. Nothing to show.`,
+      text: `Binding byte ${byte} names the macro starting ${macroOffsetForBindingByte(byte)} bytes into the block (payload ${at}). This block carries no macro at that byte - GG deletes the macro and leaves the binding on the key. Nothing to show.`,
     })];
   }
   const actions = (record.actions ?? []).map((action) => (action.kind === 'press'
     ? `press ${keyName(action.key)}`
-    : action.kind === 'release' ? `release ${keyName(action.key)}` : `wait ${action.ms} ms`));
-  const bound = macroBoundKeys(doc, id);
+    : action.kind === 'release' ? `release ${keyName(action.key)}`
+      : action.kind === 'press_mouse' ? `press ${macroMouseMaskName(action.mask)}`
+        : action.kind === 'release_mouse' ? `release ${macroMouseMaskName(action.mask)}`
+          : `wait ${action.ms} ms`));
+  const bound = macroBoundKeys(doc, record);
   return [
     el('h3', {
       class: 'subhead',
-      text: `the whole macro: id ${id} (binding ${binding}) - ${record.mode_name ?? MACRO_MODE_NAMES[record.mode] ?? `mode 0x${hex2(record.mode)}`} (0x${hex2(record.mode)}), interval ${record.interval_ms} ms, ${record.action_count ?? actions.length} action(s)`,
+      text: `the whole macro: record #${macroRecordOrdinal(record)} (binding byte ${byte}) - ${record.mode_name ?? MACRO_MODE_NAMES[record.mode] ?? `mode 0x${hex2(record.mode)}`} (0x${hex2(record.mode)}), interval ${record.interval_ms} ms, ${record.action_count ?? actions.length} action(s)`,
     }),
     el('ul', { class: 'macro-actions' }, actions.map((text) => el('li', { class: 'mono', text }))),
     el('p', { class: 'hint mono', text: record.raw }),
     line('Bound by', el('span', {
       class: 'mono',
       text: bound.length ? bound.join(', ') : 'no key',
-    }), `payload offset ${record.offset}, ${record.record_bytes ?? '?'} bytes - the id is carried in the record header, so every key bound to this macro plays this one record`),
+    }), `payload offset ${record.offset}, ${record.record_bytes ?? '?'} bytes, header word ${record.header_word ?? 'n/a'} - a binding names where the macro sits, so every key bound to this byte plays this one macro`),
   ];
 }
 
-function macroLine(doc, id) {
-  const record = macroRecordFor(doc, id);
-  const named = `macro ${id} (binding ${macroBindingIndex(id)}); `;
+function macroLine(doc, byte) {
+  const record = macroRecordFor(doc, byte);
+  const named = `binding byte ${byte} -> the macro ${macroOffsetForBindingByte(byte)} bytes into the block; `;
   if (!record) {
-    return `${named}no record with that id in this block: GG keeps the macro in its own database and the binding is left on the key. `;
+    return `${named}no macro starts at that byte in this block: GG deletes the macro and leaves the binding on the key. `;
   }
   const mode = record.mode_name ?? MACRO_MODE_NAMES[record.mode] ?? `mode 0x${hex2(record.mode)}`;
   const interval = record.mode === 4 ? ` every ${record.interval_ms} ms` : '';
@@ -2480,7 +2515,7 @@ function renderMacrosPanel(file) {
   const recordsBytes = records.reduce((sum, record) => sum + (record.record_bytes ?? 0), 0);
   const rows = [el('p', {
     class: 'hint',
-    text: `payload offset ${summary.offset}, ${summary.len} bytes, ${summary.nonzero} non-zero. ${records.length} macro record(s) decoded from it, filling ${recordsBytes} bytes${recordsBytes ? `, ${summary.offset} to ${summary.offset + recordsBytes - 1}` : ''}. A record is an 8-byte header (0x77, mode, macro id, flags, interval) plus its actions, every action 4 bytes: a push 02 key 01 01, a release 02 key 01 00, a wait 04 00 ms. The chain is packed with no stride and no length word, and the bytes behind it belong to GG's own structures, so the walk stops where the grammar stops matching. A 0x71 slot's third code byte is the macro id, and GG's binding table names the same macro as 35 + id - 1, so ids 1..${MACRO_ID_MAX} reach bindings 35..255. This panel lists the records the block walks to; a write sends the block's bytes back, never this list.`,
+    text: `payload offset ${summary.offset}, ${summary.len} bytes, ${summary.nonzero} non-zero. ${records.length} macro record(s) decoded from it, filling ${recordsBytes} bytes${recordsBytes ? `, ${summary.offset} to ${summary.offset + recordsBytes - 1}` : ''}. A record is an 8-byte header (0x77, mode, action count, flags, interval) plus its actions, every action 4 bytes: a key push 02 key 01 01, a key release 02 key 01 00, a mouse press 00 mask 00 01, a mouse release 00 mask 00 00, a wait 04 00 ms. The mask is a mouse-button bitmask (bit 0 button 1, bit 1 button 2, bit 2 button 3, bit 3 button 4, bit 4 button 5, bit 5 button 6), so one action presses several buttons at once - mask 0x03 is the left+right pair a macro uses for a middle click. The header word is the action count: every record of the reads surveyed carries its action count there. The chain is packed with no stride and no length word, and the bytes behind it belong to GG's own structures, so the walk stops where the grammar stops matching. A 0x71 slot's third code byte counts 4-byte units from the block start: the macro it plays starts at byte x 4 of the block, so a binding byte reaches ${MACRO_BINDING_REACH_BYTES} of its ${MACRO_DATA_LEN} bytes. This panel lists the records the block walks to; a write sends the block's bytes back, never this list.`,
   })];
   if (!Array.isArray(doc.macros)) {
     rows.push(el('p', { class: 'hint', text: 'this dump has no "macros" field - it was written before the record decode. Re-read the profile to get them.' }));
@@ -2506,17 +2541,17 @@ function renderMacrosPanel(file) {
     }));
   }
   for (const [position, record] of records.entries()) {
-    const id = record.id ?? (record.index ?? 0) + 1;
-    const bound = macroBoundKeys(doc, id);
+    const ordinal = macroRecordOrdinal(record);
+    const bound = macroBoundKeys(doc, record);
     rows.push(el('h3', {
       class: 'subhead',
-      text: `macro ${id} (binding ${macroBindingIndex(id)}, payload ${record.offset}): `
+      text: `record #${ordinal} (binding byte ${macroBindingByte(record.offset - macroRegionStart(doc))}, payload ${record.offset}): `
         + `${record.mode_name ?? MACRO_MODE_NAMES[record.mode] ?? `mode 0x${hex2(record.mode)}`} (0x${hex2(record.mode)}), interval ${record.interval_ms} ms - ${macroKeystrokes(record)}`,
     }));
     rows.push(line('Bound by', el('span', {
       class: 'mono',
       text: bound.length ? bound.join(', ') : 'no key',
-    }), `payload offset ${record.offset}, ${record.record_bytes ?? '?'} bytes, ${record.action_count ?? (record.actions ?? []).length} actions, flags 0x${hex2(record.flags >> 8)} 0x${hex2(record.flags & 0xff)}`));
+    }), `payload offset ${record.offset}, ${record.record_bytes ?? '?'} bytes, ${record.action_count ?? (record.actions ?? []).length} actions, header word ${record.header_word ?? 'n/a'}, flags 0x${hex2(record.flags >> 8)} 0x${hex2(record.flags & 0xff)}`));
     rows.push(el('p', {
       class: 'hint mono',
       text: (record.actions ?? [])
@@ -2795,7 +2830,7 @@ const SsggProfileApp = {
   WHEEL_UP, WHEEL_DOWN, WHEEL_KEYS, OLED_RECT, OLED_W, OLED_H, oledBytes, oledPixels, oledDataUrl, paintOled, renderOledPanel,
   MACRO_DATA_LEN, macroBlockBytes,
   wheelEntry, copyName, CODE_COUNT, CONSUMER_TARGETS, PRODUCT_NAMES, LEGACY_ONBOARD_PIDS, PRODUCTS, IMPORT_SOURCE, onboardModelPids, importedName, productKind, deviceFeatures, deviceLabel, productHex, MEDIA_NAMES, MOUSE_FUNCTIONS, MOUSE_NAMES, META_ACTION_NAMES, META_CAP_LABELS, BINDING_GROUPS, FACTORY_BASE_ZEROS, FACTORY_BASE_MEDIA, FACTORY_BASE_EXTRA, FACTORY_META, bindingGroup, factoryEntry, optionSelect, bindingGroupOptions, mouseActionOptions, keyboardKeyOptions, mediaKeyOptions, metaActionOptions, macroBindingOptions, macroSummary, bindingOf, bindingCounts, codesPerEntry, customBindings, normalizeDoc, normalizeEntry, selectKey, renderBindingsPanel, FUNCTION_NAMES, functionName, hex2, hexOf, parseHex, colorToHex, hexToColor, LAYOUT_ROWS, LAYOUT, LAYOUT_HIDS, EXTRA_HIDS, MAPPING_COUNT, LAYER_BASE, LAYER_META, EXPECTED_ARRAYS, isValidProfileDoc, layerArray, keyEntry, mappingCodes, writeCodes, setFunction, setCode, setAllCodes, keyState, rapidTap, setRapidPair, rapidTapKeysFor, lighting, setLightingColor, NAME_FIELD_BYTES, setProfileName, serializeDoc, cloneDoc, diffAgainst, summarizeChanges, changeKeyHids, SVG_NS, el, svg, state, activeFile, activeDoc, nextFileId, addFile, downloadText, saveFile, fileChanges, changedFiles, codeOptions, CODE_OPTIONS, buildKeySelect, buildFunctionSelect, UNIT, GAP, boardKeyList, buildBoard, FILL_COLORS, paintBoard, ui, panel, line, numberInput, textInput, button, renderTabs, renderHeader, mappingRows, renderKeyPanel, renderBindingPanel, renderNameBar, panelPlan,
-  MACRO_MARKER, MACRO_MODE_NAMES, MACRO_BINDING_BASE, MACRO_ID_MAX, macroRecords, macroIndex, macroBindingIndex, macroRecordFor, macroKeystrokes, macroBoundKeys, macroLine, macroDetailRows, renderMacrosPanel,
+  MACRO_MARKER, MACRO_MODE_NAMES, MACRO_INDEX_UNIT, MACRO_BINDING_BYTE_MAX, MACRO_BINDING_REACH_BYTES, MACRO_MOUSE_BITS, macroRecords, macroIndex, macroRegionStart, macroBindingByte, macroOffsetForBindingByte, macroRecordOrdinal, macroRecordFor, macroMouseMaskName, macroKeystrokes, macroBoundKeys, macroLine, macroDetailRows, renderMacrosPanel,
   MACRO_CHANNEL, macroEditor, sessionToken, macroSessionPost, macroSessionGet, adoptMacroRecords, adoptProfileJson, syncMacroSession, mountInlineMacroEditor, openMacroEditor,
   META_TOGGLE_FUNCTION, META_LOCK_WIN_ACTION, computeMetaMask, metaMaskDiffers, META_KEY_HID, META_KEY_GG_CODE, META_KEY_SLOT, hidSlot, boardHid, metaToggleByte, toggleByteFor, isLockWinEntry, lockWinBinding, lockWinMarkers,
   PAYLOAD_LEN_A, PAYLOAD_LEN_B, PROFILE_REGION_BYTES, payloadLenForSchema, payloadSplit,

@@ -174,6 +174,10 @@ Still open:
 - Remapper gaps: no hot-plug (an unplugged keyboard ends the session), no LED capability on the virtual device.
 - Desktop window: `ssgg-gui` (feature `desktop`, wry + tao) wraps the `ssgg gui` editor. Built and started on Windows
   only; the Linux/Wayland run, in-window save and the live panel against hardware are untested.
+- Apex 7 macro region: the record grammar now decodes mouse actions and a binding byte reads as 4-byte units of
+  block offset, both measured on a wired `0x1612` read whose number row `3` to `7` are mouse macros (all 14 of its
+  bindings resolve). Editing stays GUI-only and `encode` still refuses a list that is not the block's own bytes, so
+  no macro write has been replayed on hardware.
 - Skipped on purpose: Sarhan engine/control API (`src/engine`, good token and Host-check design to copy), PipeWire
   mixer, rebranding; Jaime Electron app, native PipeWire RPC service (unconditional `pipewire`/`libspa`
   deps), Snap/.deb, `apex_gen3.rs` (duplicates `0x1642`), branding.

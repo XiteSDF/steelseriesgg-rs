@@ -3,9 +3,14 @@
 // page, and the same editor mounts inside the profile editor when a window is not available.
 //
 // The grammar and every limit here mirror `src/devices/keyboards/apex_7_profile.rs`, which is the
-// authority: the record header `0x77 | mode u8 | id u16 | flags u16 | interval u16` is 8 bytes and every
-// action is 4 - a key push `0x02 | key u8 | 01 01`, a key release `0x02 | key u8 | 01 00`, a wait
-// `0x04 | 00 | ms u16`. A push has no duration of its own: the milliseconds belong to a wait.
+// authority: the record header `0x77 | mode u8 | header word u16 | flags u16 | interval u16` is 8 bytes
+// and every action is 4 - a key push `0x02 | key u8 | 01 01`, a key release `0x02 | key u8 | 01 00`, a
+// mouse-button press `0x00 | mask u8 | 00 01`, a mouse-button release `0x00 | mask u8 | 00 00`, a wait
+// `0x04 | 00 | ms u16`. A push has no duration of its own: the milliseconds belong to a wait. The mask
+// is a mouse-button bitmask (bit 0 button 1, bit 1 button 2, bit 2 button 3, bit 3 button 4, bit 4
+// button 5, bit 5 button 6), so one action presses several buttons at once - mask 0x03 is the
+// left+right pair a macro uses for a middle click. A mask of 0 is not an action: the walk stops at it,
+// which is what keeps a record from swallowing the block's zero padding.
 //
 // Records are packed with no stride and no length word, from payload 3600 in the six reads surveyed
 // (wired Apex 7 `0x1612`, schema b, 2026-10-22) - 1524 bytes into the macro block, which starts at 2076
@@ -14,8 +19,13 @@
 // to 4208. The capacity a list has is the block; a list that needs more is refused with its numbers,
 // exactly as `encode_macro_records` refuses it.
 //
-// A macro is named by its id: a `0x71` binding row carries `35 + id - 1`, so ids 1..221 reach bindings
-// 35..255 - the list's limit is the binding byte, not a slot count.
+// A binding names a record by where it sits, not by its place in the list: a `0x71` binding row carries
+// one byte, and the record it plays starts at `byte x 4` bytes into the block - the same 4-byte unit an
+// action fills. Measured on a wired read (schema B) whose keys c, v, x carry 0, 7, 14 and whose macros
+// 0, 28 and 56 bytes into the block press LCtrl with c, v, x; and on a read whose number row carries 25,
+// 28, 33, 38, 43 and whose macros at 100, 112, 132, 152, 172 press mouse masks 0x03, 0x08, 0x10, 0x20,
+// 0x07. A byte reaches 1020 bytes of the block - the binding byte, not a slot count and not the block's
+// capacity, is the limit on what a key can play, and a macro packed past that is out of reach.
 //
 // `[EXPERIMENTAL]`, same label the codec carries: the split is what the surveyed reads parse, and only
 // mode 4 is measured on a read.
@@ -36,7 +46,11 @@
   const RECORD_FLAGS = 0x0101;
   const ACTION_KEY = 0x02;
   const ACTION_DELAY = 0x04;
+  const ACTION_MOUSE = 0x00;
   const ACTION_LEN = 4;
+  // The mouse-button mask bits, and the highest mask a read carries. A mask of 0 is not an action.
+  const MOUSE_BITS = [[1, 'mouse 1'], [2, 'mouse 2'], [4, 'mouse 3'], [8, 'mouse 4'], [16, 'mouse 5'], [32, 'mouse 6']];
+  const MASK_MAX = 63;
   // The macro block of a schema b payload: 9,600 bytes from 2076, the engine's one `macro-data-size`
   // field. The six reads surveyed packed their records from 3600, inside it.
   const REGION_START_B = 2076;
@@ -49,9 +63,14 @@
   const MODE_LOOP = 6;
   const MODE_MAX = 8;
   const U16_MAX = 65_535;
-  // A `0x71` binding row names a macro with one byte: `BINDING_BASE + id - 1`.
-  const BINDING_BASE = 35;
-  const ID_MAX = 221;
+  // A `0x71` binding row names a record with one byte: the byte counts 4-byte units from the block
+  // start, so the record it plays starts at `byte x 4` bytes into the block. Measured on a wired read
+  // (schema B) whose keys c, v, x carry 0, 7, 14 and whose macros 0, 28, 56 bytes into the block press
+  // LCtrl with c, v, x, and on a read whose number row carries 25, 28, 33, 38, 43 over macros at 100,
+  // 112, 132, 152, 172 pressing mouse masks 0x03, 0x08, 0x10, 0x20, 0x07.
+  const INDEX_UNIT = 4;
+  const BINDING_BYTE_MAX = 255;
+  const BINDING_REACH_BYTES = BINDING_BYTE_MAX * INDEX_UNIT;
   const CHANNEL = 'ssgg-macros';
 
   // Modes the editor offers. Names come from the codec's `macro_mode_name` and GG's own words; only
@@ -62,7 +81,18 @@
     { value: MODE_LOOP, label: 'loop (mode 6, name from GG, unverified)', measured: false },
   ];
 
-  const bindingIndex = (id) => BINDING_BASE + id - 1;
+  const bindingByte = (offsetFromStart) => Math.floor(offsetFromStart / INDEX_UNIT);
+  const offsetForBindingByte = (byte) => byte * INDEX_UNIT;
+  // The name of a mouse mask, for the panels and the editor: 0x03 reads as "mouse 1+mouse 2".
+  function maskName(mask) {
+    if (mask === null || mask === undefined) return null;
+    const bits = MOUSE_BITS.filter(([bit]) => mask & bit).map(([, name]) => name);
+    return bits.length ? bits.join('+') : `mask 0x${hex2(mask)}`;
+  }
+  // The header word a record carries: the measured rule is its action count (8 of the 9 records
+  // surveyed carry exactly that; the ninth carries 83 with 48 actions). It is data, not an identity -
+  // a binding names the position, never this word.
+  const headerWordFor = (record) => record.header_word ?? (record.actions ?? []).length;
 
   const hex2 = (byte) => byte.toString(16).padStart(2, '0');
 
@@ -137,7 +167,7 @@
   // The words of a record's bytes, as the encode side reads them: header, then one action per chunk.
   function recordRaw(record) {
     const out = [RECORD_MARKER, record.mode & 0xff];
-    out.push(record.id & 0xff, (record.id >> 8) & 0xff);
+    out.push(headerWordFor(record) & 0xff, (headerWordFor(record) >> 8) & 0xff);
     out.push(record.flags & 0xff, (record.flags >> 8) & 0xff);
     out.push(record.interval_ms & 0xff, (record.interval_ms >> 8) & 0xff);
     for (const action of record.actions ?? []) {
@@ -145,6 +175,10 @@
         out.push(ACTION_KEY, (action.key ?? 0) & 0xff, 0x01, 0x01);
       } else if (action.kind === 'release') {
         out.push(ACTION_KEY, (action.key ?? 0) & 0xff, 0x01, 0x00);
+      } else if (action.kind === 'press_mouse') {
+        out.push(ACTION_MOUSE, (action.mask ?? 0) & 0xff, 0x00, 0x01);
+      } else if (action.kind === 'release_mouse') {
+        out.push(ACTION_MOUSE, (action.mask ?? 0) & 0xff, 0x00, 0x00);
       } else {
         out.push(ACTION_DELAY, 0x00);
         out.push((action.ms ?? 0) & 0xff, ((action.ms ?? 0) >> 8) & 0xff);
@@ -154,7 +188,7 @@
   }
 
   // Records renumbered as the encoder packs them: the list is packed from the region's first byte, so
-  // every record's payload offset, ordinal, binding index, size and raw bytes follow from the order.
+  // every record's payload offset, ordinal, binding byte, size and raw bytes follow from the order.
   function packRecords(records, region) {
     const start = region ? region.start : REGION_START_B;
     let at = start;
@@ -165,13 +199,13 @@
         actions,
         offset: at,
         ordinal,
-        index: bindingIndex(record.id),
+        index: bindingByte(at - start),
         mode: record.mode & 0xff,
         mode_name: modeName(record.mode),
         flags: record.flags ?? RECORD_FLAGS,
         flags_ok: (record.flags ?? RECORD_FLAGS) === RECORD_FLAGS,
         interval_ms: record.interval_ms,
-        id: record.id,
+        header_word: headerWordFor(record),
         action_count: actions.length,
       };
       packed.record_bytes = recordBytes(packed);
@@ -190,23 +224,27 @@
   function normalizeAction(action) {
     if (action.kind === 'press') return { kind: 'press', key: action.key ?? 0 };
     if (action.kind === 'release') return { kind: 'release', key: action.key ?? 0 };
+    if (action.kind === 'press_mouse') return { kind: 'press_mouse', mask: action.mask ?? 0 };
+    if (action.kind === 'release_mouse') return { kind: 'release_mouse', mask: action.mask ?? 0 };
     return { kind: 'delay', ms: action.ms ?? 0 };
   }
 
   const makePress = (key) => ({ kind: 'press', key });
   const makeRelease = (key) => ({ kind: 'release', key });
+  const makePressMouse = (mask) => ({ kind: 'press_mouse', mask });
+  const makeReleaseMouse = (mask) => ({ kind: 'release_mouse', mask });
   const makeDelay = (ms) => ({ kind: 'delay', ms });
 
   // A new record with no actions: the header alone, packed at the end of the list.
-  function makeRecord(ordinal) {
+  function makeRecord(ordinal, offsetFromStart = 0) {
     return {
       offset: 0,
       ordinal,
-      index: bindingIndex(ordinal + 1),
+      index: bindingByte(offsetFromStart),
       flags_ok: true,
       mode: MODE_REPEAT,
       mode_name: modeName(MODE_REPEAT),
-      id: Math.min(ordinal + 1, ID_MAX),
+      header_word: 1,
       flags: RECORD_FLAGS,
       interval_ms: 100,
       record_bytes: HEADER_LEN,
@@ -225,17 +263,17 @@
     const end = Math.min(bytes.length, region.start + region.len);
     const records = [];
     // The same walk as the codec's `decode_macros`: a record is a marker, a header GG would write (mode
-    // 1..8, id 1..221, interval >= 1) and its actions, read until the grammar stops matching. A header
+    // 1..8, header word >= 1, interval >= 1) and its actions, read until the grammar stops matching. A header
     // with no action, a header GG's own structures wear, and a record the block end cuts off are all
     // skipped - the bytes behind the records belong to GG, and this grammar invents nothing from them.
     const headerAt = (at) => {
       if (at + HEADER_LEN > end || bytes[at] !== RECORD_MARKER) return null;
       const mode = bytes[at + 1];
-      const id = bytes[at + 2] | (bytes[at + 3] << 8);
+      const headerWord = bytes[at + 2] | (bytes[at + 3] << 8);
       const flags = bytes[at + 4] | (bytes[at + 5] << 8);
       const interval = bytes[at + 6] | (bytes[at + 7] << 8);
-      if (mode < 1 || mode > MODE_MAX || id < 1 || id > ID_MAX || interval < 1) return null;
-      return { mode, id, flags, interval };
+      if (mode < 1 || mode > MODE_MAX || headerWord < 1 || interval < 1) return null;
+      return { mode, headerWord, flags, interval };
     };
     const actionAt = (at) => {
       if (at + ACTION_LEN > end) return null;
@@ -246,6 +284,10 @@
         const state = bytes[at + 3];
         if (flag !== 0x01) return null;
         return state === 0x01 ? makePress(key) : makeRelease(key);
+      }
+      if (byte === ACTION_MOUSE && bytes[at + 1] !== 0 && bytes[at + 2] === 0x00) {
+        // A mouse mask of 0 is the zero padding, not an action: that is what stops the walk there.
+        return bytes[at + 3] === 0x01 ? makePressMouse(bytes[at + 1]) : makeReleaseMouse(bytes[at + 1]);
       }
       if (byte === ACTION_DELAY && bytes[at + 1] === 0x00) {
         return makeDelay(bytes[at + 2] | (bytes[at + 3] << 8));
@@ -271,11 +313,11 @@
         records.push({
           offset: at,
           ordinal: records.length,
-          index: bindingIndex(header.id),
+          index: bindingByte(totalBytes(records)),
           flags_ok: header.flags === RECORD_FLAGS,
           mode: header.mode,
           mode_name: modeName(header.mode),
-          id: header.id,
+          header_word: header.headerWord,
           flags: header.flags,
           interval_ms: header.interval,
           record_bytes: cursor - at,
@@ -325,11 +367,28 @@
         + `${region.start} has ${region.len}: the bytes that do not fit are lost, so the board runs the `
         + `macros the region holds`);
     }
+    // The binding byte is one byte counting 4-byte units, so it names offsets 0, 4, ... 1020 of the
+    // block. A record packed past that is written, and read back, and no key can play it.
+    let packed = 0;
+    const outOfReach = records.filter((record) => {
+      const at = packed;
+      packed += recordBytes(record);
+      return at > BINDING_REACH_BYTES;
+    }).length;
+    if (outOfReach) {
+      problems.push(`${outOfReach} of ${records.length} records pack past byte ${BINDING_REACH_BYTES} of `
+        + `the block, where no binding byte reaches (255 x ${INDEX_UNIT}): they are written and read back, `
+        + 'and no key can play them');
+    }
     records.forEach((record, position) => {
       const where = `record ${position} (${recordBytes(record)} bytes)`;
-      if (!Number.isInteger(record.id) || record.id < 1 || record.id > ID_MAX) {
-        problems.push(`${where}: id must be a whole number 1..${ID_MAX} - a binding row carries one byte, `
-          + '35 + id - 1, so that is how far a key can reach a macro');
+      if (!Number.isInteger(headerWordFor(record)) || headerWordFor(record) < 1 || headerWordFor(record) > U16_MAX) {
+        problems.push(`${where}: the header word must be a whole number 1..${U16_MAX} - every record of every `
+          + 'read surveyed carries a non-zero word there, and 8 of the 9 carry exactly their action count');
+      }
+      if ((record.actions ?? []).length === 0) {
+        problems.push(`${where}: a record with no action is not a macro - the walk skips a header with no `
+          + 'action behind it, so a header-only record would not come back from a read');
       }
       if (!Number.isInteger(record.interval_ms) || record.interval_ms < 1 || record.interval_ms > U16_MAX) {
         problems.push(`${where}: interval must be a whole number 1..${U16_MAX} ms (a 16-bit word, and every `
@@ -353,14 +412,24 @@
       }
       actions.forEach((action, index) => {
         const at = `${where} action ${index}`;
-        if (action.kind !== 'press' && action.kind !== 'release' && action.kind !== 'delay') {
-          problems.push(`${at}: is "${action.kind}", and the grammar knows only push, release and wait`);
+        const KINDS = ['press', 'release', 'press_mouse', 'release_mouse', 'delay'];
+        if (!KINDS.includes(action.kind)) {
+          problems.push(`${at}: is "${action.kind}", and the grammar knows only key push, key release, `
+            + 'mouse press, mouse release and wait');
         }
         if (action.kind === 'delay' && (!Number.isInteger(action.ms) || action.ms < 0 || action.ms > U16_MAX)) {
           problems.push(`${at}: ms must be a whole number 0..${U16_MAX} (16-bit word)`);
         }
-        if (action.kind !== 'delay' && (!Number.isInteger(action.key) || action.key < 0 || action.key > 255)) {
-          problems.push(`${at}: key code must be a whole number 0..255 (one byte)`);
+        if (action.kind === 'press' || action.kind === 'release') {
+          if (!Number.isInteger(action.key) || action.key < 0 || action.key > 255) {
+            problems.push(`${at}: key code must be a whole number 0..255 (one byte)`);
+          }
+        }
+        if (action.kind === 'press_mouse' || action.kind === 'release_mouse') {
+          if (!Number.isInteger(action.mask) || action.mask < 1 || action.mask > MASK_MAX) {
+            problems.push(`${at}: mask must be a whole number 1..${MASK_MAX} (the mouse-button bits: bit 0 `
+              + 'is button 1, bit 5 button 6) - a mask of 0 is not an action, the walk stops at it');
+          }
         }
       });
     });
@@ -389,6 +458,8 @@
   function describeAction(action) {
     if (action.kind === 'press') return `push ${keyLabel(action.key ?? 0)}`;
     if (action.kind === 'release') return `release ${keyLabel(action.key ?? 0)}`;
+    if (action.kind === 'press_mouse') return `${maskName(action.mask ?? 0)} down`;
+    if (action.kind === 'release_mouse') return `${maskName(action.mask ?? 0)} up`;
     return `wait ${action.ms ?? 0} ms`;
   }
 
@@ -479,8 +550,9 @@
     function drawList() {
       const rows = records().map((record, position) => {
         const size = recordBytes(record);
-        const label = `macro ${position} - ${record.mode_name} (mode ${hex2(record.mode)}), id ${record.id}, `
-          + `${record.interval_ms} ms, ${record.action_count ?? (record.actions ?? []).length} action(s), ${size} B`;
+        const label = `record #${position} - ${record.mode_name} (mode ${hex2(record.mode)}), binding byte `
+          + `${bindingByte(record.offset - (region ? region.start : REGION_START_B))}, ${record.interval_ms} ms, `
+          + `${record.action_count ?? (record.actions ?? []).length} action(s), ${size} B`;
         const row = el('button', {
           type: 'button',
           class: `macro-item${position === state.selected ? ' active' : ''}`,
@@ -501,7 +573,7 @@
       if (!record) {
         detail.replaceChildren(el('p', {
           class: 'hint',
-          text: 'Pick a macro above, or add one. A record is a header (mode, id, interval) and its actions: key push, key release, wait.',
+          text: 'Pick a macro above, or add one. A record is a header (mode, header word, interval) and its actions: key push, key release, mouse press, mouse release, wait.',
         }));
         return;
       }
@@ -514,10 +586,10 @@
         record.mode_name = modeName(record.mode);
         draw();
       });
-      const idInput = numberInput(record.id, 1, ID_MAX, 'macro id');
-      idInput.addEventListener('change', () => {
-        record.id = clampNumber(idInput, 1, ID_MAX);
-        idInput.value = String(record.id);
+      const headerWordInput = numberInput(headerWordFor(record), 1, U16_MAX, 'header word (data: the measured rule is the action count)');
+      headerWordInput.addEventListener('change', () => {
+        record.header_word = clampNumber(headerWordInput, 1, U16_MAX);
+        headerWordInput.value = String(record.header_word);
         drawMeter();
       });
       const intervalInput = numberInput(record.interval_ms, 0, U16_MAX, 'interval in milliseconds');
@@ -573,6 +645,28 @@
         }),
       ]);
 
+      // Mouse buttons: a mask, so one action presses several buttons at once. The masks a read carries
+      // are offered first: 0x03 is the left+right pair, 0x08/0x10/0x20 are the 4th, 5th and 6th buttons.
+      const maskOptions = [0x03, 0x07, 0x08, 0x10, 0x20, 0x30].map((mask) => ({ value: mask, label: `${maskName(mask)} (0x${hex2(mask)})` }));
+      const pressMaskSelect = select(maskOptions, 0x03);
+      const pressMouseRow = el('div', { class: 'macro-add-row' }, [
+        el('span', { class: 'mono macro-add-label', text: 'mouse press' }),
+        pressMaskSelect,
+        button('add', () => {
+          record.actions.push(makePressMouse(Number.parseInt(pressMaskSelect.value, 10)));
+          draw();
+        }),
+      ]);
+      const releaseMaskSelect = select(maskOptions, 0x03);
+      const releaseMouseRow = el('div', { class: 'macro-add-row' }, [
+        el('span', { class: 'mono macro-add-label', text: 'mouse release' }),
+        releaseMaskSelect,
+        button('add', () => {
+          record.actions.push(makeReleaseMouse(Number.parseInt(releaseMaskSelect.value, 10)));
+          draw();
+        }),
+      ]);
+
       // Wait: one duration.
       const waitInput = numberInput(50, 0, U16_MAX, 'pause in ms');
       const waitRow = el('div', { class: 'macro-add-row' }, [
@@ -587,22 +681,26 @@
       detail.replaceChildren(
         el('h3', {
           class: 'subhead',
-          text: `macro ${state.selected} - id ${record.id}, binding 35 + ${record.id} - 1, `
+          text: `record #${state.selected} - binding byte `
+            + `${bindingByte(record.offset - (region ? region.start : REGION_START_B))} `
+            + `(${INDEX_UNIT} x the bytes from the block start), header word ${headerWordFor(record)}, `
             + `${recordBytes(record)} bytes, ${record.action_count ?? (record.actions ?? []).length} action(s)`,
         }),
         el('div', { class: 'macro-fields' }, [
           el('label', { class: 'mono', text: 'mode ' }, modeSelect),
-          el('label', { class: 'mono', text: 'id ' }, idInput),
+          el('label', { class: 'mono', text: 'header word ' }, headerWordInput),
           el('label', { class: 'mono', text: 'interval ms ' }, intervalInput),
         ]),
         el('p', {
           class: 'hint mono',
           text: `flags 0x${hex2(record.flags & 0xff)}${hex2((record.flags >> 8) & 0xff)} - every record of every read surveyed carries 0x0101, so the editor writes those; `
-            + 'mode 4 is measured on a read, mode 1 and 6 are named from GG. A push and a release are 4 bytes each and hold no duration: a wait is what carries milliseconds.',
+            + 'mode 4 is measured on a read, mode 1 and 6 are named from GG. A push, a release, a mouse press and a mouse release are 4 bytes each and hold no duration: a wait is what carries milliseconds. The header word is the action count - every record of the reads surveyed carries its action count there.',
         }),
         el('div', { class: 'macro-actions-list' }, actionRows),
         pushRow,
         releaseRow,
+        pressMouseRow,
+        releaseMouseRow,
         waitRow,
         el('p', { class: 'mono hint', text: recordRaw(record) }),
       );
@@ -624,8 +722,8 @@
         class: 'mono note',
         text: `macro block ${region.start}..${region.start + region.len} of the ${doc.schema === SCHEMA_B ? 'schema b' : 'profile'} payload, `
           + `${region.fromReport ? 'as the read reported it' : 'the measured schema b block'}; the reads surveyed packed their records from `
-          + `${SURVEYED_CHAIN_START} to ${SURVEYED_CHAIN_END}. Header 8 B, push 4 B, release 4 B, wait 4 B, packed with no stride. `
-          + `A macro id 1..${ID_MAX} is bound by row 35 + id - 1. - the bytes behind the records belong to GG and are left alone`,
+          + `${SURVEYED_CHAIN_START} to ${SURVEYED_CHAIN_END}. Header 8 B, and every action 4 B - key push, key release, mouse press, mouse release, wait - packed with no stride. `
+          + `A key binds the macro at byte x ${INDEX_UNIT} of the block, so a binding byte reaches ${BINDING_REACH_BYTES} bytes of it. - the bytes behind the records belong to GG and are left alone`,
       }),
       meterText,
     ]);
@@ -735,8 +833,11 @@
 
   const api = {
     HEADER_LEN, PRESS_LEN, RELEASE_LEN, DELAY_LEN, ACTION_LEN, RECORD_MARKER, RECORD_FLAGS, ACTION_KEY,
-    ACTION_DELAY, REGION_START_B, REGION_LEN_B, SURVEYED_CHAIN_START, SURVEYED_CHAIN_END, SCHEMA_B, MODE_REPEAT,
-    MODE_ONCE, MODE_LOOP, MODE_MAX, U16_MAX, BINDING_BASE, ID_MAX, bindingIndex, maxActions, MODE_OPTIONS,
+    ACTION_DELAY, ACTION_MOUSE, MASK_MAX, REGION_START_B, REGION_LEN_B, SURVEYED_CHAIN_START, SURVEYED_CHAIN_END,
+    SCHEMA_B, MODE_REPEAT,
+    MODE_ONCE, MODE_LOOP, MODE_MAX, U16_MAX, INDEX_UNIT, BINDING_BYTE_MAX, BINDING_REACH_BYTES, bindingByte,
+    offsetForBindingByte, maskName, makePressMouse, makeReleaseMouse, makePress, makeRelease, makeDelay,
+    headerWordFor, maxActions, MODE_OPTIONS,
     regionOf, editorDisabledReason, actionLen, recordBytes, totalBytes, plan, recordRaw, packRecords, modeName,
     normalizeAction, makePress, makeRelease, makeDelay, makeRecord, recordsFromBlock, workingRecords, applyRecords,
     limitProblems, keyLabel, keyOptions, describeAction, mount, bootPopup, CHANNEL,

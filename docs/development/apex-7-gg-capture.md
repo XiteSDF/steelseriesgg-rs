@@ -225,19 +225,43 @@ the `[EXPERIMENTAL]` grammar this project derived from it, used when reporting a
 it, it sends the block's own bytes back. Records start with marker `0x77`:
 
 ```
-header  0x77 | mode u8 | id u16 LE | flags u16 LE | interval u16 LE    (8 bytes)
-press   0x02 | key | 0x01 0x01                                         (4 bytes)
-release 0x02 | key | 0x01 0x00                                         (4 bytes)
-delay   0x04 | 0x00 | ms u16 LE                                        (4 bytes)
+header  0x77 | mode u8 | header word u16 LE | flags u16 LE | interval u16 LE    (8 bytes)
+press        0x02 | key u8 | 0x01 0x01                                 (4 bytes)
+release      0x02 | key u8 | 0x01 0x00                                 (4 bytes)
+press mouse  0x00 | mask u8 | 0x00 0x01                                (4 bytes)
+release mouse 0x00 | mask u8 | 0x00 0x00                               (4 bytes)
+delay        0x04 | 0x00 | ms u16 LE                                   (4 bytes)
 ```
 
 Modes seen: `1` = play once, stepping `interval` ms between actions; `4` = play again every `interval`
-(a mode-4 record with `interval` 5000 presses `4`, which is the META + Insert binding of profile 1). A `0x71`
-mapping row carries the **macro id** in its third code byte, and the binding number is `35 + id - 1`
-(`MACRO_BINDING_BASE`, `[EXPERIMENTAL]`: measured 2026-10-22 on a read whose META mapping 15 carries 117 and
-whose records carry id 83, the only id above 34 there, so `35 + 83 - 1 = 117`). Ids `1..221` fit the one-byte
-binding field (`MACRO_ID_MAX`). The `flags` bytes are `01 01` on every record with actions and `01 00` on the
-header that carries none, and are unexplained (`MACRO_RECORD_FLAGS_KNOWN`).
+(a mode-4 record with `interval` 5000 presses `4`, which is the META + Insert binding of profile 1). The number-row
+board below carries modes `2`, `3` and `5` as well: `2` and `3` wrap a mouse press in a delay and a release, and `5`
+is a record of a single mouse press with no release. What separates the three is unmeasured - the codec names `1`
+and `4` and reports every other mode as `unknown` (`macro_mode_name`).
+
+The mouse actions are what a number-row macro is built from: on a wired `0x1612` read (firmware 4.16.8, schema b,
+2026-10-22) whose number row `3` to `7` is bound to macros, those records press and release mouse masks `0x03`
+(buttons 1+2), `0x08` (button 4), `0x10` (button 5), `0x20` (button 6) and `0x07` (buttons 1+2+3), each pair
+wrapped in a delay (`[EXPERIMENTAL]`: measured 2026-10-28). The mask is a bit set, not a button number: bit `0x01`
+is mouse 1 through bit `0x20` mouse 6, and one action can set several bits at once - the `0x03` and `0x07` masks
+press two and three buttons at once. That is the whole measured set: bits above `0x20` are unnamed, so a write
+carries no mask past `0x3F` (`MACRO_MOUSE_MASK_MAX`).
+
+A `0x71` mapping row carries the **binding byte** in its third code byte: **the macro record's offset in the
+block, in 4-byte units** - `index = offset / 4`, `offset = 4 x index` (`MACRO_INDEX_UNIT`).
+`[EXPERIMENTAL]`: measured 2026-10-28 on that same read: its 14 macro bindings carry the bytes
+`0, 7, 14, 21, 25, 28, 33, 38, 43, 46, 63, 92, 96, 117`, and **all 14 land on a record the block holds** -
+`25, 28, 33, 38, 43` land on the five mouse records at offsets `100, 112, 132, 152, 172`, whose masks are mouse
+1+2, 4, 5, 6 and 1+2+3, which is what number-row `3` to `7` do on that board. The older reading - `7 x record
+position` - names the right records only for the four bindings whose records happen to be 28 bytes apart
+(`0, 7, 14, 21`) and the wrong ones for the other ten: byte 25 becomes the record at position 3, byte 28 the record
+at position 4, and `5`, `6`, `7` resolve to records that press the mouse buttons of `3` and `4`. It is superseded.
+One code byte reaches `255`, so a binding names records up to `4 x 255 = 1020` bytes into the block
+(`MACRO_BINDING_REACH_BYTES`); the block's capacity is larger than that reach, and a record packed past it is
+written and read back with no key able to play it. The u16 at record `+2` is **not** a macro id: it equals the record's action count in 13 of the 14 records of
+that read (the 48-action record at 2544 carries 83), and in every record of the wired `Config_1` reads, so the
+codec carries it as `header_word` data and validates only that it is non-zero. The `flags` bytes are `01 01` on every record with actions and `01 00` on
+the header that carries none, and are unexplained (`MACRO_RECORD_FLAGS_KNOWN`).
 
 **Checksum**: the little-endian u32 at the payload tail is the STM32 hardware CRC-32 (poly `0x04C11DB7`, init
 `0xFFFFFFFF`, no input/output reflection, no final XOR) over `payload[0..len-4]` read as little-endian 32-bit
@@ -251,10 +275,12 @@ The 64-bit FNV-1a digests in the read report are identity hashes for comparing r
 ## Macro decode: partial, display-only
 
 `decode` walks the macro block into a record list (`apex_7_profile::decode_macros`), and `tools/profile-gui`
-displays it: the Macro panel lists every record the walk produced (mode, id, interval, flags, its keystrokes, the
-keys bound to it, its raw bytes), a key bound with `0x71` shows the same record in its own panel, and the binding
-select offers the decoded records as bind targets. The walk reads the whole block: every record whose bytes the
-region holds, not a fixed count.
+displays it: the Macro panel lists every record the walk produced (mode, header word, interval, flags, its
+keystrokes and mouse buttons, the keys bound to it, its raw bytes), a key bound with `0x71` shows the same record
+in its own panel, and the binding select offers the decoded records as bind targets. The walk reads the whole
+block: every record whose bytes the region holds, not a fixed count. A read of the board above lists all 14
+records, and the five mouse records show as `push mouse 1+mouse 2`, `push mouse 4`, `push mouse 5`,
+`push mouse 6`, `push mouse 1+mouse 2+mouse 3`.
 
 What is **not** supported, and the limits that go with it:
 
@@ -267,14 +293,20 @@ What is **not** supported, and the limits that go with it:
 - **The record list is never encoded.** A write takes `macro_data.bytes_hex`, the block as the read recorded it,
   and sends it verbatim; the decoded list in `macros` is not serialised, so a list that disagrees with the bytes
   has no effect on what the keyboard gets.
-- **The walk is best-effort.** The list has no length word and no stride, so the walker stops at the first byte
-  that is neither the zero pad nor a `0x77` record start, and returns the records up to that point with a note in
-  `macro_note`. `ssgg` has seen real GG blocks whose bytes its grammar rejects. A report carrying such a note and
-  no `bytes_hex` is refused by the write path (`OnboardWriteError::MacroRecordNote`).
+- **The walk is best-effort.** The list has no length word and no stride, so the walker reads the block to its
+  end, takes the records whose bytes parse, and reports what it skipped in `macro_note`: the count of non-zero
+  bytes the list does not cover and the headers that carry no action. `ssgg` has seen real GG blocks whose
+  padding bytes its grammar rejects. A report carrying such a note and no `bytes_hex` is refused by the write
+  path (`OnboardWriteError::MacroRecordNote`).
+- **A binding cannot name every record the block holds.** A byte reaches 1020 bytes into the block; records
+  packed deeper than that are decoded, shown in the editor, written back, and unreachable by any key. The editor
+  says so on each record past the reach.
 - **Bytes inside a record are unconfirmed.** `flags` is `01 01` in every record with actions and is unexplained;
-  the modes measured are `1`, `2`, `4` and `5`; `id` is read as GG's database id. The binding rule `35 + id - 1`
-  is `[EXPERIMENTAL]`: measured on the read named above, and the ids measured (1 to 83) all resolve to bindings
-  inside `35..255`.
+  the modes measured are `1`, `2`, `3`, `4` and `5`. The u16 at `+2` is carried as `header_word`: it equals the
+  record's action count in 13 of the 14 records of the read above (the 48-action record carries 83), so it is not
+  an id and the codec validates only that it is non-zero. The binding rule is `[EXPERIMENTAL]`: `offset / 4`, measured
+  on the read named above, and a binding byte no record starts at - `0x00` for an unbound key, and the deleted
+  macro GG leaves behind - decodes as no macro.
 - **Macro names are not in the payload.** The name and the macro as GG displays it live in GG's own database
   (`db\database.db`); the payload carries packed records only, which is why the panel labels a record by ordinal,
   mode and action count and not by name.

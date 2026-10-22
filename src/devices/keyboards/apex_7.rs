@@ -403,7 +403,7 @@ impl Apex7 {
         })?;
         // If there's no wait there's a race of whether the device prepares the buffer in time, resulting
         // in garbage reads
-        std::thread::sleep(Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(2));
         let reply = self.read_reply_report(PAYLOAD_READ_LEN)?;
         let parsed = parse_read_reply_at(&reply, read_len, READ_REPLY_FRAMING_LEN)?;
         if let Some(msg) = reply_mismatch(&parsed, buffer_offset, read_len) {
