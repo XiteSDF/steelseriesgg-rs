@@ -1047,9 +1047,15 @@ pub const MACRO_ACTION_KEY: u8 = 0x02;
 /// mouse 6 and left+right+middle - and a mask of `0` is refused, which is what stops the action walk on the
 /// block's zero padding.
 pub const MACRO_ACTION_MOUSE: u8 = 0x00;
-/// Highest mouse mask a write carries. The bits the reads measured are `0x01` button 1 through `0x20`
-/// button 6, so a mask with any higher bit names nothing this codec can spell and is refused.
-pub const MACRO_MOUSE_MASK_MAX: u8 = 0x3F;
+/// Highest mouse mask a write carries: bit `0x80`, mouse 8. The engine's own macro converter names a mouse
+/// action's button `log2(mask) + 1` and rejects the byte when that is not a whole number in `1..=8`
+/// (`invalid mouse code %d`), and its writer emits `1 << (button - 1)` for a button it accepts
+/// (`unsupported mouse button press %d direction %d`) - `SteelSeriesEngine.exe`
+/// `pkg/models/macro/convert.libsteelGetMacroDataFromOnboard` at `0x1404e25a0` and
+/// `libsteelTranslateMacroToOnboard` at `0x1404e05e0`. A mask of several bits is what the reads carry
+/// (mouse 1+2 is `0x03`); the engine's reader rejects it, so only a single-bit mask is a button GG itself
+/// can read back.
+pub const MACRO_MOUSE_MASK_MAX: u8 = 0x80;
 /// Action byte of a timed pause inside a macro record.
 pub const MACRO_ACTION_DELAY: u8 = 0x04;
 /// Start of the macro block in a schema b payload, and its length: [`MACRO_DATA_LEN`] bytes, the last 20
@@ -1106,10 +1112,12 @@ pub struct MacroAction {
     /// Key code of a key press or release, absent on a mouse action and on a delay.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key: Option<u8>,
-    /// Mouse mask of a mouse press or release, absent on a key action and on a delay. Bit `0x01` is
-    /// mouse 1, `0x02` mouse 2, `0x04` mouse 3, `0x08` mouse 4, `0x10` mouse 5, `0x20` mouse 6, and a
-    /// mask can set several bits at once. `[EXPERIMENTAL]`: the bit order is read off the number-row
-    /// macros named on [`MACRO_ACTION_MOUSE`], where `3` is left+right and `7` left+right+middle.
+    /// Mouse mask of a mouse press or release, absent on a key action and on the delay. Bit `0x01` is
+    /// mouse 1 through bit `0x80` mouse 8, and a mask can set several bits at once. The engine's own
+    /// reader names the button `log2(mask) + 1` ([`macro_mouse_button`]), so a single-bit mask is the
+    /// form GG can read back; the number-row macros of the read surveyed carry `0x03` and `0x07`, which
+    /// that reader rejects. `[EXPERIMENTAL]`: the bit order is read off the number-row macros named on
+    /// [`MACRO_ACTION_MOUSE`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mask: Option<u8>,
     /// Milliseconds of a delay, absent on a press or release.
@@ -1172,20 +1180,23 @@ pub const fn macro_offset_for_binding_byte(byte: u8, start: usize) -> usize {
 }
 
 /// Mouse mask as words: the buttons it presses at once. `[EXPERIMENTAL]`: the bit order is the one
-/// measured on the number-row macros named on [`MACRO_ACTION_MOUSE`].
+/// measured on the number-row macros named on [`MACRO_ACTION_MOUSE`], and the eight bits are the range
+/// the engine's own reader accepts ([`MACRO_MOUSE_MASK_MAX`]).
 #[must_use]
 pub fn macro_mouse_mask_name(mask: Option<u8>) -> String {
     let mask = mask.unwrap_or(0);
     if mask == 0 {
         return "mouse 0".to_string();
     }
-    const BUTTONS: [(u8, &str); 6] = [
+    const BUTTONS: [(u8, &str); 8] = [
         (0x01, "mouse 1"),
         (0x02, "mouse 2"),
         (0x04, "mouse 3"),
         (0x08, "mouse 4"),
         (0x10, "mouse 5"),
         (0x20, "mouse 6"),
+        (0x40, "mouse 7"),
+        (0x80, "mouse 8"),
     ];
     let named: Vec<&str> = BUTTONS
         .iter()
@@ -1196,6 +1207,20 @@ pub fn macro_mouse_mask_name(mask: Option<u8>) -> String {
         return format!("mouse mask 0x{mask:02X}");
     }
     named.join("+")
+}
+
+/// The mouse button a mask names, by the engine's own rule: `log2(mask) + 1`, valid for a single bit in
+/// `0x01` (mouse 1) to `0x80` (mouse 8). `None` for a mask of no bit or of several bits - the engine's
+/// reader rejects those with `invalid mouse code %d`, and the reads show GG writing them.
+///
+/// [`MACRO_MOUSE_MASK_MAX`]: the engine's range check is `1..=8` on this value.
+#[must_use]
+pub const fn macro_mouse_button(mask: u8) -> Option<u8> {
+    if mask == 0 || mask & mask.wrapping_sub(1) != 0 {
+        return None;
+    }
+    let button = mask.trailing_zeros() as u8 + 1;
+    if button <= 8 { Some(button) } else { None }
 }
 
 /// Mode byte as a word.
@@ -2686,7 +2711,10 @@ fn macro_lines(profile: &OnboardProfile) -> Vec<String> {
         key.map_or_else(|| "key ?".to_string(), |key| format!("key 0x{key:02X}"))
     }
     fn mouse_mask_label(mask: Option<u8>) -> String {
-        macro_mouse_mask_name(mask)
+        // The mask byte is printed with the names: a multi-bit mask is a set of buttons the engine's
+        // own reader rejects, and the byte is the only thing that tells a reader which case they have.
+        let byte = mask.unwrap_or(0);
+        format!("{} (mask 0x{byte:02X})", macro_mouse_mask_name(mask))
     }
 
     fn actions_line(actions: &[MacroAction]) -> String {
@@ -2986,8 +3014,35 @@ mod tests {
         assert!(decode(&encoded).expect("re-decode").crc_ok);
     }
 
-    /// A record list the block's bytes do not match is an edit, and the write is refused: the block carries
-    /// A mouse mask past the bits the reads measured names no button, so the encoder refuses it.
+    /// The engine's own rule for a mouse action: `log2(mask) + 1`, mouse 1 to mouse 8, and a mask of
+    /// several bits names nothing the engine can read back.
+    #[test]
+    fn a_mouse_mask_names_one_button_the_way_the_engine_names_it() {
+        let buttons: [(u8, Option<u8>); 10] = [
+            (0x01, Some(1)),
+            (0x02, Some(2)),
+            (0x04, Some(3)),
+            (0x08, Some(4)),
+            (0x10, Some(5)),
+            (0x20, Some(6)),
+            (0x40, Some(7)),
+            (0x80, Some(8)),
+            (0x00, None),
+            (0x03, None),
+        ];
+        for (mask, button) in buttons {
+            assert_eq!(macro_mouse_button(mask), button, "{mask:#04X}");
+        }
+        assert_eq!(macro_mouse_mask_name(Some(0x40)), "mouse 7");
+        assert_eq!(macro_mouse_mask_name(Some(0x80)), "mouse 8");
+        assert_eq!(
+            macro_mouse_mask_name(Some(MACRO_MOUSE_MASK_MAX)),
+            "mouse 8",
+            "the highest mask a write carries is the mouse 8 bit"
+        );
+    }
+
+    /// A mouse mask past the bits a write may carry names no button, so the encoder refuses it.
     #[test]
     fn a_mouse_mask_past_the_measured_bits_is_refused() {
         let record = JsonMacro {

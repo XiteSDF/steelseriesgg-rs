@@ -176,8 +176,10 @@ Still open:
   only; the Linux/Wayland run, in-window save and the live panel against hardware are untested.
 - Apex 7 macro region: the record grammar now decodes mouse actions and a binding byte reads as 4-byte units of
   block offset, both measured on a wired `0x1612` read whose number row `3` to `7` are mouse macros (all 14 of its
-  bindings resolve). Editing stays GUI-only and `encode` still refuses a list that is not the block's own bytes, so
-  no macro write has been replayed on hardware.
+  bindings resolve). The mask bits are named to mouse 8 on the engine converter's own rule (`log2(mask) + 1`,
+  `1..=8`); the read's bytes for keys 3 and 7 (`0x03`, `0x07`) are the button number written raw, which that
+  converter rejects, so the panels print the byte beside the names. Editing stays GUI-only and `encode` still
+  refuses a list that is not the block's own bytes, so no macro write has been replayed on hardware.
 - Skipped on purpose: Sarhan engine/control API (`src/engine`, good token and Host-check design to copy), PipeWire
   mixer, rebranding; Jaime Electron app, native PipeWire RPC service (unconditional `pipewire`/`libspa`
   deps), Snap/.deb, `apex_gen3.rs` (duplicates `0x1642`), branding.

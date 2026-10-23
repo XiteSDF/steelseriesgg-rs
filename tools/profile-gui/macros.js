@@ -7,9 +7,11 @@
 // and every action is 4 - a key push `0x02 | key u8 | 01 01`, a key release `0x02 | key u8 | 01 00`, a
 // mouse-button press `0x00 | mask u8 | 00 01`, a mouse-button release `0x00 | mask u8 | 00 00`, a wait
 // `0x04 | 00 | ms u16`. A push has no duration of its own: the milliseconds belong to a wait. The mask
-// is a mouse-button bitmask (bit 0 button 1, bit 1 button 2, bit 2 button 3, bit 3 button 4, bit 4
-// button 5, bit 5 button 6), so one action presses several buttons at once - mask 0x03 is the
-// left+right pair a macro uses for a middle click. A mask of 0 is not an action: the walk stops at it,
+// is a mouse-button bitmask (bit 0 button 1 through bit 7 button 8), so one action presses several
+// buttons at once - mask 0x03 is the left+right pair a macro uses for a middle click. The engine's
+// own reader names a mouse action's button log2(mask) + 1 and rejects a byte that is not a single bit
+// in 0x01..0x80, so a single-bit mask is the form GG can read back, and the multi-bit masks the reads
+// carry (0x03, 0x07) are bytes its reader refuses. A mask of 0 is not an action: the walk stops at it,
 // which is what keeps a record from swallowing the block's zero padding.
 //
 // Records are packed with no stride and no length word, from payload 3600 in the six reads surveyed
@@ -49,8 +51,14 @@
   const ACTION_MOUSE = 0x00;
   const ACTION_LEN = 4;
   // The mouse-button mask bits, and the highest mask a read carries. A mask of 0 is not an action.
-  const MOUSE_BITS = [[1, 'mouse 1'], [2, 'mouse 2'], [4, 'mouse 3'], [8, 'mouse 4'], [16, 'mouse 5'], [32, 'mouse 6']];
-  const MASK_MAX = 63;
+  const MOUSE_BITS = [[1, 'mouse 1'], [2, 'mouse 2'], [4, 'mouse 3'], [8, 'mouse 4'], [16, 'mouse 5'],
+    [32, 'mouse 6'], [64, 'mouse 7'], [128, 'mouse 8']];
+  // The masks the engine's own reader accepts are the single bits, mouse 1 (0x01) to mouse 8 (0x80):
+  // it names a mouse action's button log2(mask) + 1 and rejects the byte when that is not a whole
+  // number in 1..8. A mask of several bits is what the reads carry (0x03 = mouse 1+mouse 2); the
+  // engine's reader rejects those, so the editor offers the single bits first.
+  const MASK_MAX = 0x80;
+  const MASK_BUTTONS = [1, 2, 4, 8, 16, 32, 64, 128];
   // The macro block of a schema b payload: 9,600 bytes from 2076, the engine's one `macro-data-size`
   // field. The six reads surveyed packed their records from 3600, inside it.
   const REGION_START_B = 2076;
@@ -89,6 +97,11 @@
     const bits = MOUSE_BITS.filter(([bit]) => mask & bit).map(([, name]) => name);
     return bits.length ? bits.join('+') : `mask 0x${hex2(mask)}`;
   }
+  // The one button a mask names, by the engine's rule (log2(mask) + 1, mouse 1..8); null for a mask
+  // of no bit or of several bits - the bytes the reads carry for a number-row macro (0x03, 0x07).
+  const mouseButton = (mask) => (mask > 0 && mask <= 128 && (mask & (mask - 1)) === 0
+    ? MOUSE_BITS.findIndex(([bit]) => bit === mask) + 1
+    : null);
   // The header word a record carries: the measured rule is its action count (8 of the 9 records
   // surveyed carry exactly that; the ninth carries 83 with 48 actions). It is data, not an identity -
   // a binding names the position, never this word.
@@ -428,7 +441,7 @@
         if (action.kind === 'press_mouse' || action.kind === 'release_mouse') {
           if (!Number.isInteger(action.mask) || action.mask < 1 || action.mask > MASK_MAX) {
             problems.push(`${at}: mask must be a whole number 1..${MASK_MAX} (the mouse-button bits: bit 0 `
-              + 'is button 1, bit 5 button 6) - a mask of 0 is not an action, the walk stops at it');
+              + 'is button 1, bit 7 button 8) - a mask of 0 is not an action, the walk stops at it');
           }
         }
       });
@@ -458,8 +471,8 @@
   function describeAction(action) {
     if (action.kind === 'press') return `push ${keyLabel(action.key ?? 0)}`;
     if (action.kind === 'release') return `release ${keyLabel(action.key ?? 0)}`;
-    if (action.kind === 'press_mouse') return `${maskName(action.mask ?? 0)} down`;
-    if (action.kind === 'release_mouse') return `${maskName(action.mask ?? 0)} up`;
+    if (action.kind === 'press_mouse') return `${maskName(action.mask ?? 0)} down (mask 0x${hex2(action.mask ?? 0)})`;
+    if (action.kind === 'release_mouse') return `${maskName(action.mask ?? 0)} up (mask 0x${hex2(action.mask ?? 0)})`;
     return `wait ${action.ms ?? 0} ms`;
   }
 
@@ -645,9 +658,13 @@
         }),
       ]);
 
-      // Mouse buttons: a mask, so one action presses several buttons at once. The masks a read carries
-      // are offered first: 0x03 is the left+right pair, 0x08/0x10/0x20 are the 4th, 5th and 6th buttons.
-      const maskOptions = [0x03, 0x07, 0x08, 0x10, 0x20, 0x30].map((mask) => ({ value: mask, label: `${maskName(mask)} (0x${hex2(mask)})` }));
+      // Mouse buttons: one bit per button, mouse 1 to mouse 8 - the set the engine's own reader
+      // accepts. The multi-button masks the reads carry are offered after them, labelled by the
+      // buttons they press at once.
+      const maskOptions = [...MASK_BUTTONS, 0x03, 0x07, 0x30].map((mask) => ({
+        value: mask,
+        label: `${maskName(mask)} (0x${hex2(mask)})`,
+      }));
       const pressMaskSelect = select(maskOptions, 0x03);
       const pressMouseRow = el('div', { class: 'macro-add-row' }, [
         el('span', { class: 'mono macro-add-label', text: 'mouse press' }),
@@ -833,7 +850,8 @@
 
   const api = {
     HEADER_LEN, PRESS_LEN, RELEASE_LEN, DELAY_LEN, ACTION_LEN, RECORD_MARKER, RECORD_FLAGS, ACTION_KEY,
-    ACTION_DELAY, ACTION_MOUSE, MASK_MAX, REGION_START_B, REGION_LEN_B, SURVEYED_CHAIN_START, SURVEYED_CHAIN_END,
+    ACTION_DELAY, ACTION_MOUSE, MASK_MAX, MASK_BUTTONS, mouseButton,
+    REGION_START_B, REGION_LEN_B, SURVEYED_CHAIN_START, SURVEYED_CHAIN_END,
     SCHEMA_B, MODE_REPEAT,
     MODE_ONCE, MODE_LOOP, MODE_MAX, U16_MAX, INDEX_UNIT, BINDING_BYTE_MAX, BINDING_REACH_BYTES, bindingByte,
     offsetForBindingByte, maskName, makePressMouse, makeReleaseMouse, makePress, makeRelease, makeDelay,

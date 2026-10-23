@@ -243,9 +243,21 @@ The mouse actions are what a number-row macro is built from: on a wired `0x1612`
 2026-10-22) whose number row `3` to `7` is bound to macros, those records press and release mouse masks `0x03`
 (buttons 1+2), `0x08` (button 4), `0x10` (button 5), `0x20` (button 6) and `0x07` (buttons 1+2+3), each pair
 wrapped in a delay (`[EXPERIMENTAL]`: measured 2026-10-28). The mask is a bit set, not a button number: bit `0x01`
-is mouse 1 through bit `0x20` mouse 6, and one action can set several bits at once - the `0x03` and `0x07` masks
-press two and three buttons at once. That is the whole measured set: bits above `0x20` are unnamed, so a write
-carries no mask past `0x3F` (`MACRO_MOUSE_MASK_MAX`).
+is mouse 1 through bit `0x80` mouse 8, and one action can set several bits at once.
+
+The engine binary states the rule. Its macro converter writes a mouse action as `1 << (button - 1)` for a button
+in `1..=8` (`libsteelTranslateMacroToOnboard`, `SteelSeriesEngine.exe` `0x1404e05e0`), and its reader names the
+button `log2(mask) + 1`, rejecting the byte when that is not a whole number in `1..=8` - `invalid mouse code %d`
+(`convert.libsteelGetMacroDataFromOnboard`, `0x1404e25a0`). So a single-bit mask is the form GG can round-trip,
+`0x04` is mouse 3 and `0x40` is mouse 7.
+
+The board above shows what GG writes for the same keys in GG's own UI: the operator built these five macros as
+mouse 3, 4, 5, 6, 7, and the bytes for keys 4, 5, 6 are the single-bit masks (`0x08`, `0x10`, `0x20`), while keys
+3 and 7 carry `0x03` and `0x07` - the button *number* written raw, which GG's own reader rejects. `[EXPERIMENTAL]`
+(the two readings disagree on those two keys; the byte is what the board holds, and only the single-bit form is
+what GG's converter emits). `ssgg` names the bits, and prints the byte beside them
+(`push mouse 1+mouse 2 (mask 0x03)`), so a mask GG's reader rejects is visible as one. A write carries a mask of
+`0x01..=0x80` (`MACRO_MOUSE_MASK_MAX`), the engine's range.
 
 A `0x71` mapping row carries the **binding byte** in its third code byte: **the macro record's offset in the
 block, in 4-byte units** - `index = offset / 4`, `offset = 4 x index` (`MACRO_INDEX_UNIT`).
@@ -279,8 +291,8 @@ displays it: the Macro panel lists every record the walk produced (mode, header 
 keystrokes and mouse buttons, the keys bound to it, its raw bytes), a key bound with `0x71` shows the same record
 in its own panel, and the binding select offers the decoded records as bind targets. The walk reads the whole
 block: every record whose bytes the region holds, not a fixed count. A read of the board above lists all 14
-records, and the five mouse records show as `push mouse 1+mouse 2`, `push mouse 4`, `push mouse 5`,
-`push mouse 6`, `push mouse 1+mouse 2+mouse 3`.
+records, and the five mouse records show as `push mouse 1+mouse 2 (mask 0x03)`, `push mouse 4 (mask 0x08)`,
+`push mouse 5 (mask 0x10)`, `push mouse 6 (mask 0x20)`, `push mouse 1+mouse 2+mouse 3 (mask 0x07)`.
 
 What is **not** supported, and the limits that go with it:
 

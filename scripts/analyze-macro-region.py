@@ -29,7 +29,14 @@ ACTION_LEN = 4
 # A binding byte names a record by its offset in the block in 4-byte units.
 INDEX_UNIT = 4
 BINDING_BYTE_MAX = 255
-MOUSE_BITS = [(0x01, 1), (0x02, 2), (0x04, 3), (0x08, 4), (0x10, 5), (0x20, 6)]
+MOUSE_BITS = [(0x01, 1), (0x02, 2), (0x04, 3), (0x08, 4), (0x10, 5), (0x20, 6), (0x40, 7), (0x80, 8)]
+
+
+def mouse_button(mask):
+    """The engine's rule for one button per mask: log2(mask) + 1, mouse 1..8 (None otherwise)."""
+    if mask == 0 or mask & (mask - 1):
+        return None
+    return next((n for bit, n in MOUSE_BITS if bit == mask), None)
 
 
 def mask_words(mask):

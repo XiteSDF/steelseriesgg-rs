@@ -773,10 +773,15 @@ ok('the binding byte is the offset a macro starts at, counted in 4-byte units', 
 }, () => [app.MACRO_INDEX_UNIT, app.MACRO_BINDING_REACH_BYTES]);
 ok('the mouse mask a macro action presses is named by its bits', () => {
   const names = [[0x03, 'mouse 1+mouse 2'], [0x08, 'mouse 4'], [0x10, 'mouse 5'], [0x20, 'mouse 6'],
-    [0x07, 'mouse 1+mouse 2+mouse 3']];
+    [0x07, 'mouse 1+mouse 2+mouse 3'], [0x40, 'mouse 7'], [0x80, 'mouse 8']];
   return names.every(([mask, want]) => app.macroMouseMaskName(mask) === want)
     && app.macroKeystrokes({ actions: [{ kind: 'press_mouse', mask: 0x03 }] }).includes('mouse 1+mouse 2 down')
-    && app.macroKeystrokes({ actions: [{ kind: 'press_mouse', mask: 0x10 }, { kind: 'delay', ms: 1 }, { kind: 'release_mouse', mask: 0x10 }] }).includes('mouse 5 down');
+    && app.macroKeystrokes({ actions: [{ kind: 'press_mouse', mask: 0x10 }, { kind: 'delay', ms: 1 }, { kind: 'release_mouse', mask: 0x10 }] }).includes('mouse 5 down')
+    // The mask byte is shown with the names: a multi-bit mask is one the engine's own reader rejects,
+    // and the byte is what tells a reader which case they are looking at.
+    && app.macroKeystrokes({ actions: [{ kind: 'press_mouse', mask: 0x03 }] }).includes('(mask 0x03)')
+    && app.macroKeystrokes({ actions: [{ kind: 'press_mouse', mask: 0x40 }] }).includes('mouse 7 down (mask 0x40)')
+    && app.MACRO_MOUSE_BITS.length === 8;
 }, () => [0x03, 0x07, 0x08, 0x10, 0x20].map((mask) => app.macroMouseMaskName(mask)));
 okMacros('macroKeystrokes reads the keys and delays a record runs', () => {
   const record = app.macroRecords(macrosDoc)[0];
@@ -1926,6 +1931,15 @@ console.log('macro editor window (macros.js)');
 // app.js reads, exactly as in the browser.
 loadClassic('macros.js');
 const macro = globalThis.SsggMacroEditor;
+ok('one mouse mask names one button by the engine rule, log2(mask) + 1 in mouse 1..8', () =>
+  [[0x01, 1], [0x02, 2], [0x04, 3], [0x08, 4], [0x10, 5], [0x20, 6], [0x40, 7], [0x80, 8]]
+    .every(([mask, button]) => macro.mouseButton(mask) === button)
+    // A mask of several bits - the bytes a number-row macro of the reads carries - names no single
+    // button, and the engine's own reader rejects it with `invalid mouse code`.
+    && [0x00, 0x03, 0x07, 0x30, 0x100].every((mask) => macro.mouseButton(mask) === null)
+    && macro.MASK_BUTTONS.length === 8 && macro.MASK_BUTTONS[7] === 128
+    && macro.MASK_MAX === 128);
+
 
 ok("the editor's grammar bytes match the codec's constants", () => {
   const rust = read('src/devices/keyboards/apex_7_profile.rs');
@@ -2055,8 +2069,10 @@ ok('every limit that stops a write is named before the editor lets the list thro
     && check({ ...base, actions: [macro.makeDelay(70000)] }).includes('ms must be a whole number 0..65535')
     && check({ ...base, actions: [{ kind: 'press', key: 300 }] }).includes('key code must be a whole number 0..255')
     && check({ ...base, actions: [{ kind: 'hold', key: 4 }] }).includes('grammar knows only key push')
-    && check({ ...base, actions: [{ kind: 'press_mouse', mask: 0 }] }).includes('mask must be a whole number 1..63')
-    && check({ ...base, actions: [{ kind: 'release_mouse', mask: 64 }] }).includes('mask must be a whole number 1..63')
+    && check({ ...base, actions: [{ kind: 'press_mouse', mask: 0 }] }).includes('mask must be a whole number 1..128')
+    && check({ ...base, actions: [{ kind: 'release_mouse', mask: 129 }] }).includes('mask must be a whole number 1..128')
+    // The mouse 7 and mouse 8 bits are inside the engine's own range (log2(mask) + 1 in 1..8).
+    && check({ ...base, actions: [{ kind: 'press_mouse', mask: 0x40 }, { kind: 'release_mouse', mask: 0x80 }] }) === ''
     && check({ ...base, actions: [{ kind: 'press_mouse', mask: 0x03 }, { kind: 'release_mouse', mask: 0x03 }] }) === ''
     // A record packed past the last byte a binding can name is written and read back, and no key plays it.
     && macro.limitProblems(Array.from({ length: 65 }, () => ({ ...base, actions: [macro.makePress(4), macro.makeRelease(4)] })), region).join(' | ').includes('no binding byte reaches')

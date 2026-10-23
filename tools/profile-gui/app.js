@@ -2212,7 +2212,8 @@ const MACRO_INDEX_UNIT = 4;
 const MACRO_BINDING_BYTE_MAX = 255;
 const MACRO_BINDING_REACH_BYTES = MACRO_BINDING_BYTE_MAX * MACRO_INDEX_UNIT;
 // The mouse-button mask bits, same order as the codec names them.
-const MACRO_MOUSE_BITS = [[0x01, 'mouse 1'], [0x02, 'mouse 2'], [0x04, 'mouse 3'], [0x08, 'mouse 4'], [0x10, 'mouse 5'], [0x20, 'mouse 6']];
+const MACRO_MOUSE_BITS = [[0x01, 'mouse 1'], [0x02, 'mouse 2'], [0x04, 'mouse 3'], [0x08, 'mouse 4'], [0x10, 'mouse 5'],
+  [0x20, 'mouse 6'], [0x40, 'mouse 7'], [0x80, 'mouse 8']];
 
 // Records of a dump, from the `macros` array the writer emits. An older dump has no such field.
 function macroRecords(doc) {
@@ -2266,7 +2267,7 @@ function macroKeystrokes(record) {
   const out = [];
   for (const action of record.actions) {
     if (action.kind === 'press') out.push(keyName(action.key));
-    else if (action.kind === 'press_mouse') out.push(`${macroMouseMaskName(action.mask)} down`);
+    else if (action.kind === 'press_mouse') out.push(`${macroMouseMaskName(action.mask)} down (mask 0x${hex2(action.mask ?? 0)})`);
     else if (action.kind === 'delay') out.push(`${action.ms} ms`);
   }
   return out.length ? out.join(' > ') : 'no keys';
@@ -2515,7 +2516,7 @@ function renderMacrosPanel(file) {
   const recordsBytes = records.reduce((sum, record) => sum + (record.record_bytes ?? 0), 0);
   const rows = [el('p', {
     class: 'hint',
-    text: `payload offset ${summary.offset}, ${summary.len} bytes, ${summary.nonzero} non-zero. ${records.length} macro record(s) decoded from it, filling ${recordsBytes} bytes${recordsBytes ? `, ${summary.offset} to ${summary.offset + recordsBytes - 1}` : ''}. A record is an 8-byte header (0x77, mode, action count, flags, interval) plus its actions, every action 4 bytes: a key push 02 key 01 01, a key release 02 key 01 00, a mouse press 00 mask 00 01, a mouse release 00 mask 00 00, a wait 04 00 ms. The mask is a mouse-button bitmask (bit 0 button 1, bit 1 button 2, bit 2 button 3, bit 3 button 4, bit 4 button 5, bit 5 button 6), so one action presses several buttons at once - mask 0x03 is the left+right pair a macro uses for a middle click. The header word is the action count: every record of the reads surveyed carries its action count there. The chain is packed with no stride and no length word, and the bytes behind it belong to GG's own structures, so the walk stops where the grammar stops matching. A 0x71 slot's third code byte counts 4-byte units from the block start: the macro it plays starts at byte x 4 of the block, so a binding byte reaches ${MACRO_BINDING_REACH_BYTES} of its ${MACRO_DATA_LEN} bytes. This panel lists the records the block walks to; a write sends the block's bytes back, never this list.`,
+    text: `payload offset ${summary.offset}, ${summary.len} bytes, ${summary.nonzero} non-zero. ${records.length} macro record(s) decoded from it, filling ${recordsBytes} bytes${recordsBytes ? `, ${summary.offset} to ${summary.offset + recordsBytes - 1}` : ''}. A record is an 8-byte header (0x77, mode, action count, flags, interval) plus its actions, every action 4 bytes: a key push 02 key 01 01, a key release 02 key 01 00, a mouse press 00 mask 00 01, a mouse release 00 mask 00 00, a wait 04 00 ms. The mask is a mouse-button bitmask (bit 0 button 1 through bit 7 button 8): the engine's own reader names a mouse action's button log2(mask) + 1 and rejects a byte that is not a single bit in 0x01..0x80, so a single-bit mask is the button GG can read back, and mask 0x03 (mouse 1+mouse 2) is a pair the reads carry that GG's reader refuses. The header word is the action count: every record of the reads surveyed carries its action count there. The chain is packed with no stride and no length word, and the bytes behind it belong to GG's own structures, so the walk stops where the grammar stops matching. A 0x71 slot's third code byte counts 4-byte units from the block start: the macro it plays starts at byte x 4 of the block, so a binding byte reaches ${MACRO_BINDING_REACH_BYTES} of its ${MACRO_DATA_LEN} bytes. This panel lists the records the block walks to; a write sends the block's bytes back, never this list.`,
   })];
   if (!Array.isArray(doc.macros)) {
     rows.push(el('p', { class: 'hint', text: 'this dump has no "macros" field - it was written before the record decode. Re-read the profile to get them.' }));

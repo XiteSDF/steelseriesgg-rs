@@ -14,8 +14,8 @@ use serde_json::Value;
 use steelseries_gg::devices::keyboards::apex_7_profile::{
     BUTTON_MAPPINGS_OFFSET, BUTTON_META_MAPPINGS_OFFSET, KEY_MAPPING_LEN, MACRO_ACTION_LEN, MACRO_BINDING_BYTE_MAX,
     MACRO_BINDING_REACH_BYTES, MACRO_HEADER_LEN, MACRO_INDEX_UNIT, MACRO_RECORD_FLAGS_KNOWN, MacroAction,
-    MacroRecordRegion, SCHEMA_B, compute_checksum, decode, encode_json, macro_index, macro_mouse_mask_name,
-    macro_offset_for_binding_byte, macro_region_bounds, profile_json,
+    MacroRecordRegion, SCHEMA_B, compute_checksum, decode, encode_json, macro_index, macro_mouse_button,
+    macro_mouse_mask_name, macro_offset_for_binding_byte, macro_region_bounds, profile_json,
 };
 
 const PAYLOAD_LEN: usize = 11_696;
@@ -685,6 +685,46 @@ fn every_binding_of_a_mouse_macro_board_resolves_to_a_record() {
             "mouse 1+mouse 2+mouse 3"
         ],
         "keys 3, 4, 5, 6, 7 press the buttons their records carry - the measurement that fixed the rule"
+    );
+    // The operator's board is a macro that presses a mouse button, and the bytes for keys 3 and 7 are
+    // not the single-bit mask the engine's own reader names that button with: the engine's rule is
+    // log2(mask) + 1, so mouse 3 is 0x04 and mouse 7 is 0x40, and it rejects 0x03 and 0x07 outright.
+    // The board carries the button number in the mask byte for those two keys, and the single-bit mask
+    // for the three between them.
+    let masks: Vec<u8> = [25usize, 33, 41, 49, 57]
+        .iter()
+        .map(|slot| {
+            let byte = bindings
+                .iter()
+                .find(|(offset, _)| *offset == *slot)
+                .map(|(_, byte)| *byte)
+                .expect("the key is bound to a macro");
+            let at = macro_offset_for_binding_byte(byte, profile.macro_region.start);
+            let rec = profile
+                .macros
+                .iter()
+                .find(|rec| rec.offset == at)
+                .expect("the binding names a record");
+            rec.actions
+                .iter()
+                .find(|action| action.kind == "press_mouse")
+                .and_then(|action| action.mask)
+                .expect("the record presses a mouse button")
+        })
+        .collect();
+    assert_eq!(
+        masks,
+        vec![0x03, 0x08, 0x10, 0x20, 0x07],
+        "the mask bytes the board carries for keys 3, 4, 5, 6, 7"
+    );
+    assert_eq!(
+        masks.iter().map(|mask| macro_mouse_button(*mask)).collect::<Vec<_>>(),
+        vec![None, Some(4), Some(5), Some(6), None],
+        concat!(
+            "only the three middle bytes are the button the engine's reader names; keys 3 and 7 carry ",
+            "the button number (3 and 7), which GG's reader rejects and which the operator's GG shows ",
+            "as mouse 3 and mouse 7 from its own database"
+        )
     );
     // The superseded rule (byte = 7 x the record's position in the chain) agrees only on the four bindings
     // whose records are 28 bytes apart, and that is the whole board the rule was measured on.
