@@ -66,11 +66,10 @@ at a stale slot. The picker opens in `tools/profile-gui/`, so copy a dump here f
 navigate to where it is. The tracked fixtures under `examples/` are **decodes of real slot
 captures**: `sample-identity.json` is the stock slot (macro block empty, profile name
 `Config 3`), `sample-remap.json` is that decode with base remaps written in and the profile
-name `Remapped`. A third sample that carries packed macro records is not tracked - it holds
-the operator's own macros - and the suite's macro checks report `skip` in a checkout without
-it; those checks run on the fixture bytes `selftest.mjs` assembles, which include a block the
-record grammar **rejects**. A read *record* (the per-pull telemetry with `chunks` and no `oled`
-block) is refused by name: this page edits profiles, not logs.
+name `Remapped`. No tracked sample carries macro records: a real macro block is someone's keystrokes,
+so the suite packs its own record list into the stock decode's block (see **Checks** below), and that
+fixture includes bytes the record grammar **rejects**. A read *record* (the per-pull telemetry with
+`chunks` and no `oled` block) is refused by name: this page edits profiles, not logs.
 `Save a copy` prompts for nothing: the browser download already asks where to put the file, so a
 dialog in front of it is one extra question for one decision. The copy name is derived from the
 loaded file - `x.json` downloads as `x-copy.json`, a copy of a copy stays `x-copy.json`, and a
@@ -79,6 +78,16 @@ is the point: the name a save offers is never the name of the file that was load
 not look like an in-place write.
 The status line reports what loaded (name, character count, slot, schema, checksum,
 macros) and every reason a file was refused.
+
+The tab row at the top names the open file, and marks it `name.json *N` with the change count
+`fileChanges` reports when it differs from the bytes it was loaded with. At its right end sits the undo for
+the whole profile: **Revert this file**, disabled while the file is clean and named
+`Revert name.json (N changes)` when it is not - `revertFile` puts back the `original` document the file came
+in with, one clone, every panel edit at once. The board marks the keys a change touches (`changeKeyHids`),
+and each panel undoes its own part on the spot (the name bar's **Revert the name**, a key row's **Undo the
+changes on this key**, the OLED row's **Revert the OLED block**). The page lists no changed paths: the count
+in the tab and the marks on the board already say where the edits are, and the revert does not need a list to
+undo them.
 
 Two picker traps this page avoids, both of which look exactly like "the JSON
 does not load": a `display:none` file input is not labelable (clicking its label
@@ -291,10 +300,28 @@ the page's stylesheet, not a copy of it.
 
 Nothing in the file-info panel is editable: it has no dropdown and no text field.
 
+Four rows of the Lighting block carry a note saying what is known about the field and what is not: the six
+`oled_illumination_options` bytes (GG's name for them; no field name exists in the engine binary or in the
+4.16.8 firmware, and GG's Apex 7 front end offers no OLED option beyond the image upload - operator-reported
+2026-10-23 - so they are the keyboard's own `DISPLAY`-menu settings the profile carries: brightness, icons,
+timeout; the two values the shipped captures read are `02 00 00 00 00 00` on the live board's slot and
+`00 02 00 00 00 00` on the stock slot), the two dimmer bytes (255 in every shipped capture) and the idle
+timeout (0 in every shipped capture, with the board's own ladder - `5 SECS` up to `5 HOURS`, plus `NONE` and
+`NEVER` - listed as the ms values it can take). The ladder and the board's `ILLUMINATION` / `DISPLAY` menu
+items came out of the 4.16.8 firmware's string pool on 2026-10-23; see
+`docs/development/apex-7-gg-capture.md`.
+
+The page has three places for panels and `panelPlan` is the only thing that decides which one a panel goes
+to: the column right of the board (**inspector**, exactly one panel - the selected key, a wheel cap, or the
+OLED), the two blocks directly under the board (**primary**: Rapid Tap, then Lighting - the two edits whose
+effect the caps on the board show), and the **Details** section under the page (**details**: the file panel,
+Custom bindings, Macro records - what the file records that the board does not display). The Details section
+is hidden while no file is open, and its heading is the page's own, not a panel's.
+
 `guid`, `guid_padding` and the `crc_*` fields are shown read-only; the `oled` block is dumped in
 full (see [OLED bitmap](#oled-bitmap)), and the macro block is **decoded into records**, see
 [Macro records](#macro-records). Saving writes the whole document, **including fields this editor
-does not know about**; the change panel lists what differs from the copy that
+does not know about**; the tab row counts what differs from the copy that
 was loaded, and diffing is what marks a key cap as edited. The Rapid Tap pairs print their
 `reserved` bytes (the decoder lists 2 hex bytes per pair, the engine's `onboard_rapid_tap_pair`
 layout) read-only, so a save writes them back unchanged.
@@ -326,13 +353,20 @@ edits none of them.
 ```sh
 node tools/profile-gui/sync-products.mjs           # import the product table from Rust
 node tools/profile-gui/sync-products.mjs --check   # fail if products.generated.js is stale
-node tools/profile-gui/selftest.mjs    # 197 checks; 13 of them read the profile JSONs in the repo
-                                       # root (the operator's captures, not files of the repo) and
-                                       # report `skip` in a checkout that has none of them. Covers:
+node tools/profile-gui/selftest.mjs    # 236 checks; 4 of them need a live `ssgg gui` session
+                                       # (`SSGG_GUI_URL` and `SSGG_GUI_TOKEN`) and report `skip`
+                                       # without it. No check reads a file outside `tools/profile-gui/`,
+                                       # and the suite names no capture taken off a board. Covers:
                                        # tables, binding, geometry, round-trip, edits, fake-DOM page
                                        # wiring, index.html script order, the picker path, the
-                                       # one-profile rule, the save-a-copy prompt, the wheel caps,
-                                       # the OLED rect (raster, bit order, hash fields), the label
+                                       # one-profile rule, the save-a-copy prompt, the tab row's change
+                                       # count and whole-file revert, the panel layout (the two blocks under
+                                       # the board, the Details section), the wheel caps,
+                                       # the OLED rect (raster, bit order, hash fields), the BMP upload
+                                       # decoder (header, palettes, refusals, sampling, threshold), the
+                                       # pixel editor (brushes, stroke, summary fields, stage events), the
+                                       # revert to the block as loaded, the one-row control bar and the
+                                       # panel file input, the label
                                        # rules, the binding and Meta action selects, the name bar,
                                        # the macro block's bytes and what a report without them says
 node tools/profile-gui/preview.mjs [-o FILE] [--source FILE] [profile.json ...]   # -o defaults to board-preview.svg
@@ -342,14 +376,16 @@ node tools/profile-gui/preview.mjs [-o FILE] [--source FILE] [profile.json ...] 
 same code the page runs is checked in CI-able plain node. It loads
 `examples/sample-identity.json` (a **stock** wired Apex 7 slot, decoder `oled.bytes_hex` intact,
 macro block all zero) and `examples/sample-remap.json` (base remaps
-written in, meta colour edited); plus `sample-macros.json` in the repo root - a decode carrying
-5 packed records and its macro block's 9,600 bytes as `macro_data.bytes_hex` - which is
-the operator's file and not in the repo, so those checks skip without it.
+written in, meta colour edited).
 
-The macro checks run on that root file: five records at indices 0, 7, 14, 21, 28 -
-i.e. ordinals 0..4 with the measured stride of 7 - modes `once`/`repeat`, 4, 4, 4, 1 and 0 actions,
-three `0x71` bindings on the base layer whose third code byte is the index, and the deleted-macro
-case is produced in the suite by pointing a binding index past the list. The Rust side keeps its
+The macro checks run on a decode the suite assembles: the stock slot with 5 packed records and its
+macro block's 9,600 bytes as `macro_data.bytes_hex`. Five records of 28 bytes each (a header plus five
+actions), packed at 0, 28, 56, 84 and 112 bytes into the block - binding bytes 0, 7, 14, 21 and 28, the
+measured stride of 7 - in modes `repeat`, `once`, `repeat`, `loop` and `once`, with one mouse record
+whose release action carries the `0x00 0x03` pair the reads carry at +108, and a stray non-record run
+after the last record so the block carries bytes the record list cannot walk. Three `0x71` bindings on
+the base layer whose third code byte is the index, and the deleted-macro case is produced in the suite by
+pointing a binding index past the list. The Rust side keeps its
 own fixtures (`SYNTH_MACRO_BLOCK`, and `GG_MACRO_BYTES` - the record runs of that real block, the zero byte,
 the `0x03` and a standing-in tail) for the codec tests. Paths are resolved against the script, so
 `node tools/profile-gui/selftest.mjs` works from the repo root as well as from this
@@ -365,8 +401,8 @@ as `bytes_hex` instead of summarising it. **Bit 7 of each byte is its left pixel
 Apex 7 (`0x1612`): the operator took the image GG paints on that panel, decoded it into bytes, read those bytes
 back from the keyboard as the block, and writing them back paints the same picture. There is no bit-order
 switch. `oledPixels` rasterises it (a set bit is a lit pixel) and
-`oledDataUrl` makes a PNG through a canvas: the board rect draws it, the OLED panel shows it
-at 2x with `image-rendering: pixelated`. A page without a 2D canvas keeps its text label and
+`oledDataUrl` makes a PNG through a canvas: the board rect draws it, the OLED panel draws it at 2x on
+its paint stage with `image-rendering: pixelated`. A page without a 2D canvas keeps its text label and
 says why; so does a dump that has no `bytes_hex`.
 
 The conversion is **GUI-only**: the Rust codec treats the block as an opaque byte array and carries it
@@ -389,19 +425,52 @@ difference. If a dump's stored field disagrees with its `bytes_hex` the panel sa
 words. `Set all black` writes 640 zero bytes and recomputes `len`, `nonzero`, `fnv1a_64` and
 `head`; only the JSON changes.
 
-**Upload a BMP** replaces the block in the JSON. `decodeBmp` reads the header, accepts
+**Upload a BMP** replaces the block in the JSON: the row's file input (`.bmp`) feeds `FileReader` into
+`applyBmpBytes`, and the status line says what was written
+(the source geometry, its bit depth and compression, the lit-pixel count) or names what a refused
+file was. `decodeBmp` reads the header, accepts
 `BI_RGB` at 1, 4, 8, 24 and 32 bpp (`BI_RGB` top-down too, and 32 bpp `BI_BITFIELDS` with the
-plain blue/green/red masks), refuses `BI_RGB`-embedded JPEG/PNG, RLE and any other mask
-layout, takes the nearest-neighbour average over a palette entry (1 and 4 bpp read the palette,
-8 bpp reads it too, 24/32 bpp read the triple), and samples the picture to 128x40 by
+plain blue/green/red masks), refuses `BI_JPEG`/`BI_PNG`, RLE, 16 bpp and any other mask
+layout, and every refusal quotes what it found. A file at 8 bpp or less reads the palette it
+ships, and one that ships none gets the default its indices stand for (1 bpp: index 0 black,
+index 1 white; 4 and 8 bpp: the grey ramp). Brightness is the average of a pixel's red, green and
+blue, and the picture is sampled to 128x40 by
 nearest-neighbour - the same rule `python-pptx` documents for a picture stretched to fill a
 slot, which is how GG puts a 1920x1080 image on this 128x40 panel. A pixel lights up at 128/255
-brightness or more. `Set all black` clears the block, and `Invert every pixel` flips every bit of
-`bytes_hex`: lit becomes off and off becomes lit, bit 7 stays the left pixel of its byte, so the
-picture is mirrored in colour only and never moved, inverting twice is the identity, and a block with
-no `bytes_hex` inverts to every pixel lit. `oled` is one of the four things the board can select: clicking the rect opens this panel in the column next to the board. Both actions
-rewrite `bytes_hex` and recompute `nonzero`, `fnv1a_64` and `head` from it, and
-`fileChanges` sees one changed path (`/oled/bytes_hex`), so the Changes panel lists it.
+brightness or more (`OLED_LIT_THRESHOLD`).
+
+`Set all black` clears the block, and `Invert every pixel` flips every bit of `bytes_hex`: lit becomes off
+and off becomes lit, bit 7 stays the left pixel of its byte, so the picture is mirrored in colour only and
+never moved, inverting twice is the identity, and a block with no `bytes_hex` inverts to every pixel lit.
+
+**One row, every control.** The panel's `Paint` row holds them side by side - the two brushes, **Revert the
+OLED block**, **Set all black**, **Invert every pixel**, the **Upload a BMP** file input - and the paint
+stage with the picture sits under them in the same row, so the note under the row spells out what each one
+does.
+
+**Paint** is the per-pixel editor: **White pixel** lights the bit (the board shows that pixel) and
+**Black pixel** turns it off. The pointer target is the
+stage under the picture, not the picture, so the click's own `offsetX`/`offsetY` divided by
+`OLED_PAINT_SCALE` (2 device pixels per bitmap pixel) name the pixel, and the controls above it never
+shift the coordinates. A click paints one pixel; a drag paints every pixel Bresenham draws between the
+points it reports (`oledLine`), so a fast stroke comes out connected instead of as its two ends.
+`applyOledPixels` flips only the bits that need flipping, so painting white over white reports nothing
+written, and `applyOledPaint` writes the block through `setOledBitmap`, so `len`, `nonzero`, `fnv1a_64`
+and `head` stay true to the bytes. The stroke closes when the button comes up, when the pointer leaves the
+stage, when a brush is picked and on a revert, and that repaints the board rect and the summary row. A
+right-button press paints nothing, a click outside the 128x40 area is ignored, and on a page with no 2D
+canvas the stage is blank and the paint still works, because it needs the coordinates, not the picture.
+
+**Revert the OLED block** puts back the `oled` object the file was loaded with: `revertOledBlock` copies
+`file.original.oled` over the current one, summary fields included, because those describe the bytes being
+restored. Every control in the row is a page-local edit, so this one button is the undo for all of them. It
+is disabled while the block already matches the file as loaded (`oledBlockDiffers` compares the two `oled`
+objects), so it cannot touch an unchanged block and cannot show up as a change of its own.
+
+`oled` is one of the four things the board can select: clicking the rect opens this panel in the column
+next to the board. Every control in the row
+rewrites `bytes_hex` and recomputes `nonzero`, `fnv1a_64` and `head` from it, and `fileChanges` counts the
+paths it moved under `oled`, which is the number the tab shows and the tab's revert undoes.
 Nothing here touches a keyboard: the page opens configs read from an Apex 7 (`0x1612`), has no device access, and
 writing to a board is `ssgg onboard write` on the CLI. Encode lives on the CLI side: `ssgg onboard encode <json>` writes a decode report
 back into payload bytes (verified byte-identical over the 11,696-byte payload of three factory
@@ -444,7 +513,7 @@ code, `word`, `ms` - the page names the key through the embedded offset table, s
 capture byte by byte. The page composes the key sequence from `actions` (a record with no actions
 says `no keys`); the engine draws a random delay in `[ms, ms+19]`, which the read has never seen.
 
-`Macro records` is a panel under the board. Its head names the span the records fill; per record it
+`Macro records` is a panel of the Details section. Its head names the span the records fill; per record it
 prints the summary line, the interval, the key sequence, the byte and action counts, the action list,
 the raw bytes, and **which key binds it** (`Bound by Meta+Ins`, or `Bound by no key`). Per `0x71` mapping the JSON carries `macro_index` (the record index the
 third code byte names). The key panel's macro select is short on purpose: an option is
@@ -518,7 +587,7 @@ the name matches the file and turns amber with `changed - the file as loaded had
 when it does not; the revert button is disabled until then, and writes back the name the file was
 loaded with (`setProfileName` regenerates `name_hex` with it, so the two cannot disagree). Typing
 updates the indicator and the document and leaves the rest of the page alone - repainting on every
-keystroke would pull the caret out of the field - and the full repaint (board marks, Changes list)
+keystroke would pull the caret out of the field - and the full repaint (board marks, tab change count)
 comes on the field's `change` event. A name over the field's 24 printable ASCII bytes is refused
 with that sentence in the status line and leaves the document alone. Saving writes the name with
 the rest of the JSON.

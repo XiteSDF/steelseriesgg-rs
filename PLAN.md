@@ -180,6 +180,12 @@ Still open:
   `1..=8`); the read's bytes for keys 3 and 7 (`0x03`, `0x07`) are the button number written raw, which that
   converter rejects, so the panels print the byte beside the names. Editing stays GUI-only and `encode` still
   refuses a list that is not the block's own bytes, so no macro write has been replayed on hardware.
+- Apex 7 macro modes: the mode byte, action count, repeat count and interval are read out of the engine binary
+  (mode = GG playback type + 1, accepted `1..=5`; the repeat pair is used by modes 2, 3, 4 only), in
+  `docs/development/apex-7-gg-capture.md`. Nothing implemented, by user decision 2026-10-28. Recorded there too:
+  three codec rules are looser than GG's - `MACRO_MODE_MAX` is 8 where GG accepts `1..=5`, `macro_mode_name` names
+  only modes 1 and 4, and `macro_action_at` takes keyboard page 1 only, so a media-key action (page `0xc`) is not
+  decoded. Open is naming the five modes, see P8.
 - Skipped on purpose: Sarhan engine/control API (`src/engine`, good token and Host-check design to copy), PipeWire
   mixer, rebranding; Jaime Electron app, native PipeWire RPC service (unconditional `pipewire`/`libspa`
   deps), Snap/.deb, `apex_gen3.rs` (duplicates `0x1642`), branding.
@@ -189,6 +195,32 @@ Still open:
 Nothing below has run on a device. Ask whoever owns the device; record device, firmware and date; promote a status
 only per `.claude/rules/experimental-protocol.md`.
 
+- **[GG stopped, no device]** Apex 7 (`0x1612`) macro mode labels: read the `locale` row of the
+  `application_settings` table in `C:\ProgramData\SteelSeries\GG\apps\engine\db\database.db` - the GG front end
+  pushes its label table there, and the engine binary, `SSEdevice.dll` and the firmware carry none (see
+  `docs/development/apex-7-gg-capture.md`).
+- **[HW, owner, GG stopped, read-only]** Apex 7 (`0x1612`) OLED illumination bytes: read a slot, change one OLED
+  setting on the board's own menu (`DISPLAY` -> `BRIGHTNESS` first, then `DISPLAY ICONS`, then `TIMEOUT`), read the
+  slot again, and report which of the six bytes at payload offset 27 moved and to what value. GG's UI has no OLED
+  option beyond the image upload (operator-reported 2026-10-23), so the board's menu is the control surface. The
+  live board reads `02 00 00 00 00 00` and the stock slot `00 02 00 00 00 00` (see
+  `docs/development/apex-7-gg-capture.md`). Record device, firmware and date.
+- **[HW, owner, GG stopped, read-only]** Apex 7 (`0x1612`) key-light idle bytes: set the board's `ILLUMINATION`
+  brightness / dim level and an idle timeout, read the slot, and report which of the dimmer bytes (78, 79) and
+  `idle_timeout_ms` (80) move and to what values. The ladder the board offers is `5 SECS` to `5 HOURS` plus
+  `NONE` / `NEVER`, so the values to expect are 0, 5000, 10000, 30000, 60000, 300000, 600000, 900000, 1800000,
+  2700000, 3600000, 7200000, 10800000, 18000000.
+- **[HW, owner, GG stopped]** Apex 7 (`0x1612`) OLED picture upload: pick a BMP in the profile GUI's
+  *Upload a BMP* row, save the JSON, `ssgg onboard write`, and report whether the panel paints the picture.
+  The bytes travel the verified `encode` path, and only GG's own bytes were ever replayed on a board (see
+  `docs/development/apex-7-gg-capture.md`), so an arbitrary uploaded picture has never been on hardware.
+- **[HW, owner, GG stopped]** Apex 7 (`0x1612`) hand-painted OLED picture: paint a few pixels with the GUI's
+  white and black brushes, save the JSON, `ssgg onboard write`, and report which pixels the panel lights (the
+  bit order is confirmed on hardware, a hand-built picture is not).
+- **[HW, owner, GG stopped]** Apex 7 (`0x1612`) macro modes: fill the UI label of each of the five modes from the
+  session that made the five mouse macros on number row `3` to `7` (the table in
+  `docs/development/apex-7-gg-capture.md`), then bind a key to the mode-5 macro and report whether it plays while
+  held, on release, or once. Record device, firmware and date.
 - **[HW, owner, GG stopped]** Apex Pro TKL 2023 `0x1628`: `rgb color 00FF00`, `rgb brightness 50` then `100` (frame
   dims and restores?), then `rgb color` again in a new run (full brightness: known limit).
 - **[HW, outside]** Apex 3 TKL `0x1622` (#173/#257): `ssgg -d rgb color FF0000`, `rgb off`, `rgb brightness 50` with the
@@ -201,6 +233,76 @@ only per `.claude/rules/experimental-protocol.md`.
 ---
 
 ## Done or dropped (do not redo)
+
+- No file of the repo references a capture taken off the operator's board (2026-10-23). The GUI suite builds its
+  own fixtures: the OLED checks run on the stock decode with a synthetic 5,120-byte bitmap, the macro checks run on
+  a decode the suite packs itself (five 28-byte records at binding bytes 0, 7, 14, 21, 28, plus bytes the record
+  grammar rejects), and the META mask check measures the rule on the tracked fixtures with a binding the suite makes.
+  `tools/profile-gui/app.js` names no capture in its comments, and `.gitignore` keeps a root dump out of
+  `git add`. The real captures stay outside the repo, read by the operator, and the suite runs whole in a clean
+  checkout (234/236, the 2 failures are the product-table drift).
+
+- Apex 7 OLED control surface (2026-10-23, operator-reported): GG's Apex 7 front end offers **only** the OLED image
+  upload - no OLED brightness, sleep or icon choice. Those are the keyboard's own menu's settings (`DISPLAY` ->
+  `BRIGHTNESS`, `DISPLAY ICONS`, `TIMEOUT`, matching the 4.16.8 firmware's string pool), so the six bytes at payload
+  offset 27 are board-side settings the profile carries, not GG settings written into it. Nothing in the crate edits
+  them: a decoded payload writes back byte-for-byte. Read-out tracked in the list above.
+
+- GUI Lighting-block notes (2026-10-23): the four option rows say what is known. `hexFieldRow` gained an optional
+  note argument appended to its tooltip line, and the OLED six bytes, both dimmer bytes and the idle timeout now
+  render a `.line-note` naming the values the shipped captures read, that no engine-binary or firmware word names
+  the six fields, and the firmware's timeout ladder with the ms values it implies. Labels and notes only - no
+  behaviour change, no protocol status changed.
+
+- Apex 7 firmware package 4.16.8 read out of the Ghidra project (2026-10-23): the update payload is a container -
+  header of `(id, offset, size)` triples, app image at `0x1000` (`0x1d000`, vector table there, initial SP
+  `0x2000c000`), a second app copy at `0x1e000`, the five `0x020N` profile slots at `0x3b000 + 0x8000*n`
+  (`0xa000` each) and the five `0x030N` blocks at `0x6d000 + 0x5000*n` (`0x5000` each), **all of them zero in the
+  shipped image**, so nothing decodes from them. The app image's 92-entry string pool at `0x1599b..0x15d61` is the
+  board's own menu text and names the options the keyboard offers: `ILLUMINATION` with `PRESETS` / `CUSTOM` /
+  `BRIGHTNESS` and the effect names, `DISPLAY` with `DISPLAY ICONS` / `TIMEOUT` / `BRIGHTNESS`, and the timeout
+  ladder `5 SECS` to `5 HOURS` plus `NONE` / `NEVER` - the ladder `idle_timeout_ms` carries. No pointer in the
+  package points into the pool (the menu code reaches it PC-relative), the firmware's code is not analysed, and the
+  six bytes at payload offset 27 are still unnamed. Written up in `docs/development/apex-7-gg-capture.md`.
+
+- GUI panel layout: Rapid Tap and Lighting directly under the board, the rest under a Details heading
+  (2026-10-24): `panelPlan` returns `inspector` / `primary` / `details` instead of one `below` list - `primary`
+  is the Rapid Tap block then the Lighting block (the two edits whose effect the caps show), `details` is the
+  file panel, Custom bindings and Macro records. `index.html` gained the `#detailsBox` section (hidden while no
+  file is open, with its own `Details` heading and note) and `#detailsPanels`, `main.js` mounts both, `render()`
+  fills `ui.below` with `primary` and `ui.details` with `details` and toggles the section. Two `selftest.mjs`
+  checks (the plan's shape and panel order, the mounted layout with the section hidden for no file) and the
+  three plan checks re-pointed at the new shape. GUI-side only, no protocol status changed.
+- GUI: no Changes panel, the revert moved to the tab row (2026-10-24): the panel that listed every changed
+  path is gone (`renderChangesPanel`, `summarizeChanges` and the `ul.changes` CSS deleted), and the undo for a
+  whole profile is one button at the right end of the tab row. `revertFile` clones `file.original` back over
+  the open file; the tab marks it `name.json *N` with the `fileChanges` count, and the button is disabled while
+  the file is clean and named `Revert name.json (N changes)` when it is not. Two `selftest.mjs` checks (the
+  revert restores the JSON in the same slot, clears the board marks and is idempotent; the tab label, the
+  spacer, the disabled states, the status line), the panels-render check now asserts no panel is titled
+  `Changes`, and the prose that pointed at the Changes list points at the tab count. GUI-side only, no
+  protocol status changed.
+- GUI OLED revert and one-row control bar (2026-10-24): the OLED panel's brushes, `Revert the OLED block`,
+  `Set all black`, `Invert every pixel` and the BMP file input now share the panel's single `Paint` row above the
+  paint stage, with one note spelling out what each control does. `revertOledBlock` copies the `oled` object the
+  file was loaded with over the current one - summary fields included, because those describe the bytes being
+  restored - so one button undoes every control in the row, and `oledBlockDiffers` disables it while the block
+  already matches the file as loaded. Two new `selftest.mjs` checks (the row holds all of them; the revert
+  restores the bytes, summary fields and change list, closes an open stroke and is disabled when clean) and the
+  invert and upload checks re-pointed at the merged row. GUI-side only, no protocol status changed.
+- GUI OLED pixel editor (2026-10-24): the panel paints
+  lights the pixel, black turns it off - on a stage under the picture, so the click coordinates are the bitmap's
+  own (`OLED_PAINT_SCALE`), a drag paints the Bresenham line between the points it reports, a right-button press
+  and an out-of-range click paint nothing, and the write goes through `setOledBitmap` like every other OLED edit.
+  `applyOledPixels` / `applyOledPaint` / `oledLine` / `oledPixelAtEvent` in `app.js`, five `selftest.mjs` checks.
+  GUI-side only, no protocol status changed.
+- GUI OLED BMP upload (2026-10-24): `tools/profile-gui/README.md` has documented `decodeBmp` and an
+  "Upload a BMP" row since the page was committed, and `app.js` never had either - the row was added in the
+  invert commit and the decoder was not. Implemented in `app.js` (`decodeBmp`, `bmpColor`,
+  `bmpToOledBytes`, `applyBmpBytes`, `applyBmpFile`) with the panel's file input and the status line, and
+  covered by eight `selftest.mjs` checks (header and palette decode, refusals, nearest-neighbour sampling,
+  the 128/255 threshold, the summary fields, the panel row, the FileReader path). GUI-side only: the Rust
+  codec still carries the block byte-for-byte and no protocol status changed.
 
 - Device registration (#276): superseded on `feat/backlog-2026-10`, which implements all three devices as
   `[EXPERIMENTAL]` (the Aerox 9 skip is lifted by user decision 2026-10-21). `0x2290` is now the detect-only one.

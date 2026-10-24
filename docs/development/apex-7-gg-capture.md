@@ -11,7 +11,8 @@ and written back to one**, and a write carries those bytes verbatim. The only pa
 interprets is the *inside* of the 9,600-byte macro block: the engine declares it an opaque byte array and a
 write sends those bytes back unchanged, and the macro-record grammar in this document is `[EXPERIMENTAL]` and is
 used for reporting only. The GUI converts the OLED block between its bytes and a drawn picture (draw, clear,
-invert, PNG export). The same
+invert, PNG export, an *Upload a BMP* control that turns a picture into those 640 bytes, a per-pixel paint
+editor with white and black brushes, and a revert that puts the block back as the file was loaded with it). The same
 protocol covers the
 other Apex keyboards of this legacy platform - the engine's protocol file is written per platform, not per
 model - and `discovery::keyboard_class` enables it on the one board that was measured, leaving the rest
@@ -193,9 +194,16 @@ Schema A is 11,648 bytes and schema B is 11,696; they share every offset below e
 the field as a `bytearray` and parses nothing inside it. The conversion between those bytes and a picture exists
 only in `tools/profile-gui`: it rasterises 128×40 monochrome pixels (8 px per byte, 16 bytes per row, bit 7 of
 each byte the left pixel) for the drawn screen, the Clear / Invert controls and the PNG export, and writes a
-bitmap back into the same JSON field. **That geometry and bit order are confirmed on an Apex 7 (`0x1612`)**: the
-operator took the image GG paints on the panel, decoded it into bytes, and read those bytes back from the
-keyboard as the block; writing them back paints that picture. Nothing in the Rust codec rasterises.
+bitmap back into the same JSON field: `decodeBmp` reads a BMP (`BI_RGB` at 1, 4, 8, 24 and 32 bpp, top-down rows,
+32 bpp `BI_BITFIELDS` with the plain masks, RLE / embedded JPEG / embedded PNG / 16 bpp refused), samples it to
+128×40 by nearest neighbour and lights a pixel at 128/255 or above. The panel also paints single pixels into
+the same field with two brushes (white lights the bit, black turns it off), writing through the same
+`setOledBitmap` path. **That geometry and bit order are confirmed on
+an Apex 7 (`0x1612`)**: the operator took the image GG paints on the panel, decoded it into bytes, and read
+those bytes back from the
+keyboard as the block; writing them back paints that picture. Nothing in the Rust codec rasterises, and no
+arbitrary uploaded picture has been put on a board - the bytes an upload produces travel the same verified
+`encode` path as the bytes a read produced, and that is the claim, not the picture.
 
 Lighting block (offsets inside payload):
 
@@ -225,19 +233,25 @@ the `[EXPERIMENTAL]` grammar this project derived from it, used when reporting a
 it, it sends the block's own bytes back. Records start with marker `0x77`:
 
 ```
-header  0x77 | mode u8 | header word u16 LE | flags u16 LE | interval u16 LE    (8 bytes)
-press        0x02 | key u8 | 0x01 0x01                                 (4 bytes)
-release      0x02 | key u8 | 0x01 0x00                                 (4 bytes)
-press mouse  0x00 | mask u8 | 0x00 0x01                                (4 bytes)
-release mouse 0x00 | mask u8 | 0x00 0x00                               (4 bytes)
-delay        0x04 | 0x00 | ms u16 LE                                   (4 bytes)
+header  0x77 | mode u8 | action count u16 LE | carried u8 | repeat count u8 | interval u16 LE   (8 bytes)
+press        0x02 | key u8 | page u8 | 0x01                                (4 bytes)
+release      0x02 | key u8 | page u8 | 0x00                                (4 bytes)
+press mouse  0x00 | mask u8 | 0x00 0x01                                   (4 bytes)
+release mouse 0x00 | mask u8 | 0x00 0x00                                  (4 bytes)
+delay        0x04 | 0x00 | ms u16 LE                                      (4 bytes)
 ```
 
-Modes seen: `1` = play once, stepping `interval` ms between actions; `4` = play again every `interval`
-(a mode-4 record with `interval` 5000 presses `4`, which is the META + Insert binding of profile 1). The number-row
-board below carries modes `2`, `3` and `5` as well: `2` and `3` wrap a mouse press in a delay and a release, and `5`
-is a record of a single mouse press with no release. What separates the three is unmeasured - the codec names `1`
-and `4` and reports every other mode as `unknown` (`macro_mode_name`).
+(`header word` is the codec's name for the action count and `flags` its name for the carried byte and the repeat
+count together; the names are the codec's, the fields are GG's - see
+[Macro playback modes](#macro-playback-modes-engine-binary-2026-10-28). The keyboard page byte is 1 for keyboard
+usages and `0xc` for consumer/media usages; the codec's grammar takes 1 only.)
+
+Modes seen: `1`, `2`, `3`, `4`, `5` - GG's playback types `0..4` plus one. Modes `2`, `3` and `4` are the ones GG
+gives the repeat pair (interval + count): the number-row board below carries interval `25 ms` on mode `3`, `30 ms`
+on mode `4` and a count of `69` on mode `2`, and a mode-4 record with interval `5000` presses `4`, which is the
+META + Insert binding of profile 1. Modes `1` and `5` carry the defaults (`1`, `15 ms`) and no repeat pair. The
+codec names `1` "once" and `4` "repeat" and reports every other mode as `unknown` (`macro_mode_name`); the UI label
+of each mode is open.
 
 The mouse actions are what a number-row macro is built from: on a wired `0x1612` read (firmware 4.16.8, schema b,
 2026-10-22) whose number row `3` to `7` is bound to macros, those records press and release mouse masks `0x03`
@@ -270,10 +284,13 @@ position` - names the right records only for the four bindings whose records hap
 at position 4, and `5`, `6`, `7` resolve to records that press the mouse buttons of `3` and `4`. It is superseded.
 One code byte reaches `255`, so a binding names records up to `4 x 255 = 1020` bytes into the block
 (`MACRO_BINDING_REACH_BYTES`); the block's capacity is larger than that reach, and a record packed past it is
-written and read back with no key able to play it. The u16 at record `+2` is **not** a macro id: it equals the record's action count in 13 of the 14 records of
-that read (the 48-action record at 2544 carries 83), and in every record of the wired `Config_1` reads, so the
-codec carries it as `header_word` data and validates only that it is non-zero. The `flags` bytes are `01 01` on every record with actions and `01 00` on
-the header that carries none, and are unexplained (`MACRO_RECORD_FLAGS_KNOWN`).
+written and read back with no key able to play it. The u16 at record `+2` is **the record's action count**, not a
+macro id: GG's own writer stores the number of actions it packed there, and it equals the number of actions in all
+14 records of that read (the longest, at 2544, carries 83 and lists 83). The codec carries it as `header_word`
+data and validates only that it is non-zero. The two bytes at `+4` and `+5` are `01 01` in 13 of the 14 records and
+`00 01` in the one whose only action is a press with no release; `+5` is the repeat count and `+4` is a carried GG
+field - see [Macro playback modes](#macro-playback-modes-engine-binary-2026-10-28) (`MACRO_RECORD_FLAGS_KNOWN`
+lists the pairs the codec has seen).
 
 **Checksum**: the little-endian u32 at the payload tail is the STM32 hardware CRC-32 (poly `0x04C11DB7`, init
 `0xFFFFFFFF`, no input/output reflection, no final XOR) over `payload[0..len-4]` read as little-endian 32-bit
@@ -313,15 +330,129 @@ What is **not** supported, and the limits that go with it:
 - **A binding cannot name every record the block holds.** A byte reaches 1020 bytes into the block; records
   packed deeper than that are decoded, shown in the editor, written back, and unreachable by any key. The editor
   says so on each record past the reach.
-- **Bytes inside a record are unconfirmed.** `flags` is `01 01` in every record with actions and is unexplained;
-  the modes measured are `1`, `2`, `3`, `4` and `5`. The u16 at `+2` is carried as `header_word`: it equals the
-  record's action count in 13 of the 14 records of the read above (the 48-action record carries 83), so it is not
-  an id and the codec validates only that it is non-zero. The binding rule is `[EXPERIMENTAL]`: `offset / 4`, measured
-  on the read named above, and a binding byte no record starts at - `0x00` for an unbound key, and the deleted
-  macro GG leaves behind - decodes as no macro.
+- **Two record fields are now GG-verified, two are not.** The mode byte, the u16 at `+2` (the action count, which
+  is what the engine's writer stores there - `header_word` is that count, not an id, in all 14 records of the read
+  above) and the repeat count and interval are read out of the engine binary; see
+  [Macro playback modes](#macro-playback-modes-engine-binary-2026-10-28). Unconfirmed: the carried byte at `+4`
+  (`flags` is `01 01` in 13 of the 14 records, `00 01` in the one whose only action is a press with no release) and
+  the UI name of each mode. The binding rule is `[EXPERIMENTAL]`: `offset / 4`, measured on the read named above,
+  and a binding byte no record starts at - `0x00` for an unbound key, and the deleted macro GG leaves behind -
+  decodes as no macro.
 - **Macro names are not in the payload.** The name and the macro as GG displays it live in GG's own database
   (`db\database.db`); the payload carries packed records only, which is why the panel labels a record by ordinal,
   mode and action count and not by name.
+
+## Macro playback modes (engine binary, 2026-10-28)
+
+Read out of `SteelSeriesEngine.exe` (current GG, Windows) in Ghidra on 2026-10-28. The functions that move a
+macro between GG's own representation and the board's packed block, both directions:
+
+| Function | Address | What it does |
+|----------|---------|--------------|
+| `pkg/models/macro/convert.libsteelTranslateMacroToOnboard` (`convert_libsteel.go:108`) | `0x1404e05e0` | GG macro + playback options -> board record header and actions |
+| `pkg/models/macro/convert.libsteelMacroMetadataModel` | `0x1404e1620` | tail-calls the writer above |
+| `pkg/models/macro/convert.LibsteelConvertToOnboardMacros` | `0x1404dffc0` | GG bindings -> board: calls the writer per bound key |
+| `pkg/models/macro/convert.libsteelTranslateOnboardToMacro` | `0x1404e21c0` | board record -> GG binding |
+| `pkg/models/macro/convert.libsteelGetMacroDataFromOnboard` | `0x1404e25a0` | board actions -> GG device events |
+| `pkg/device.adjustDeviceEventsForPlaybackOptionsData` (`macro.go:224`) | `0x1404c8120` | playback options -> events for OS-side (non-onboard) macros |
+| `pkg/device.unmarshalPlaybackOptions` | `0x1404c8040` | JSON -> the playback options struct |
+
+**The mode byte is GG's playback type plus one, and it is part of the magic word.** The writer builds the header's
+first word as `0x77 | (type + 1) << 8` - so the block's `77 01`, `77 02`, `77 03`, `77 04`, `77 05` are GG types
+`0, 1, 2, 3, 4`. A type outside `0..=4` is refused with `unknown playback type: %d`; the reader recovers the type
+as `mode - 1` and refuses a mode outside `1..=5` (`unknown onboard playback type: %d`). So the wire mode space is
+exactly `1..=5`: GG writes nothing else and reads nothing else. The reader's magic test is the 24-bit word
+`0x007700`, i.e. the bytes `77 01 00`.
+
+**Header fields** (the writer's own store sequence, 8 bytes, and the reader's uses of them):
+
+| Byte | Field | Engine evidence |
+|------|-------|-----------------|
+| `+0` | `0x77` | low byte of the header word above |
+| `+1` | playback mode `1..=5` | `type + 1` on write, `mode - 1` on read, both range-checked |
+| `+2..+3` | action count, u16 LE | writer stores the number of actions it packed; the reader loops that many 4-byte actions |
+| `+4` | GG playback-options byte, carried | the writer copies the struct byte that sits just before the repeat count and never interprets it; the reader hands it back unchanged. `1` in 13 of the 14 records of the read above, `0` in the one whose only action is a press with no release. `[EXPERIMENTAL]`: carried, not explained |
+| `+5` | repeat count | the writer's playback-options count byte, the same value `adjustDeviceEventsForPlaybackOptionsData` appends as an event for types `1, 2, 3` |
+| `+6..+7` | repeat interval, ms, u16 LE | the writer's playback-options `u16`; the same value the same function appends for types `1, 2, 3` |
+
+The writer checks `offset + 8 + 4*count` against the block capacity before it stores the header and logs an error
+when the record would not fit: a record is `8 + 4*count` bytes, and the block is `macro-data-size` = 9600.
+
+**Which modes use the repeat pair.** `adjustDeviceEventsForPlaybackOptionsData` switches on the playback type:
+for types `1`, `2`, `3` (wire modes `2`, `3`, `4`) it appends two events - device-event function `4` carrying the
+interval in ms and function `5` carrying the count - and for types `0` and `4` (wire modes `1`, `5`) it returns the
+events unchanged. A type outside `0..=4` logs `Playback options data is of an unknown type. Returning default
+events but you should probably add a case for this.` The read above matches: mode `2` carries count `69`, modes
+`3` and `4` carry intervals `25 ms` and `30 ms` with count `1`, and modes `1` and `5` carry the defaults `1` and
+`15 ms`.
+
+**Actions are GG's device events packed to 4 bytes.** The writer takes GG's event tuple - function, usage page,
+code, data - and the function selects the action kind; the reader's switch undoes the same mapping. A function the
+writer has no branch for is refused: `onboard mapping does not support event type %d`.
+
+| Kind | GG function | Bytes `+1..+3` |
+|------|-----------|----------------|
+| `0` | mouse button | `+1` = one-bit mask, `0x01`..`0x80` = mouse 1..8: the writer emits `1 << (code - 1)` and refuses a code outside `1..=8` (`unsupported mouse button press %d direction %d`), the reader recovers `log2(mask) + 1` and rejects any other byte (`invalid mouse code %d`); `+2` = 0; `+3` = 1 press, 0 release |
+| `1` | wheel | `+1` = direction byte (1 up, `0xFF` down, GG's data value); `+2` = 0; `+3` = 1 press, 0 release |
+| `2` | keyboard | `+1` = HID usage (`0xE0`..`0xE7` are the modifier keys themselves); `+2` = usage page, 1 = keyboard and `0xc` = consumer/media, the writer's own rewrite of page 7 to 1 and its check `page in {1, 0xc}`; `+3` = 1 press, 0 release |
+| `4` | delay | u16 LE at `+1` = milliseconds; a delay over 65535 ms is split into several 65535 ms actions by the writer |
+| `7` | mouse press+release pair | `+1` = button number, `+2` = 0, `+3` = 1. The writer's branch leaves byte `+0` **uninitialised** in the frame Ghidra shows, so the kind byte of such an action is whatever the allocation held: `[EXPERIMENTAL]`, no such action appears in the read above |
+| `8` | keyboard press+release pair | written as kind `2` with `+1` = usage, `+2` = page, `+3` = 1 (press only, the release is implicit) |
+| `0xc` | horizontal wheel | `+1` = direction, `+2` = 0; in the writer's switch, not present in the read above |
+
+`libsteelGetMacroDataFromOnboard` walks the block it is handed as a **flat 4-byte action stream** - it never skips
+a record header - so the header grammar above is what the translate path uses, and a block handed to that converter
+raw is parsed as actions from byte 0.
+
+**What is not settled: the UI names of the five modes.** The engine binary carries no name for the enum - the
+labels live in the GG front end - so the table below is filled only as far as the binary and the read go. The read
+above is the operator's own board, whose five mouse macros were each made in GG with a different play mode, so the
+five labels come from that session, not from a new capture:
+
+| Wire mode | GG type | Repeat fields in the read | UI label |
+|-----------|---------|---------------------------|----------|
+| 1 | 0 | defaults only | *to fill* |
+| 2 | 1 | count 69, interval 15 ms | *to fill* |
+| 3 | 2 | count 1, interval 25 ms | *to fill* |
+| 4 | 3 | count 1, interval 30 ms | *to fill* |
+| 5 | 4 | defaults only | *to fill* |
+
+The one structural hint: mode `5` is the mode GG's own event builder does not handle, i.e. a mode only the board
+implements - `play while the key is held` is the standing hypothesis, unconfirmed. The check that settles it is
+behavioural, not byte-level: bind a key to a mode-5 macro and see whether it stops on release.
+
+**Where GG gets the labels: not from anything readable offline.** Searched the string tables of
+`SteelSeriesEngine.exe`, `SSEdevice.dll` and the Apex 7 `4.16.8` firmware image on 2026-10-28: none carries a
+play-mode label (`Play Once`, `Loop`, `Toggle`, `while pressed`, `Repeat` match only log text such as
+`unknown playback type: %d`, Go runtime names, and the firmware's OLED strings `MACROS`, `REMOVE MACRO`,
+`NO MACRO FOUND`). The engine moves a number only: `device.unmarshalPlaybackOptions` (`pkg/device/macro.go:216`)
+unmarshals `{"playbackOptions": <the binding's stored blob>}` and returns `.PlaybackOptions.Type`, the column
+`bindings.playback_options_data`.
+
+The engine's localization service is a mirror of the front end's strings, not their owner
+(`pkg/utils/localization/localization.go:180-274`): `Initialize` registers for `EVENT_APP_SETTING_CHANGED`, and
+`handleEventAppSettingChanged` re-runs `CacheLocalization` when the changed setting key is `locale`;
+`getLocalizationData` calls `GetLocalizedText("locale")`, marshals the returned text and unmarshals it into the
+fixed Go struct `LocaleJsonStruct`; `GetLocalizedText("a.b.c")` splits on `.`, Title-cases each part and walks that
+struct by field name; `GetLocale` decodes the `settings` app setting and falls back to `en_US`. The setting is
+written by the front end through the engine's `setApplicationSetting` handler
+(`pkg/frontend/application_settings_handlers.go:8` -> `config.GetAppSettingStringSetterByKey`, table
+`application_settings`). The label table is data the GG app pushes into the engine.
+
+Cheapest check that can fill the label column - no hardware, no new capture: read the `locale` row of
+`application_settings` in `C:\ProgramData\SteelSeries\GG\apps\engine\db\database.db` with GG stopped. If the front
+end sends the macro UI's strings, the five labels are in that JSON.
+
+**Where the codec is looser than these facts** (recorded 2026-10-28, not changed - the codec is deliberately
+carrying the block through, not validating it as GG does): `MACRO_MODE_MAX` is `8` where GG accepts `1..=5`;
+`macro_mode_name` names mode `1` "once" and mode `4` "repeat" and calls `2`, `3`, `5` unknown, where GG's rule is
+that modes `2, 3, 4` carry the repeat pair and modes `1` and `5` carry none; and the decode walks a record's
+actions by its grammar and ignores the header's action count, which agrees with GG in all 14 records of the read
+above.
+
+One more binding-side fact from the same read: GG writes a **second** binding for the mouse 4 / mouse 8 pair - the
+binding writer swaps the `0xE3` and `0xE7` codes when a flag is set, and the read's mapping table shows the pair
+(two rows naming one record). `[EXPERIMENTAL]`: from the writer's source, matched against the read's rows.
 
 ## Profile write: open (`0x88`), buffer write (`03 00`), push (`0x05`), commit (`0xEB`)
 
@@ -382,13 +513,75 @@ slot back with the read path and diffing the payload (`apex_7_profile::image_dif
   crate computes) and `sample-remap.{bin,json}` (that decode with base remaps written in, the meta colour
   edited, name `Remapped`).
 
+## Apex 7 firmware package 4.16.8 (read from the Ghidra project copy, 2026-10-23)
+
+`firmware-apex-7-v4.16.8.bin` (the update payload GG ships; loaded in Ghidra as `ARM:LE:32:Cortex`,
+base 0, 1 MiB) is a **container**, not a flat image. A header of `(id, offset, size)` triples sits at
+offset 0, then the blocks:
+
+| id | offset | size | what it is |
+|----|--------|------|------------|
+| `0x2` | `0x1000` | `0x1d000` | application image - vector table at `0x1000`, initial SP `0x2000c000` |
+| `0x3` | `0x1e000` | `0x1d000` | second copy of the application image |
+| `0x201`-`0x205` | `0x3b000 + 0x8000*n` | `0xa000` each | the five `0x020N` profile slots, **all zero in the shipped package** |
+| `0x301`-`0x305` | `0x6d000 + 0x5000*n` | `0x5000` each | the five `0x030N` files GG names, **all zero in the shipped package** |
+| `0x9` | `0x86000` | `0x800` | zero |
+| `0xa` | `0x87000` | `0x400` | a table of `id 00 b c` triples (key-matrix data, not illumination) |
+
+Two open questions get shorter: the slot region is `0xa000` = 40,960 bytes, which is the length a write
+pushes (question 1), and the `0x030N` files GG names are a real `0x5000`-byte block per slot in the same
+flash family as the profiles (question 5). Neither carries content in the shipped package, so nothing can
+be decoded from them.
+
+**The board's own menu vocabulary.** The application image carries a 92-entry string pool at
+`0x1599b..0x15d61` - the text the keyboard draws on its 128x40 OLED - with the font's glyph table at
+`0x157c8` (`(u16 offset, u16 width)` pairs) and glyph bitmaps at `0x15700`. No 32-bit word anywhere in
+the package points into the pool, so the menu code reaches it PC-relative. The pool is the menu tree,
+read from the end backwards:
+
+- top level: `ILLUMINATION`, `MACROS`, `ACTUATION`, `DISPLAY`, `ABOUT`, `VERSIONS`, `FACTORY RESET`;
+- `ILLUMINATION` → `PRESETS`, `CUSTOM`, `BRIGHTNESS`, and the effect and state names `FAZE`, `PRISM`,
+  `FULL COLOR`, `BREATHE COLOR`, `BREATHE MULTI`, `RIPPLE`, `LINE`, `FADE`, `LIGHTS OFF`, `OVERWRITE`,
+  `LIST`, `TOGGLE`, `REACTIVE`, `BASE`, `HAZE`, `COAST`, `VAPORS`, `DIMMED`, `DIM`, `ON`, `OFF`, `AFK`,
+  plus the colour names `RED`, `GREEN`, `BLUE`, `WHITE`, `YELLOW`, `PURPLE`, `ORANGE`;
+- `DISPLAY` → `DISPLAY ICONS`, `TIMEOUT`, `BRIGHTNESS`;
+- the timeout ladder as the pool lists it: `5 SECS`, `10 SECS`, `30 SECS`, `1 MIN`, `5 MINS`, `10 MINS`,
+  `15 MINS`, `30 MINS`, `45 MINS`, `1 HOUR`, `2 HOURS`, `3 HOURS`, `5 HOURS`, `NONE`, `NEVER`;
+- config menu: `DE/ACTIVATE CONFIGS`, `CONFIG KEY ACTION`, `SAVE CONFIG`, `LOAD CONFIG`, `RAPID TAP`,
+  `RECORD`, `DELETE`;
+- macro and calibration messages: `RECORDING`, `FINISH:`, `CANCEL:`, `REMOVE MACRO`, `PRESS KEY TO`,
+  `ASSIGNED`, `TO ASSIGN`, `PRESS KEY`, `NO MACRO FOUND`, `OUT OF MEMORY`, `TOO MANY EVENTS`, `ERROR`,
+  `UPDATED`, `DELETED`, `SUCCESS`, `CALIBRATION DONE`, `RECALIBRATING`, `PRESS ALL KEYS`, `PRESS: + I + O`,
+  `UPDATING` (the pool spells it `Updating`), `SteelSeries Apex 7 Recovery`, `NO`, `YES`.
+
+Against the lighting block table above, the board's options line up with the fields at 78, 79 and 80:
+`idle_timeout_ms` takes the ladder (`0` = never, then 5 000, 10 000, 30 000, 60 000, 300 000, 600 000,
+900 000, 1 800 000, 2 700 000, 3 600 000, 7 200 000, 10 800 000, 18 000 000 ms), and the two dimmer
+bytes carry the `DIM`/`BRIGHTNESS` levels. All three captures in this repo read `255, 255, 0` there.
+**The six bytes at 27 stay unnamed, and they are not GG's UI's.** The live board's slot has
+`02 00 00 00 00 00`; the stock slot and the synthetic remap both have `00 02 00 00 00 00`. Nothing in
+`SteelSeriesEngine.exe` names them: the engine binary's only `oled` strings are the GameSense OLED path
+(`shihan_monitoring`, the Apex Pro TKL frame builder) and its only `illumination` strings are the live-colour
+commands (`write_all_illumination`, `reset_all_illumination`); `brightness`, `dimmer` and `icons` do not occur
+at all. The names are GG's lisp spec's, which ships encrypted. GG's Apex 7 front end offers **one** OLED control
+- upload an image to the panel, the bytes this document's OLED section carries - and no OLED brightness, sleep
+or icon choice (operator-reported 2026-10-23). Those are the keyboard's own menu's settings, and the profile
+carries them: the board's `DISPLAY` menu offers `BRIGHTNESS`, `DISPLAY ICONS` and `TIMEOUT`, and setting a
+brightness on the board is enough to move a byte in the slot. That makes the read-out cheap and read-only -
+change one setting on the board, read the slot, diff it. Tracked in `PLAN.md`.
+
 ## Open questions
 
 1. A read collects 12,288 file bytes, however a write pushes 40,960. According to device specs, these should not
-   be read, so the purpose of writes is not clear.
-2. The *meaning* of the bytes inside the macro block: decode and encode carry the block through intact, the
-   engine treats it as an opaque byte array, and a write sends back the bytes a read produced. The macro record
-   split above is `[EXPERIMENTAL]` and is used for reporting only.
+   be read, so the purpose of writes is not clear. The firmware package shows the slot region is `0xa000`
+   (40,960) per slot, so the write length is the whole region; the read path's 12,288 is 12 pulls of 512.
+2. The *meaning* of the bytes inside the macro block: the record header (mode, action count, repeat count and
+   interval) and the action kinds are now read out of the engine binary - see
+   [Macro playback modes](#macro-playback-modes-engine-binary-2026-10-28). Open: the carried byte at `+4`, the UI name
+   of each of the five modes, and whether mode `5` is play-while-held. `decode` and `encode` still carry the block
+   through intact and the record split is `[EXPERIMENTAL]`, used for reporting only.
+   Note too that the engine's own action converter walks the block as a flat 4-byte action stream and does not skip
+   record headers; the record grammar here is what the translate path uses.
 3. Where macros beyond the last five are stored. The keys function for all macros, so the internal memory for
    them must exist, but at the current path it is not read.
 4. A schema `A` payload has never been read on hardware. Both captures are the same firmware and all 241
@@ -398,7 +591,16 @@ slot back with the read path and diffing the payload (`apex_7_profile::image_dif
    they are the per-profile lighting config is GG's naming, not a hardware fact - `ssgg` only ever reads and
    writes `0x020N`, no `0x030N` file has been read on hardware, and nothing decodes one. `ssgg`'s Apex 7
    lighting goes out over the zone commands (`0x21`) from the OpenRGB-era code, not from this capture.
+   The firmware package adds: one `0x5000`-byte block per slot, ids `0x301`-`0x305`, zero-filled in the
+   shipped image, sitting next to the five profile slots.
 6. What `0xF4` does. GG sends it third in its opening chain and the keyboard answers `1`; no engine-side word
    names it, `ssgg` implements nothing for it, and a read completes without the chain. Open too: what driver mode
    does on the device, and the full bytes of the closing frames - `69 00` (OLED off) and `41 00 00` (profile not
    volatile) are inferred from the engine's names.
+7. What the six `oled_illumination_options` bytes at payload offset 27 are. The name is GG's (the lisp spec's);
+   the values are known for three captures and nothing names the fields. GG's Apex 7 UI has no OLED option beyond
+   the image upload (operator-reported 2026-10-23), so these are the board's own `DISPLAY` menu settings -
+   `BRIGHTNESS`, `DISPLAY ICONS`, `TIMEOUT` - carried through the profile, not GG's settings written into it.
+   The read-out is read-only: set one option on the board (brightness is the easiest to see), read the slot, and
+   diff it against a read taken before. `ssgg` never edits these bytes - a decoded payload writes back
+   byte-for-byte - so a profile edit cannot lose them.
