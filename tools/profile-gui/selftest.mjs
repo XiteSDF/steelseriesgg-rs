@@ -16,7 +16,7 @@
 //
 // Every check is a thunk: a check the suite gets wrong fails and the run reaches the summary.
 // Exits non-zero when any check fails.
-import { existsSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import { spawnSync } from 'node:child_process';
 import { installFakeDom, loadApp, loadClassic, document as fakeDocument } from './fake-dom.mjs';
@@ -58,26 +58,17 @@ function ok(label, thunk, detail = () => '') {
     pending.push(result.then((v) => report(label, v === true, detail), (e) => { failed += 1; console.log(`  FAIL ${label} - threw ${e.message}`); }));
     return;
   }
-  if (result === SKIP) {
-    skipped += 1;
-    console.log(`  skip ${label} - needs the profile JSONs in the repo root, which are the operator's captures, not files of the repo`);
-    return;
-  }
   report(label, result === true, detail);
 }
 const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
-// A check can return SKIP: the checks that measure the profile JSONs in the repo root (the operator's
-// captures, which are not committed) skip and say so in a checkout without them.
-const SKIP = 'skip';
 // A check the machine cannot run right now: counted, reported with the reason, and not a failure.
 const skip = (label, reason) => {
   checks += 1;
   skipped += 1;
   console.log(`  skip ${label} - ${reason}`);
 };
-const rootText = (name) => (existsSync(`../../${name}`) ? readFileSync(`../../${name}`, 'utf8') : null);
-// A check that measures the real macro decode runs only when that file is here; without it, skip.
-const okMacros = (label, thunk, detail = () => '') => ok(label, () => (macrosDoc ? thunk() : SKIP), detail);
+// A check that measures the macro decode runs on the list the suite packed above.
+const okMacros = (label, thunk, detail = () => '') => ok(label, thunk, detail);
 const parseExample = (name) => JSON.parse(readFileSync(`${EX}/${name}`, 'utf8'));
 
 // The page keeps one file at a time, so samples are loaded one after another and their docs
@@ -85,11 +76,60 @@ const parseExample = (name) => JSON.parse(readFileSync(`${EX}/${name}`, 'utf8'))
 const remap = app.addFile('sample-remap.json', readFileSync(`${EX}/sample-remap.json`, 'utf8'));
 const apex = remap.file.doc;
 const identityDoc = parseExample('sample-identity.json');
-// The macro checks measure a decode of a real macro run. That file is the operator's (it carries their
-// macros), so it lives in the repo root next to the other captures and is not committed: without it the
-// macro checks skip.
-const macrosText = rootText('sample-macros.json');
-const macrosDoc = macrosText === null ? null : JSON.parse(macrosText);
+// The OLED checks need a block with a picture in it, and the repo ships no capture with one: this is the
+// stock decode with a synthetic 5,120-byte bitmap stamped in (a quiet band of zeros, then a pattern).
+const bitmapDocText = () => {
+  const doc = JSON.parse(JSON.stringify(identityDoc));
+  const bytes = new Uint8Array(app.OLED_BYTES);
+  for (let at = 512; at < bytes.length; at += 1) bytes[at] = (at * 37 + 11) & 0xff;
+  app.setOledBitmap(doc, bytes);
+  return JSON.stringify(doc);
+};
+// The macro checks measure a decode carrying macro records. A capture carries the keystrokes its owner
+// wrote, so the suite packs its own list into the stock decode's macro block: five records of 28 bytes
+// each (a header plus five actions), packed at 0, 28, 56, 84 and 112 bytes into the block - the binding
+// bytes 0, 7, 14, 21 and 28 - with a stray non-record run after them, the way a real GG block leaves
+// bytes the record list cannot walk.
+loadClassic('macros.js');
+const macro = globalThis.SsggMacroEditor;
+const macrosDoc = (() => {
+  const region = { start: macro.REGION_START_B, len: macro.REGION_LEN_B };
+  const mk = (mode, headerWord, intervalMs, actions) => ({
+    mode, header_word: headerWord, flags: macro.RECORD_FLAGS, interval_ms: intervalMs, actions,
+  });
+  const records = macro.packRecords([
+    mk(4, 3, 5000, [macro.makePress(0x04), macro.makePress(0x05), macro.makeDelay(20), macro.makeRelease(0x05), macro.makeRelease(0x04)]),
+    mk(1, 27, 15, [macro.makePress(0x55), macro.makeRelease(0x55), macro.makeDelay(15), macro.makePress(0x56), macro.makeRelease(0x56)]),
+    mk(4, 8, 100, [macro.makePress(0x1e), macro.makeDelay(10), macro.makeRelease(0x1e), macro.makePress(0x1f), macro.makeRelease(0x1f)]),
+    mk(6, 12, 250, [macro.makePressMouse(0x07), macro.makeReleaseMouse(0x07), macro.makeDelay(5), macro.makePressMouse(0x03), macro.makeReleaseMouse(0x03)]),
+    mk(1, 31, 15, [macro.makePress(0x22), macro.makeRelease(0x22), macro.makeDelay(30), macro.makePress(0x23), macro.makeRelease(0x23)]),
+  ], region);
+  const block = new Array(region.len).fill(0);
+  records.forEach((record) => macro.recordRaw(record).split(' ').forEach((word, at) => {
+    block[(record.offset - region.start) + at] = Number.parseInt(word, 16);
+  }));
+  // The bytes the list cannot walk, right after the last record.
+  [0x00, 0x03, 0x00, 0x00].forEach((byte, at) => { block[140 + at] = byte; });
+  const doc = app.cloneDoc(identityDoc);
+  doc.macros = records;
+  doc.macro_data = {
+    offset: region.start,
+    len: region.len,
+    nonzero: block.filter((byte) => byte !== 0).length,
+    head: app.hexOf(block.slice(0, 16)),
+    fnv1a_64: app.fnv1a64(block),
+    bytes_hex: app.hexOf(block),
+  };
+  doc.macro_note = '1 non-zero byte(s) of the block are not records, first at +141';
+  doc.macro_region = {
+    start: region.start,
+    len: region.len,
+    used_bytes: records.reduce((end, record) => Math.max(end, record.offset - region.start + record.record_bytes), 0),
+    free_bytes: region.len - 140,
+    records: records.length,
+  };
+  return doc;
+})();
 
 // --- byte, colour and digest helpers --------------------------------------
 console.log('hex, colour and digest helpers');
@@ -630,7 +670,7 @@ ok('the meta layer edits its own mapping list', () => {
     && app.keyEntry(doc, app.LAYER_BASE, 7).entry.function === app.keyEntry(apex, app.LAYER_BASE, 7).entry.function;
 });
 ok('the change list is empty for an unedited file',
-  () => app.diffAgainst(apex, app.cloneDoc(apex)).length === 0 && app.summarizeChanges([]).length === 0 && app.changeKeyHids([]).size === 0);
+  () => app.diffAgainst(apex, app.cloneDoc(apex)).length === 0 && app.changeKeyHids([]).size === 0);
 ok('an edited binding is tracked as its own changes', () => {
   const doc = app.cloneDoc(apex);
   app.setCode(doc, app.LAYER_BASE, 7, 0, 26);
@@ -651,18 +691,6 @@ ok('the change list names the key a change belongs to', () => {
   const doc = app.cloneDoc(apex);
   app.setCode(doc, app.LAYER_BASE, 7, 0, 26);
   return [...app.changeKeyHids(app.diffAgainst(apex, doc))];
-});
-ok('the change summary groups the edits of the same field together', () => {
-  const doc = app.cloneDoc(apex);
-  app.setCode(doc, app.LAYER_BASE, 7, 0, 26);
-  app.setCode(doc, app.LAYER_BASE, 8, 0, 26);
-  const groups = app.summarizeChanges(app.diffAgainst(apex, doc));
-  return groups.length === 2 && groups.every(([, count]) => count === 2);
-}, () => {
-  const doc = app.cloneDoc(apex);
-  app.setCode(doc, app.LAYER_BASE, 7, 0, 26);
-  app.setCode(doc, app.LAYER_BASE, 8, 0, 26);
-  return app.summarizeChanges(app.diffAgainst(apex, doc));
 });
 ok('a profile name change is tracked together with the hex form the writer needs', () => {
   const doc = app.cloneDoc(apex);
@@ -740,6 +768,114 @@ ok('the app writes a bitmap back into the OLED block', () => {
   app.setOledBitmap(doc, new Array(app.OLED_BYTES).fill(3));
   return app.oledBytes(doc)[0] === 3 && app.oledBytes(doc).length === app.OLED_BYTES;
 });
+// A BMP writer for the upload checks: every file decodeBmp reads is built here, byte for byte, so
+// the suite needs no fixture on disk. Rows are given in file order, which for a positive height is
+// bottom-up (the file's first row is the picture's bottom row).
+const bmpLe16 = (v) => [v & 0xff, (v >> 8) & 0xff];
+const bmpLe32 = (v) => [v & 0xff, (v >> 8) & 0xff, (v >> 16) & 0xff, (v >>> 24) & 0xff];
+const buildBmp = ({ width, height, bits, rows, palette = [], masks = null, compression = 0 }) => {
+  const stride = (((bits * width + 31) >> 5) << 2);
+  const pixels = rows.map((row) => { const line = [...row]; while (line.length < stride) line.push(0); return line; }).flat();
+  const pal = palette.map(([r, g, b]) => [b, g, r, 0]).flat();
+  const maskBytes = masks ? masks.map(bmpLe32).flat() : [];
+  const dib = [bmpLe32(40), bmpLe32(width), bmpLe32(height), bmpLe16(1), bmpLe16(bits), bmpLe32(compression),
+    bmpLe32(0), bmpLe32(0), bmpLe32(0), bmpLe32(palette.length), bmpLe32(0)].flat();
+  const dataAt = 14 + dib.length + maskBytes.length + pal.length;
+  return Uint8Array.from([0x42, 0x4d, ...bmpLe32(dataAt + pixels.length + 14), ...bmpLe32(0), ...bmpLe32(dataAt),
+    ...dib, ...maskBytes, ...pal, ...pixels]);
+};
+// The picture the upload checks sample: 256 x 80 (4x the panel in each axis) with its top-left
+// quadrant white, written bottom-up so the file's rows run from the picture's bottom row.
+const quadrantBmp = (v = 255) => {
+  const rows = [];
+  for (let y = 0; y < 80; y += 1) {
+    const row = [];
+    for (let x = 0; x < 256; x += 1) row.push(x < 128 && y >= 40 ? v : 0, x < 128 && y >= 40 ? v : 0, x < 128 && y >= 40 ? v : 0);
+    rows.push(row);
+  }
+  return buildBmp({ width: 256, height: 80, bits: 24, rows });
+};
+ok('decodeBmp reads a 24 bpp BI_RGB file, bottom-up and top-down', () => {
+  const bottomUp = buildBmp({ width: 2, height: 2, bits: 24, rows: [[255, 255, 255, 0, 0, 0], [0, 0, 0, 255, 255, 255]] });
+  const topDown = buildBmp({ width: 2, height: -2, bits: 24, rows: [[255, 255, 255, 0, 0, 0], [0, 0, 0, 255, 255, 255]] });
+  const a = app.decodeBmp(bottomUp);
+  const b = app.decodeBmp(topDown);
+  // In a bottom-up file the first row on disk is the picture's bottom row, so the top-left pixel
+  // comes from the last row; a negative height flips that.
+  return a.bits === 24 && a.compressionName === 'BI_RGB' && !a.topDown
+    && app.bmpColor(a, 0, 0).join() === '0,0,0' && app.bmpColor(a, 0, 1).join() === '255,255,255'
+    && b.topDown && app.bmpColor(b, 0, 0).join() === '255,255,255' && app.bmpColor(b, 0, 1).join() === '0,0,0';
+}, () => [app.decodeBmp(buildBmp({ width: 2, height: 2, bits: 24, rows: [[0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0]] })).stride]);
+ok('decodeBmp reads the palette it carries and the default palette it does not', () => {
+  const eight = buildBmp({ width: 2, height: 1, bits: 8, rows: [[0, 1]], palette: [[0, 0, 0], [255, 255, 255]] });
+  const one = buildBmp({ width: 8, height: 1, bits: 1, rows: [[0b10000000]] });
+  const four = buildBmp({ width: 2, height: 1, bits: 4, rows: [[0x10]] });
+  const e = app.decodeBmp(eight);
+  const o = app.decodeBmp(one);
+  const f = app.decodeBmp(four);
+  // 1 bpp: bit 7 of a byte is its left pixel, and with no palette index 0 is black, index 1 white.
+  // 4 bpp: the high nibble is the first pixel, and with no palette the 16 indices are a grey ramp.
+  return app.bmpColor(e, 0, 0).join() === '0,0,0' && app.bmpColor(e, 1, 0).join() === '255,255,255'
+    && app.bmpColor(o, 0, 0).join() === '255,255,255' && app.bmpColor(o, 1, 0).join() === '0,0,0'
+    && app.bmpColor(f, 0, 0).join() === '17,17,17' && app.bmpColor(f, 1, 0).join() === '0,0,0';
+}, () => [app.decodeBmp(buildBmp({ width: 8, height: 1, bits: 1, rows: [0] })).palette]);
+ok('decodeBmp takes 32 bpp BI_BITFIELDS with the plain masks and refuses any other layout', () => {
+  const plain = buildBmp({ width: 2, height: 1, bits: 32, compression: 3, masks: [0x00ff0000, 0x0000ff00, 0x000000ff], rows: [[255, 255, 255, 0, 0, 0, 0, 0]] });
+  const d = app.decodeBmp(plain);
+  const plainOk = d.compressionName === 'BI_BITFIELDS' && app.bmpColor(d, 0, 0).join() === '255,255,255';
+  const foreign = buildBmp({ width: 2, height: 1, bits: 32, compression: 3, masks: [0x00f80000, 0x00007e00, 0x0000001f], rows: [[0, 0, 0, 0, 0, 0, 0, 0]] });
+  let refused = '';
+  try { app.decodeBmp(foreign); } catch (error) { refused = error.message; }
+  return plainOk && /masks/.test(refused);
+}, () => app.decodeBmp(buildBmp({ width: 2, height: 1, bits: 32, compression: 3, masks: [0x00ff0000, 0x0000ff00, 0x000000ff], rows: [[0, 0, 0, 0, 0, 0, 0, 0]] })).compressionName);
+ok('decodeBmp refuses RLE, an embedded JPEG or PNG, 16 bpp, a bad magic, a short header and truncated pixels', () => {
+  const cases = [
+    ['BI_RLE8', buildBmp({ width: 2, height: 1, bits: 8, rows: [[0, 0]], compression: 1 }), /BI_RLE8/],
+    ['BI_RLE4', buildBmp({ width: 2, height: 1, bits: 4, rows: [[0]], compression: 2, palette: Array.from({ length: 16 }, (_, i) => [i, i, i]) }), /BI_RLE4/],
+    ['BI_JPEG', buildBmp({ width: 2, height: 1, bits: 24, rows: [[0, 0, 0, 0, 0, 0]], compression: 4 }), /BI_JPEG/],
+    ['BI_PNG', buildBmp({ width: 2, height: 1, bits: 24, rows: [[0, 0, 0, 0, 0, 0]], compression: 5 }), /BI_PNG/],
+    ['16 bpp', buildBmp({ width: 2, height: 1, bits: 16, rows: [[0, 0, 0, 0]] }), /16 bpp/],
+    ['bad magic', Uint8Array.from([0x50, 0x4e, ...new Array(60).fill(0)]), /magic/],
+    ['short header', Uint8Array.from([0x42, 0x4d, ...new Array(20).fill(0)]), /bytes/],
+    ['truncated pixels', buildBmp({ width: 64, height: 40, bits: 24, rows: [[0, 0, 0]] }), /needed for/],
+  ];
+  for (const [label, file, re] of cases) {
+    let message = 'no throw';
+    try { app.decodeBmp(file); } catch (error) { message = error.message; }
+    if (!re.test(message)) { globalThis.lastBmpRefusal = [label, message]; return false; }
+  }
+  globalThis.lastBmpRefusal = cases.map(([label]) => label);
+  return true;
+}, () => globalThis.lastBmpRefusal);
+ok('an upload samples the picture to 128x40 by nearest neighbour and lights at 128/255', () => {
+  const doc = app.cloneDoc(apex);
+  const info = app.applyBmpBytes(doc, quadrantBmp());
+  const bytes = app.oledBytes(doc);
+  // The white quadrant is a quarter of the picture, so it covers the panel's top-left quarter:
+  // rows 0..19 lit in bytes 0..7 (x < 64) and dark from byte 8, rows 20..39 dark throughout.
+  const top = bytes.slice(0, 16 * 20);
+  const bottom = bytes.slice(16 * 20);
+  const geometry = info.source_width === 256 && info.source_height === 80 && info.bits === 24
+    && info.compression === 'BI_RGB' && info.lit === (app.OLED_W / 2) * (app.OLED_H / 2) && info.pixels === app.OLED_W * app.OLED_H;
+  const lit = top.every((byte, i) => byte === (i % 16 < 8 ? 0xff : 0x00)) && bottom.every((byte) => byte === 0);
+  const grey = app.applyBmpBytes(doc, buildBmp({ width: 1, height: 1, bits: 24, rows: [[128, 128, 128]] }));
+  const at128 = (app.oledBytes(doc)[0] & 0x80) === 0x80;
+  app.applyBmpBytes(doc, buildBmp({ width: 1, height: 1, bits: 24, rows: [[127, 127, 127]] }));
+  const at127 = (app.oledBytes(doc)[0] & 0x80) === 0x80;
+  return geometry && lit && at128 && !at127 && grey.threshold === app.OLED_LIT_THRESHOLD;
+}, () => [app.applyBmpBytes(app.cloneDoc(apex), quadrantBmp()), app.oledBytes(app.cloneDoc(apex)).slice(0, 18)]);
+ok('an upload rewrites bytes_hex with its len, nonzero, fnv1a_64 and head', () => {
+  const doc = app.cloneDoc(apex);
+  app.applyBmpBytes(doc, quadrantBmp(128));
+  const bytes = app.oledBytes(doc);
+  const summary = doc.oled.len === app.OLED_BYTES && doc.oled.nonzero === bytes.filter((byte) => byte !== 0).length
+    && doc.oled.fnv1a_64 === app.fnv1a64(bytes) && doc.oled.head === app.hexOf(bytes.slice(0, 16))
+    && doc.oled.bytes_hex === app.hexOf(bytes);
+  // The same bytes survive the JSON round trip the Save writes, and the write path reads them back.
+  const json = JSON.parse(app.serializeDoc(doc));
+  return summary && json.oled.bytes_hex === String(doc.oled.bytes_hex).toUpperCase()
+    && app.oledBytes(json).join() === bytes.join();
+}, () => [app.cloneDoc(apex).oled, JSON.parse(app.serializeDoc(app.cloneDoc(apex))).oled]);
 okMacros('macroRecords lists the records the decoder decoded',
   () => Array.isArray(app.macroRecords(macrosDoc)) && app.macroRecords(identityDoc).length === 0,
   () => [app.macroRecords(macrosDoc).length, app.macroRecords(identityDoc).length]);
@@ -827,11 +963,11 @@ ok('a binding byte with no macro at the offset it names says what it means',
   () => app.macroLine(identityDoc, 7));
 okMacros('the whole macro of a binding is a block of its own, keystroke by keystroke', () => {
   const record = app.macroRecords(macrosDoc)[1];
-  const rows = app.macroDetailRows(macrosDoc, 1);
+  const rows = app.macroDetailRows(macrosDoc, record.index);
   const list = rows.find((node) => node.tagName === 'UL');
   const text = rows.map((node) => node.textContent).join(' ');
   return list !== undefined && list.children.length === (record.actions ?? []).length
-    && text.includes('the whole macro: record #1') && text.includes(`interval ${record.interval_ms} ms`)
+    && text.includes(`the whole macro: record #${record.ordinal}`) && text.includes(`interval ${record.interval_ms} ms`)
     && text.includes('press ') && text.includes(record.raw) && text.includes('Bound by');
 }, () => [app.macroDetailRows(macrosDoc, 1).map((n) => n.tagName), app.macroDetailRows(macrosDoc, 1).map((n) => n.textContent).join(' ').slice(0, 200)]);
 ok('a binding byte naming an offset the block does not hold says there is nothing to show', () => {
@@ -970,7 +1106,7 @@ ok('paintBoard labels each cap with the key and what it is bound to', () => {
 console.log('panels render for a keyboard read, a mouse read and an unlisted product');
 const controls = () => {
   const n = () => globalThis.document.createElement('div');
-  return { tabs: n(), status: n(), board: n(), boardBox: n(), nameBar: n(), inspector: n(), below: n(), legend: n(), fileInput: n(), saveBtn: n(), layerBaseBtn: n(), layerMetaBtn: n() };
+  return { tabs: n(), status: n(), board: n(), boardBox: n(), nameBar: n(), inspector: n(), below: n(), details: n(), detailsBox: n(), legend: n(), fileInput: n(), saveBtn: n(), layerBaseBtn: n(), layerMetaBtn: n() };
 };
 const ctl = controls();
 // main.js mounts the board itself and passes it as the board control.
@@ -1078,7 +1214,7 @@ ok('the wheel entries carry a factory binding measured in the stock read, and th
   const meta = [0, 1].map((i) => app.factoryEntry('wheel_meta_mappings', i));
   if (!eq(base.map((e) => [e.function, e.key_codes]), [[0x61, 'E9 00 00 00'], [0x61, 'EA 00 00 00']])) return false;
   if (!eq(meta.map((e) => [e.function, e.key_codes]), [[0x00, '00 00 00 00'], [0x00, '00 00 00 00']])) return false;
-  const stockDocs = [identityDoc, apex, ...(macrosDoc ? [macrosDoc] : [])];
+  const stockDocs = [identityDoc, apex, macrosDoc];
   for (const doc of stockDocs) {
     for (const [listName, index] of [['wheel_mappings', 0], ['wheel_mappings', 1],
       ['wheel_meta_mappings', 0], ['wheel_meta_mappings', 1]]) {
@@ -1129,21 +1265,25 @@ ok('the wheel entries carry a factory binding measured in the stock read, and th
   app.state.activeId = savedActiveId;
   return wheelResult;
 }, () => JSON.stringify(wheelDebug));
+// Every OLED control sits in the panel's one Paint row: the brushes, the revert, the blank and
+// invert actions, the BMP file input, and the picture (the paint stage) under them.
+const oledToolsRow = (panel) => [...panel.querySelectorAll('div.line')]
+  .find((row) => row.querySelector('.line-label')?.textContent === 'Paint');
+const oledFileInput = (row) => row?.querySelectorAll('input').find((n) => n.getAttribute('type') === 'file') ?? null;
 ok('the OLED panel renders for a read with a bitmap and for one without',
   () => app.renderOledPanel(remap.file) !== undefined && app.renderOledPanel(identityLoad.file) !== undefined
     && app.renderOledPanel(unlisted) !== undefined);
 ok('the OLED panel inverts every pixel, flips every bit, and inverting twice is the identity', () => {
   const suiteFiles = app.state.files;
   const suiteActive = app.state.activeId;
-  const text = rootText('config_1.json');
-  if (text === null) return SKIP;
+  const text = bitmapDocText();
   const file = app.addFile('oled-invert.json', text).file;
   const outcome = withFile(file, () => {
     const doc = file.doc;
     const before = Array.from(app.oledBytes(doc));
     const panel = app.renderOledPanel(file);
     const labels = panel.querySelectorAll('button').map((b) => b.textContent);
-    const row = [...panel.querySelectorAll('div.line')].find((r) => r.querySelector('.line-label')?.textContent === 'Invert');
+    const row = oledToolsRow(panel);
     const note = row.querySelector('.line-note').textContent;
     clickButton(panel, 'Invert every pixel');
     const once = Array.from(app.oledBytes(doc));
@@ -1162,7 +1302,13 @@ ok('the OLED panel inverts every pixel, flips every bit, and inverting twice is 
     const carried = json.oled.bytes_hex === String(doc.oled.bytes_hex).toUpperCase();
     const cond = {
       buttonShown: labels.includes('Invert every pixel') && labels.includes('Set all black'),
-      rowNoInput: row.querySelectorAll('input').length === 0 && row.querySelectorAll('select').length === 0,
+      oneRow: row.querySelectorAll('button').map((b) => b.textContent).includes('Invert every pixel')
+        && row.querySelectorAll('button').map((b) => b.textContent).includes('Set all black')
+        && row.querySelectorAll('button').map((b) => b.textContent).includes('Revert the OLED block')
+        && row.querySelectorAll('button').map((b) => b.textContent).includes('White pixel')
+        && !!oledFileInput(row)
+        && row.querySelectorAll('select').length === 0
+        && [...panel.querySelectorAll('div.line')].filter((r) => r.querySelector('.line-label')?.textContent === 'Invert').length === 0,
       noteRule: note.includes('flips every bit') && note.includes('inverting twice is the identity')
         && note.includes('7 stays the left pixel') && note.includes('no bytes_hex inverts to every pixel lit'),
       flips, summary, pixels, identity, carried,
@@ -1175,9 +1321,7 @@ ok('the OLED panel inverts every pixel, flips every bit, and inverting twice is 
   return outcome;
 }, () => [globalThis.lastInvert, app.renderOledPanel(app.state.files[0]).querySelector('.line-note')?.textContent.slice(0, 80)]);
 ok('inverting a block with no bitmap lights every pixel, and the blank button after it blacks it', () => {
-  const text = rootText('config_1.json');
-  if (text === null) return SKIP;
-  const bare = JSON.parse(text);
+  const bare = JSON.parse(bitmapDocText());
   delete bare.oled.bytes_hex;
   const suiteFiles = app.state.files;
   const suiteActive = app.state.activeId;
@@ -1197,13 +1341,346 @@ ok('inverting a block with no bitmap lights every pixel, and the blank button af
   app.state.activeId = suiteActive;
   return outcome;
 }, () => globalThis.lastInvertEmpty);
-ok('the binding, lighting, Rapid Tap, macro and changes panels render for every read', () => {
+// The upload control is a file input, so the suite drives it with a FileReader stub: the page's own
+// handler reads the picked file as bytes and hands them to applyBmpBytes.
+ok('the OLED panel offers a BMP upload with the accepted layouts spelled out', () => {
+  const text = bitmapDocText();
+  const suiteFiles = app.state.files;
+  const suiteActive = app.state.activeId;
+  const file = app.addFile('oled-upload.json', text).file;
+  const outcome = withFile(file, () => {
+    const panel = app.renderOledPanel(file);
+    const row = oledToolsRow(panel);
+    const input = oledFileInput(row);
+    const note = row?.querySelector('.line-note')?.textContent ?? '';
+    const cond = {
+      input: !!input && input.getAttribute('accept') === '.bmp,image/bmp',
+      label: !!row && row.textContent.includes('Upload a BMP'),
+      noteRule: note.includes('BI_BITFIELDS') && note.includes('BI_JPEG') && note.includes('nearest neighbour')
+        && note.includes('128/255') && note.includes('Only the JSON changes'),
+      blankAndInvertKept: panel.querySelectorAll('button').map((b) => b.textContent).includes('Set all black')
+        && panel.querySelectorAll('button').map((b) => b.textContent).includes('Invert every pixel'),
+    };
+    globalThis.lastOledUploadRow = cond;
+    return Object.values(cond).every(Boolean);
+  });
+  app.state.files = suiteFiles;
+  app.state.activeId = suiteActive;
+  return outcome;
+}, () => globalThis.lastOledUploadRow);
+ok('the upload control writes the picked BMP into the block and says what it did', () => {
+  const text = bitmapDocText();
+  // withFile puts the suite's own files back the moment the panel is built: the upload's own
+  // promise settles at the end of the suite (the module runs to completion before microtasks),
+  // and the checks after this one must not see the file this check loaded.
+  const suiteFiles = app.state.files;
+  const suiteActive = app.state.activeId;
+  const file = app.addFile('oled-upload.json', text).file;
+  app.state.files = suiteFiles;
+  app.state.activeId = suiteActive;
+  return uploadRun(file);
+}, () => globalThis.lastOledUpload);
+async function uploadRun(file) {
+  const panel = withFile(file, () => app.renderOledPanel(file));
+  const row = oledToolsRow(panel);
+  const input = oledFileInput(row);
+  const before = Array.from(app.oledBytes(file.doc));
+  const realFileReader = globalThis.FileReader;
+  // The status line is shared with every other check, and this check's assertions land after them
+  // all, so the suite records what the handler writes to it instead of reading it back later.
+  const writes = [];
+  const status = ctl.status;
+  const textContent = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(status), 'textContent');
+  const feed = (bytes) => {
+    globalThis.FileReader = class {
+      readAsArrayBuffer() { this.result = bytes; this.onload(); }
+    };
+  };
+  const run = (name) => {
+    input.files = [{ name }];
+    input.dispatch('change');
+  };
+  let cond = {};
+  // The handler is a promise chain (read, then apply, then the status line and a repaint, with a
+  // catch for a refused file), so the suite yields a few times to reach the end of it.
+  const settle = async () => { for (let i = 0; i < 5; i += 1) await Promise.resolve(); };
+  try {
+    Object.defineProperty(status, 'textContent', {
+      configurable: true,
+      get() { return textContent.get.call(this); },
+      set(value) { writes.push(String(value)); textContent.set.call(this, value); },
+    });
+    feed(quadrantBmp());
+    run('quadrant.bmp');
+    await settle();
+    const bytes = Array.from(app.oledBytes(file.doc));
+    const top = bytes.slice(0, 16 * 20);
+    const bottom = bytes.slice(16 * 20);
+    cond = {
+      replaced: bytes.join() !== before.join() && bytes.length === app.OLED_BYTES,
+      picture: top.every((byte, i) => byte === (i % 16 < 8 ? 0xff : 0x00)) && bottom.every((byte) => byte === 0),
+      summary: file.doc.oled.len === app.OLED_BYTES
+        && file.doc.oled.nonzero === bytes.filter((byte) => byte !== 0).length
+        && file.doc.oled.fnv1a_64 === app.fnv1a64(bytes)
+        && file.doc.oled.head === app.hexOf(bytes.slice(0, 16)),
+      changeList: app.fileChanges(file).some((change) => change.path === 'oled.bytes_hex'),
+      status: writes.some((line) => line.includes('OLED block replaced from quadrant.bmp')
+        && line.includes('256x80 24 bpp BI_RGB') && line.includes('1280/5120 pixels lit')
+        && line.includes('ssgg onboard write')),
+    };
+    // A file the decoder refuses leaves the block alone and names what it found.
+    const untouched = Array.from(app.oledBytes(file.doc));
+    feed(Uint8Array.from([0x50, 0x4e, ...new Array(60).fill(0)]));
+    run('not-a-bmp.bmp');
+    await settle();
+    cond.refusedUnchanged = Array.from(app.oledBytes(file.doc)).join() === untouched.join()
+      && writes.some((line) => line.includes('BMP refused') && line.includes('magic'));
+  } finally {
+    globalThis.FileReader = realFileReader;
+    delete input.files;
+    delete status.textContent;
+  }
+  globalThis.lastOledUpload = cond;
+  return Object.values(cond).every(Boolean);
+}
+// --- the OLED pixel editor -------------------------------------------------
+// The editor writes one bit per click, so the checks below read the block back and count lit
+// pixels; the paint stage is the pointer target, and its coordinates are the bitmap's own at
+// OLED_PAINT_SCALE (2) device pixels per pixel, so offsetX 40 is column 20.
+const paintRow = oledToolsRow;
+const paintStage = (panel) => paintRow(panel)?.querySelectorAll('div').find((d) => (d.className || '').includes('oled-stage'));
+const brushButton = (panel, label) => panel.querySelectorAll('button').find((b) => b.textContent === label);
+// addFile replaces the suite's file list, so every check that loads a paint fixture puts the
+// suite's own list and brush state back before it returns.
+const paintFixture = (name) => {
+  const files = app.state.files;
+  const activeId = app.state.activeId;
+  const file = app.addFile(name, app.serializeDoc(app.cloneDoc(identityDoc))).file;
+  app.state.files = files;
+  app.state.activeId = activeId;
+  app.setOledBitmap(file.doc, new Array(app.OLED_BYTES).fill(0));
+  return file;
+};
+
+ok('a pixel index names the bit the raster draws, and a line between two pixels is connected', () => {
+  const index = app.oledPixelIndex(3, 1);
+  const bytes = new Array(app.OLED_BYTES).fill(0);
+  bytes[index >> 3] = 1 << (7 - (index & 7));
+  const px = app.oledPixels(bytes);
+  const litInRaster = px[index * 4] === 255 && px[index * 4 + 3] === 255;
+  const flat = app.oledLine(app.oledPixelIndex(0, 0), app.oledPixelIndex(3, 0));
+  const diag = app.oledLine(app.oledPixelIndex(0, 0), app.oledPixelIndex(4, 4));
+  const long = app.oledLine(app.oledPixelIndex(0, 0), app.oledPixelIndex(127, 39));
+  return index === 131 && litInRaster
+    && app.oledPixelXY(index).x === 3 && app.oledPixelXY(index).y === 1
+    && app.oledPixelIndex(128, 0) === null && app.oledPixelIndex(-1, 0) === null
+    && flat.join() === [0, 1, 2, 3].join()
+    && diag.join() === [0, 129, 258, 387, 516].join()
+    && long.length === new Set(long).size && long[0] === 0 && long[long.length - 1] === app.OLED_W * app.OLED_H - 1
+    && long.every((i) => Number.isInteger(i) && i >= 0 && i < app.OLED_W * app.OLED_H);
+}, () => [app.oledPixelIndex(3, 1), app.oledLine(0, 3), app.oledLine(app.oledPixelIndex(0, 0), app.oledPixelIndex(4, 4)).length]);
+
+ok('the white brush lights a pixel and the black brush turns it off, and repainting changes nothing', () => {
+  const zero = new Array(app.OLED_BYTES).fill(0);
+  const white = app.applyOledPixels(zero, [0, 1, 8], 'white');
+  const again = app.applyOledPixels(white.bytes, [0, 1], 'white');
+  const back = app.applyOledPixels(white.bytes, [0, 1], 'black');
+  const off = app.applyOledPixels(zero, [0], 'black');
+  return white.bytes[0] === 0xc0 && white.bytes[1] === 0x80 && white.changed === 3 && white.lit === 3
+    && again.changed === 0 && again.lit === 3
+    && back.bytes[0] === 0x00 && back.bytes[1] === 0x80 && back.changed === 2 && back.lit === 1
+    && off.changed === 0 && off.lit === 0
+    && zero.every((byte) => byte === 0);
+}, () => [app.applyOledPixels(new Array(app.OLED_BYTES).fill(0), [0, 1, 8], 'white').bytes.slice(0, 2)]);
+
+ok('painting writes the block and the summary fields the dump records with it', () => {
+  const file = paintFixture('oled-paint-fields.json');
+  const doc = file.doc;
+  const line = app.oledLine(app.oledPixelIndex(0, 0), app.oledPixelIndex(127, 39));
+  const info = withFile(file, () => app.applyOledPaint(doc, line, 'white'));
+  const bytes = app.oledBytes(doc);
+  return info.changed === line.length && info.lit === line.length && info.pixels === app.OLED_W * app.OLED_H
+    && (bytes[0] & 0x80) === 0x80 && (bytes[app.OLED_BYTES - 1] & 1) === 1
+    && doc.oled.len === app.OLED_BYTES
+    && doc.oled.nonzero === bytes.filter((byte) => byte !== 0).length
+    && doc.oled.fnv1a_64 === app.fnv1a64(bytes)
+    && doc.oled.head === app.hexOf(bytes.slice(0, 16))
+    && app.fileChanges(file).some((change) => change.path === 'oled.bytes_hex');
+}, () => [app.oledBytes(paintFixture('oled-paint-detail.json')).filter((b) => b !== 0).length]);
+
+ok('every OLED control sits in the one Paint row, above the paint stage', () => {
+  const panel = withFile(identityLoad.file, () => app.renderOledPanel(identityLoad.file));
+  const row = paintRow(panel);
+  const labels = row ? row.querySelectorAll('button').map((b) => b.textContent) : [];
+  const note = row?.querySelector('.line-note')?.textContent ?? '';
+  return !!row && !!paintStage(panel)
+    && ['White pixel', 'Black pixel', 'Revert the OLED block', 'Set all black', 'Invert every pixel'].every((b) => labels.includes(b))
+    && row.textContent.includes('Upload a BMP') && !!oledFileInput(row)
+    && row.querySelectorAll('div').some((d) => (d.className || '').includes('oled-tools'))
+    && note.includes('bytes_hex') && note.includes('ssgg onboard write') && note.includes('never a keyboard')
+    && note.includes('nearest neighbour') && note.includes('inverting twice is the identity')
+    && note.includes('BI_BITFIELDS') && note.includes('disabled while the block already matches')
+    && note.includes(String(app.OLED_W)) && note.includes(String(app.OLED_H))
+    && [...panel.querySelectorAll('div.line')].filter((r) => r.querySelector('.line-label')?.textContent === 'Paint').length === 1;
+}, () => {
+  const panel = withFile(identityLoad.file, () => app.renderOledPanel(identityLoad.file));
+  return [paintRow(panel)?.querySelectorAll('button').map((b) => b.textContent), [...panel.querySelectorAll('div.line')].map((r) => r.querySelector('.line-label')?.textContent)];
+});
+
+ok('a click paints the pixel under the pointer, a drag paints the line, and the brush switches', () => {
+  const file = paintFixture('oled-paint.json');
+  const paintState = app.state.oledPaint;
+  app.state.oledPaint = { mode: 'white', stroke: false, last: null };
+  const lit0 = app.oledLitPixels(app.oledBytes(file.doc));
+  const status = ctl.status;
+  const statusBefore = status.textContent;
+  let cond = {};
+  try {
+    const stage = paintStage(withFile(file, () => app.renderOledPanel(file)));
+    stage.dispatch('mousedown', { offsetX: 4, offsetY: 4, button: 2 });
+    cond.rightButton = app.oledLitPixels(app.oledBytes(file.doc)) === lit0;
+    stage.dispatch('mousedown', { offsetX: 4, offsetY: 4, button: 0 });
+    stage.dispatch('mousemove', { offsetX: 40, offsetY: 4, button: 0 });
+    stage.dispatch('mouseup', { offsetX: 40, offsetY: 4, button: 0 });
+    const litWhite = app.oledLitPixels(app.oledBytes(file.doc));
+    cond.clickPaints = litWhite > lit0;
+    cond.dragLine = litWhite - lit0 === 19;
+    cond.strokeClosed = app.state.oledPaint.stroke === false && app.state.oledPaint.last === null;
+    cond.status = status.textContent.includes('OLED painted with the white brush')
+      && status.textContent.includes(`${app.OLED_W * app.OLED_H} lit`)
+      && status.textContent.includes('ssgg onboard write')
+      && status.textContent !== statusBefore;
+    clickButton(withFile(file, () => app.renderOledPanel(file)), 'Black pixel');
+    cond.brushSwitch = app.state.oledPaint.mode === 'black'
+      && (brushButton(withFile(file, () => app.renderOledPanel(file)), 'Black pixel').className || '').includes('active')
+      && !(brushButton(withFile(file, () => app.renderOledPanel(file)), 'White pixel').className || '').includes('active');
+    const erase = paintStage(withFile(file, () => app.renderOledPanel(file)));
+    erase.dispatch('mousedown', { offsetX: 4, offsetY: 4, button: 0 });
+    erase.dispatch('mousemove', { offsetX: 40, offsetY: 4, button: 0 });
+    erase.dispatch('mouseleave', {});
+    cond.blackErase = app.oledLitPixels(app.oledBytes(file.doc)) === lit0;
+    const oob = paintStage(withFile(file, () => app.renderOledPanel(file)));
+    oob.dispatch('mousedown', { offsetX: 9999, offsetY: 9999, button: 0 });
+    cond.outOfBounds = app.oledLitPixels(app.oledBytes(file.doc)) === lit0;
+  } finally {
+    app.state.oledPaint = paintState;
+  }
+  globalThis.lastOledPaint = cond;
+  return Object.values(cond).every(Boolean);
+}, () => [globalThis.lastOledPaint, ctl.status.textContent]);
+
+ok('the revert button puts the block back as the file was loaded, and is disabled when nothing changed', () => {
+  const suiteFiles = app.state.files;
+  const suiteActive = app.state.activeId;
+  const file = app.addFile('oled-revert.json', app.serializeDoc(app.cloneDoc(identityDoc))).file;
+  app.state.files = suiteFiles;
+  app.state.activeId = suiteActive;
+  const originalBytes = Array.from(app.oledBytes(file.original));
+  const paintState = app.state.oledPaint;
+  app.state.oledPaint = { mode: 'white', stroke: false, last: null };
+  const status = ctl.status;
+  const revertOf = () => oledToolsRow(withFile(file, () => app.renderOledPanel(file)))
+    .querySelectorAll('button').find((b) => b.textContent === 'Revert the OLED block');
+  let cond = {};
+  try {
+    cond.cleanDisabled = revertOf().getAttribute('disabled') === 'true' && app.oledBlockDiffers(file) === false;
+    clickButton(withFile(file, () => app.renderOledPanel(file)), 'Set all black');
+    cond.blanked = app.oledBytes(file.doc).every((byte) => byte === 0);
+    cond.dirtyShown = app.oledBlockDiffers(file) === true && revertOf().getAttribute('disabled') === null;
+    app.state.oledPaint.stroke = true;
+    app.state.oledPaint.last = 7;
+    clickButton(withFile(file, () => app.renderOledPanel(file)), 'Revert the OLED block');
+    const now = Array.from(app.oledBytes(file.doc));
+    cond.restored = now.join() === originalBytes.join();
+    cond.summary = file.doc.oled.len === app.OLED_BYTES
+      && file.doc.oled.nonzero === now.filter((byte) => byte !== 0).length
+      && file.doc.oled.fnv1a_64 === app.fnv1a64(now)
+      && file.doc.oled.head === app.hexOf(now.slice(0, 16));
+    cond.noOledChanges = app.fileChanges(file).every((change) => !change.path.startsWith('oled'));
+    cond.strokeClosed = app.state.oledPaint.stroke === false && app.state.oledPaint.last === null;
+    cond.status = status.textContent.includes('OLED block reverted') && status.textContent.includes('ssgg onboard write');
+    cond.cleanAgain = revertOf().getAttribute('disabled') === 'true';
+  } finally {
+    app.state.oledPaint = paintState;
+  }
+  globalThis.lastOledRevert = cond;
+  return Object.values(cond).every(Boolean);
+}, () => globalThis.lastOledRevert);
+
+ok('reverting a file puts back the JSON it was loaded with, in the same slot of the file list', () => {
+  const suiteFiles = app.state.files;
+  const suiteActive = app.state.activeId;
+  const file = app.addFile('revert-me.json', app.serializeDoc(app.cloneDoc(apex))).file;
+  const outcome = withFile(file, () => {
+    app.setCode(file.doc, app.LAYER_BASE, 7, 0, 26);
+    app.setCode(file.doc, app.LAYER_META, 8, 0, 26);
+    app.setProfileName(file.doc, 'Renamed');
+    app.setOledBitmap(file.doc, new Array(app.OLED_BYTES).fill(255));
+    const edited = app.fileChanges(file);
+    const roots = new Set(edited.map((c) => c.path.replace(/\[\d+\]/g, '[]').split('.')[0]));
+    const reverted = app.revertFile(file);
+    const cond = {
+      edited: edited.length === 10 && roots.has('button_mappings[]') && roots.has('button_meta_mappings[]')
+        && roots.has('name') && roots.has('name_hex') && roots.has('oled'),
+      boardMarks: app.changeKeyHids(edited).size === 2,
+      slot: app.state.files.length === 1 && app.state.files[0].id === file.id,
+      clean: app.fileChanges(app.activeFile()).length === 0 && app.changedFiles().length === 0,
+      equalsOriginal: JSON.stringify(reverted.doc) === JSON.stringify(file.original),
+      boardClean: app.changeKeyHids(app.fileChanges(reverted)).size === 0,
+      twice: JSON.stringify(app.revertFile(file).doc) === JSON.stringify(file.original),
+    };
+    globalThis.lastRevertFile = cond;
+    return Object.values(cond).every(Boolean);
+  });
+  app.state.files = suiteFiles;
+  app.state.activeId = suiteActive;
+  return outcome;
+}, () => globalThis.lastRevertFile);
+ok('the tab row marks an edited file and carries the revert at its right end', () => {
+  const suiteFiles = app.state.files;
+  const suiteActive = app.state.activeId;
+  const file = app.addFile('tab-revert.json', app.serializeDoc(app.cloneDoc(apex))).file;
+  const outcome = withFile(file, () => {
+    app.renderTabs();
+    const cleanTabs = ctl.tabs.querySelectorAll('button.tab').map((b) => b.textContent);
+    const cleanBtn = ctl.tabs.querySelectorAll('button.tab-revert')[0];
+    const cleanLabel = cleanTabs.join() === 'tab-revert.json' && cleanBtn.getAttribute('disabled') === 'true'
+      && cleanBtn.textContent === 'Revert this file' && ctl.tabs.querySelectorAll('span.tabs-spacer').length === 1;
+    app.setCode(file.doc, app.LAYER_BASE, 7, 0, 26);
+    app.renderTabs();
+    const tabs = ctl.tabs.querySelectorAll('button.tab').map((b) => b.textContent);
+    const btn = ctl.tabs.querySelectorAll('button.tab-revert')[0];
+    const editedLabel = tabs.join() === 'tab-revert.json *2'
+      && btn.getAttribute('disabled') === null && btn.textContent === 'Revert tab-revert.json (2 changes)';
+    btn.dispatch('click');
+    const after = ctl.tabs.querySelectorAll('button.tab').map((b) => b.textContent);
+    const afterBtn = ctl.tabs.querySelectorAll('button.tab-revert')[0];
+    const cond = {
+      cleanLabel,
+      editedLabel,
+      reverted: after.join() === 'tab-revert.json' && app.fileChanges(app.activeFile()).length === 0
+        && app.changedFiles().length === 0,
+      disabledAgain: afterBtn.getAttribute('disabled') === 'true' && afterBtn.textContent === 'Revert this file',
+      status: ctl.status.textContent.includes('reverted to the JSON it was loaded with')
+        && ctl.status.textContent.includes('save a copy'),
+      oneButtonPerRow: ctl.tabs.querySelectorAll('button.tab-revert').length === 1,
+    };
+    globalThis.lastTabRevert = cond;
+    return Object.values(cond).every(Boolean);
+  });
+  app.state.files = suiteFiles;
+  app.state.activeId = suiteActive;
+  return outcome;
+}, () => globalThis.lastTabRevert);
+
+const planTitles = (plan) => [...plan.primary, ...plan.details].map((p) => p.querySelector('h2')?.textContent);
+ok('the binding, lighting, Rapid Tap and macro panels render for every read, and no panel lists changes', () => {
   for (const file of [remap.file, identityLoad.file, mouseFile, unlisted]) {
     app.renderBindingsPanel(file);
     app.renderLightingPanel(file);
     app.renderRapidTapPanel(file);
     app.renderMacrosPanel(file);
-    app.renderChangesPanel(file);
+    if (planTitles(app.panelPlan(file)).includes('Changes')) return false;
   }
   return true;
 });
@@ -1220,24 +1697,35 @@ ok('the key panel renders for a key with no mapping offset', () => {
   app.renderKeyPanel(remap.file);
   return true;
 });
-ok('the panel plan lists the change list, the inspector and the panels below the board', () => {
+ok('the panel plan lists the change list, the inspector, the two blocks under the board and the details', () => {
   app.state.selected = app.LAYOUT[5].hid;
   const plan = app.panelPlan(remap.file);
-  return Array.isArray(plan.changes) && Array.isArray(plan.inspector) && plan.inspector.length >= 1 && Array.isArray(plan.below) && plan.below.length >= 3;
-}, () => Object.keys(app.panelPlan(remap.file)));
+  const keys = Object.keys(plan).sort().join();
+  return keys === 'changes,details,inspector,primary'
+    && Array.isArray(plan.changes) && plan.inspector.length === 1
+    && plan.primary.length === 2
+    && /^Rapid Tap/.test(plan.primary[0].querySelector('h2').textContent)
+    && /^Lighting/.test(plan.primary[1].querySelector('h2').textContent)
+    && plan.details.length === 3
+    && /^File: /.test(plan.details[0].querySelector('h2').textContent)
+    && plan.details[1].querySelector('h2').textContent === 'Custom bindings'
+    && /^Macro records/.test(plan.details[2].querySelector('h2').textContent)
+    && !planTitles(plan).includes('Changes');
+}, () => [Object.keys(app.panelPlan(remap.file)), planTitles(app.panelPlan(remap.file))]);
 ok('the panel plan has no wheel panel: a wheel cap edits in the one panel next to the board', () => withFile(mouseFile, () => {
   app.state.layer = app.LAYER_BASE;
   app.state.selected = app.WHEEL_UP;
   const wheelPlan = app.panelPlan(mouseFile);
   app.state.selected = app.LAYOUT[5].hid;
   const keyPlan = app.panelPlan(mouseFile);
-  const below = wheelPlan.below.map((n) => n.textContent).join(' ');
+  const below = [...wheelPlan.primary, ...wheelPlan.details].map((n) => n.textContent).join(' ');
   const wheelText = wheelPlan.inspector.map((node) => node.textContent).join(' ');
   return wheelPlan.inspector.length === 1 && keyPlan.inspector.length === 1
-    && wheelPlan.below.length === keyPlan.below.length
+    && wheelPlan.primary.length === keyPlan.primary.length
+    && wheelPlan.details.length === keyPlan.details.length
     && !/Wheel mappings \(4 entries/.test(below)
     && wheelText.includes('wheel_mappings[0]') && /Wheel \u2191 - base layer/.test(wheelText);
-}), () => withFile(mouseFile, () => [app.panelPlan(mouseFile).inspector.length, app.panelPlan(mouseFile).below.length]));
+}), () => withFile(mouseFile, () => [app.panelPlan(mouseFile).inspector.length, app.panelPlan(mouseFile).primary.length, app.panelPlan(mouseFile).details.length]));
 ok('the panel plan shows the OLED panel when the OLED rect is selected', () => {
   app.state.selected = app.SELECT_OLED;
   return app.panelPlan(remap.file).inspector.length >= 1;
@@ -1253,6 +1741,36 @@ ok('the full render runs for the active file and paints the board', () => {
   const cls = ctl.board.querySelectorAll('g.key').map((g) => g.getAttribute('class'));
   return cls.length > 0 && cls.every((c) => c.startsWith('key ')) && ctl.tabs.children.length > 0 && ctl.inspector.children.length > 0;
 }, () => [ctl.board.querySelectorAll('g.key').length, ctl.tabs.children.length, ctl.inspector.children.length]);
+ok('Rapid Tap and Lighting sit under the board and the rest sits under the Details section', () => {
+  const suiteFiles = app.state.files;
+  const suiteActive = app.state.activeId;
+  const file = app.addFile('layout.json', app.serializeDoc(app.cloneDoc(apex))).file;
+  const outcome = withFile(file, () => {
+    app.state.selected = app.LAYOUT[5].hid;
+    app.render();
+    const below = ctl.below.querySelectorAll('h2').map((h) => h.textContent);
+    const details = ctl.details.querySelectorAll('h2').map((h) => h.textContent);
+    const cond = {
+      below: below.length === 2 && /^Rapid Tap/.test(below[0]) && /^Lighting/.test(below[1]),
+      details: details.length === 3 && /^File: layout.json/.test(details[0])
+        && details[1] === 'Custom bindings' && /^Macro records/.test(details[2]),
+      shown: ctl.detailsBox.hidden === false,
+      oneInspector: ctl.inspector.querySelectorAll('section.panel').length === 1,
+    };
+    app.state.files = [];
+    app.state.activeId = null;
+    app.render();
+    cond.hiddenWithoutFile = ctl.detailsBox.hidden === true
+      && ctl.details.querySelectorAll('h2').length === 0
+      && ctl.below.querySelectorAll('h2').length === 0;
+    globalThis.lastLayout = cond;
+    return Object.values(cond).every(Boolean);
+  });
+  app.state.files = suiteFiles;
+  app.state.activeId = suiteActive;
+  return outcome;
+}, () => globalThis.lastLayout);
+
 ok('selectKey stores the layer and key a binding row asks for', () => {
   app.selectKey(app.LAYER_META, 7);
   return app.state.layer === app.LAYER_META && app.state.selected === 7;
@@ -1348,7 +1866,7 @@ okMacros('a real macro block the record list cannot walk still carries every byt
   // the byte the decode note names, and each parsed record's bytes, are inside the shipped block
   const listed = (macrosDoc.macros ?? []).every((record) => bytes
     .slice(record.offset - at, record.offset - at + record.record_bytes)
-    .map((b) => b.toString(16).padStart(2, '0').toUpperCase()).join(' ') === record.raw);
+    .map((b) => b.toString(16).padStart(2, '0').toUpperCase()).join(' ') === String(record.raw).toUpperCase());
   const panel = app.renderMacrosPanel(app.addFile('blocks.json', app.serializeDoc(app.cloneDoc(macrosDoc))).file).textContent;
   return bytes[109] === 0x03 && bytes[108] === 0x00 && listed
     && panel.includes('The write sends these bytes back unchanged')
@@ -1675,17 +2193,17 @@ ok('the byte is a field of its own: undo and factory reset never move it, and it
   return Object.values(cond).every(Boolean);
 }), () => [globalThis.lastCond, app.renderKeyPanel(metaOffFile).textContent.slice(-320), app.diffAgainst(metaOffFile.original, metaOffFile.doc).map((c) => c.path)]);
 ok('the META mask is the measured rule: bound META-layer keys by their own HID code, the key the byte names and the wheel left out', () => {
-  const rootNames = ['config_1.json', 'config_3.json', 'config_1-copy.json', 'sample-macros.json'];
-  const rootTexts = rootNames.map(rootText);
-  if (rootTexts.some((text) => text === null)) return SKIP;
-  const readDocs = [apex, identityDoc, parseExample('sample-remap.json'), JSON.parse(rootTexts[3]),
-    app.addFile('mask-config1.json', rootTexts[0]).file.doc,
-    app.addFile('mask-config3.json', rootTexts[1]).file.doc];
+  const readDocs = [apex, identityDoc, parseExample('sample-remap.json')];
   const matches = readDocs.map((doc) => app.computeMetaMask(doc) === String(doc.lighting.meta_mapped_elements).toUpperCase());
-  const copyDoc = app.addFile('mask-copy.json', rootTexts[2]).file.doc;
-  // The copy is the file a page edit made: its binding table carries one META binding more than a stock
-  // read, and its mask carries the bit that binding needs and the stock mask has no bit for. That extra
-  // bit is the measurement that the mask follows the META layer (the stored bytes were the read's stale ones).
+  // The stock reads carry keys on the META layer that the read's own mask bytes have no bit for (the board's
+  // bytes are stale there). Binding one of those keys the way the page binds it is the measurement the copy of
+  // a real read made: the derived mask gains a bit the stored bytes do not have.
+  const copyDoc = app.cloneDoc(apex);
+  const copyUsage = app.OFF2HID[60];
+  const copyRow = copyDoc.button_meta_mappings[60];
+  copyRow.function = 0x51;
+  copyRow.key_codes = '04 00 00 00';
+  app.normalizeEntry(copyRow, 60);
   const copyBits = app.computeMetaMask(copyDoc);
   const stockBits = apex.lighting.meta_mapped_elements;
   const byteNum = (mask, index) => Number(`0x${mask.split(' ')[index]}`);
@@ -1702,8 +2220,9 @@ ok('the META mask is the measured rule: bound META-layer keys by their own HID c
   unnamedDoc.meta_toggle_hid = 0x00;
   app.normalizeDoc(unnamedDoc);
   const cond = {
-    allReadsMatch: matches.length === 6 && matches.every(Boolean),
-    copyGainsABitTheStockMaskHasNoBitFor: extraBits > 0,
+    allReadsMatch: matches.length === 3 && matches.every(Boolean),
+    copyIsABoundStockKey: copyRow.function === 0x51 && bitOf(stockBits, copyUsage) === 0,
+    copyGainsABitTheStockMaskHasNoBitFor: extraBits > 0 && bitOf(copyBits, copyUsage) === 1,
     wheelLeftOut: app.computeMetaMask(wheelDoc) === app.computeMetaMask(apex),
     namedKeyDropped: bitOf(app.computeMetaMask(namedDoc), app.OFF2HID[13]) === 0,
     bitPresentWhenUnnamed: bitOf(app.computeMetaMask(unnamedDoc), app.OFF2HID[13]) === 1,
@@ -1797,7 +2316,7 @@ okMacros('the key panel of a macro-bound key shortens the select and shows the w
   return macroSelect.value === '7' && Math.max(...labels.map((l) => l.length)) <= 60
     && !labels.some((l) => l.includes('press ')) && list.length === 1
     && list[0].children.length === (record.actions ?? []).length
-    && text.includes('the whole macro: record 1') && text.includes(`interval ${record.interval_ms} ms`)
+    && text.includes(`the whole macro: record #${record.ordinal}`) && text.includes(`interval ${record.interval_ms} ms`)
     && text.includes(record.raw) && text.includes('Bound by') && text.includes('code 3 holds the record index');
 }, () => app.renderKeyPanel(macroBindFile).textContent.slice(0, 260)));
 ok('the file info rows edit nothing: no dropdown, no text field, byte and Lock Win named apart', () => withFile(headerFile, () => {
@@ -1873,6 +2392,21 @@ ok('index.html puts the name bar above the board and main.js hands it to the app
   return bar > 0 && mount > 0 && bar < mount && read('tools/profile-gui/main.js').includes("getElementById('nameBar')")
     && html.includes('nameBar" class="name-bar"');
 }, () => [read('tools/profile-gui/index.html').indexOf('id="nameBar"'), read('tools/profile-gui/index.html').indexOf('id="boardMount"')]);
+ok('index.html carries the Details section under the page and main.js mounts both of its parts', () => {
+  const html = read('tools/profile-gui/index.html');
+  const main = read('tools/profile-gui/main.js');
+  const mainTag = html.indexOf('<main>');
+  const box = html.indexOf('id="detailsBox"');
+  const panels = html.indexOf('id="detailsPanels"');
+  const foot = html.indexOf('<footer');
+  return mainTag > 0 && box > mainTag && panels > box && foot > panels
+    && html.includes('id="detailsBox" class="details-box" hidden')
+    && html.includes('class="details-title">Details<')
+    && main.includes("getElementById('detailsPanels')") && main.includes("getElementById('detailsBox')")
+    && /\.details-box\s*\{[^}]*padding/.test(style)
+    && /\.details-panels\s*\{[^}]*grid-template-columns/.test(style)
+    && /\.details-box\[hidden\]\s*\{[^}]*display:\s*none/.test(style);
+}, () => [read('tools/profile-gui/index.html').indexOf('id="detailsBox"'), read('tools/profile-gui/main.js').includes("getElementById('detailsPanels')")]);
 ok('the style sheets the name bar, its changed state and the whole-macro list', () => {
   return /\.name-bar\s*\{[^}]*flex-wrap/.test(style) && /\.name-state\.changed\s*\{[^}]*var\(--warn\)/.test(style)
     && /\.name-bar input\[type="text"\]/.test(style) && /ul\.macro-actions\s*\{/.test(style);
@@ -1927,10 +2461,8 @@ ok('index.html loads live.js after app.js with a hidden panel, and app.js itself
 
 // --- macro editor (macros.js) ---------------------------------------------
 console.log('macro editor window (macros.js)');
-// The page loads macros.js as a classic script; do the same, so the editor lands on the same global
-// app.js reads, exactly as in the browser.
-loadClassic('macros.js');
-const macro = globalThis.SsggMacroEditor;
+// The page loads macros.js as a classic script; the suite loaded it with the macro fixture above, so
+// the editor lands on the same global app.js reads, exactly as in the browser.
 ok('one mouse mask names one button by the engine rule, log2(mask) + 1 in mouse 1..8', () =>
   [[0x01, 1], [0x02, 2], [0x04, 3], [0x08, 4], [0x10, 5], [0x20, 6], [0x40, 7], [0x80, 8]]
     .every(([mask, button]) => macro.mouseButton(mask) === button)

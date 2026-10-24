@@ -55,3 +55,9 @@ apexctl/
 
 # preview.mjs output (tools/profile-gui)
 tools/profile-gui/board-preview.svg
+
+# Files a person's own board leaves behind (profile dumps, captures): never part of the repo
+/*.json
+!/.release-please-manifest.json
+!/release-please-config.json
+!/renovate.json
