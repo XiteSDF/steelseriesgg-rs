@@ -317,11 +317,15 @@ function macroBindingOptions(doc, selected) {
   const options = macroRecords(doc).map((record, position) => {
     const ordinal = macroRecordOrdinal(record);
     const byte = macroBindingByte(record.offset - macroRegionStart(doc));
-    const mode = record.mode_name ?? MACRO_MODE_NAMES[record.mode] ?? `mode 0x${hex2(record.mode)}`;
+    const mode = MACRO_MODE_SHORT[record.mode]
+      ?? record.mode_name
+      ?? `mode 0x${hex2(record.mode)}`;
+    const times = record.mode === MACRO_MODE_COUNTED ? ` x${record.repeat_count ?? ((record.flags ?? 0x0101) >> 8)}` : '';
+    const interval = MACRO_MODE_TIMED.includes(record.mode) ? ` ${record.interval_ms} ms` : '';
     const actions = (record.actions ?? []).length;
     return {
       value: byte,
-      label: `Record #${ordinal} - ${mode}${record.mode === 4 ? ` ${record.interval_ms} ms` : ''} - ${actions} action(s) - binding byte ${byte}`,
+      label: `Record #${ordinal} - ${mode}${times}${interval} - ${actions} action(s) - byte ${byte}`,
     };
   });
   if (!options.some((option) => option.value === selected)) {
@@ -2482,7 +2486,25 @@ function renderRapidTapPanel(file) {
 // Macro record marker of the packed block (apex_7_profile::MACRO_RECORD_MARKER). The decoder
 // decodes the block; this page reads the records it wrote.
 const MACRO_MARKER = 0x77;
-const MACRO_MODE_NAMES = { 4: 'repeat', 1: 'once' };
+// The five playback modes of GG's macro editor, measured on a profile GG wrote (Apex 7 `0x1612`,
+// firmware 4.16.8, schema b, slot 2, 2026-10-24): five macros, one per mode, each named by the
+// operator from GG's UI. The decode carries `mode_name`; this table is the fallback.
+const MACRO_MODE_NAMES = { 1: 'once on release', 2: 'play N times', 3: 'repeat while pressed', 4: 'toggle auto repeat', 5: 'toggle hold' };
+const MACRO_MODE_COUNTED = 2;
+// The modes whose interval GG shows in ms: 2 (N times every T), 3 (while pressed, every T) and 4
+// (auto repeat, every T). Modes 1 and 5 carry a word the measured profile does not use.
+const MACRO_MODE_TIMED = [2, 3, 4];
+// The same modes in the fewest words: a select is as wide as its longest option, so the record row in
+// the key binding select uses these and the panels use the full names above.
+const MACRO_MODE_SHORT = { 1: 'once', 2: 'N times', 3: 'while held', 4: 'auto repeat', 5: 'hold' };
+// A mode in words with the numbers that go with it: "play N times x69 every 15 ms", "repeat while
+// pressed every 25 ms", "toggle auto repeat every 30 ms". The repeat count is the flags high byte.
+function macroModeLabel(record) {
+  const mode = record.mode_name ?? MACRO_MODE_NAMES[record.mode] ?? `mode 0x${hex2(record.mode)}`;
+  const times = record.mode === MACRO_MODE_COUNTED ? ` x${record.repeat_count ?? ((record.flags ?? 0x0101) >> 8)}` : '';
+  const interval = MACRO_MODE_TIMED.includes(record.mode) ? ` every ${record.interval_ms} ms` : '';
+  return `${mode}${times}${interval}`;
+}
 // The unit a binding byte counts (apex_7_profile::MACRO_INDEX_UNIT): the macro a `0x71` row plays
 // starts at `byte x 4` bytes into the block. Measured on a wired read (schema B) whose keys c, v, x
 // carry the bytes 0, 7, 14 and whose macros 0, 28, 56 bytes into the block press LCtrl with c, v, x,
@@ -2609,9 +2631,8 @@ function macroLine(doc, byte) {
   if (!record) {
     return `${named}no macro starts at that byte in this block: GG deletes the macro and leaves the binding on the key. `;
   }
-  const mode = record.mode_name ?? MACRO_MODE_NAMES[record.mode] ?? `mode 0x${hex2(record.mode)}`;
-  const interval = record.mode === 4 ? ` every ${record.interval_ms} ms` : '';
-  return `${named}${mode} (0x${hex2(record.mode)})${interval}, ${record.action_count ?? (record.actions ?? []).length} action(s) - the whole record, keystroke by keystroke, is in the block under the macro select. `;
+  const mode = macroModeLabel(record);
+  return `${named}${mode} (mode 0x${hex2(record.mode)}), ${record.action_count ?? (record.actions ?? []).length} action(s) - the whole record, keystroke by keystroke, is in the block under the macro select. `;
 }
 
 function blockHasBytes(doc) {
@@ -2797,7 +2818,7 @@ function renderMacrosPanel(file) {
   const recordsBytes = records.reduce((sum, record) => sum + (record.record_bytes ?? 0), 0);
   const rows = [el('p', {
     class: 'hint',
-    text: `payload offset ${summary.offset}, ${summary.len} bytes, ${summary.nonzero} non-zero. ${records.length} macro record(s) decoded from it, filling ${recordsBytes} bytes${recordsBytes ? `, ${summary.offset} to ${summary.offset + recordsBytes - 1}` : ''}. A record is an 8-byte header (0x77, mode, action count, flags, interval) plus its actions, every action 4 bytes: a key push 02 key 01 01, a key release 02 key 01 00, a mouse press 00 mask 00 01, a mouse release 00 mask 00 00, a wait 04 00 ms. The mask is a mouse-button bitmask (bit 0 button 1 through bit 7 button 8): the engine's own reader names a mouse action's button log2(mask) + 1 and rejects a byte that is not a single bit in 0x01..0x80, so a single-bit mask is the button GG can read back, and mask 0x03 (mouse 1+mouse 2) is a pair the reads carry that GG's reader refuses. The header word is the action count: every record of the reads surveyed carries its action count there. The chain is packed with no stride and no length word, and the bytes behind it belong to GG's own structures, so the walk stops where the grammar stops matching. A 0x71 slot's third code byte counts 4-byte units from the block start: the macro it plays starts at byte x 4 of the block, so a binding byte reaches ${MACRO_BINDING_REACH_BYTES} of its ${MACRO_DATA_LEN} bytes. This panel lists the records the block walks to; a write sends the block's bytes back, never this list.`,
+    text: `payload offset ${summary.offset}, ${summary.len} bytes, ${summary.nonzero} non-zero. ${records.length} macro record(s) decoded from it, filling ${recordsBytes} bytes${recordsBytes ? `, ${summary.offset} to ${summary.offset + recordsBytes - 1}` : ''}. A record is an 8-byte header (0x77, mode, action count, flags, interval) plus its actions, every action 4 bytes: a key push 02 key 01 01, a key release 02 key 01 00, a mouse press 00 mask 00 01, a mouse release 00 mask 00 00, a wait 04 00 ms. The mask is a mouse-button bitmask (bit 0 button 1 through bit 7 button 8): the engine's own reader names a mouse action's button log2(mask) + 1 and rejects a byte that is not a single bit in 0x01..0x80, so a single-bit mask is the button GG can read back, and mask 0x03 (mouse 1+mouse 2) is a pair the reads carry that GG's reader refuses. The header word is GG's own number per record: on the profile measured it equals each record's action count (1, 3, 3, 3, 1); on a second dump it counts 5 actions in a record whose first triple carries the delay on the key-push byte (02 00 14 00), which the grammar does not read, so the walk stops early and the note names the bytes. It is GG's number, not a derived count - a rewrite keeps it. The chain is packed with no stride and no length word, and the bytes behind it belong to GG's own structures, so the walk stops where the grammar stops matching. A 0x71 slot's third code byte counts 4-byte units from the block start: the macro it plays starts at byte x 4 of the block, so a binding byte reaches ${MACRO_BINDING_BYTE_MAX * MACRO_INDEX_UNIT} of the block's 9600 bytes - 1020 bytes, five records deep. This panel lists the records the block walks to; a write sends the block's bytes back, never this list.`,
   })];
   if (!Array.isArray(doc.macros)) {
     rows.push(el('p', { class: 'hint', text: 'this dump has no "macros" field - it was written before the record decode. Re-read the profile to get them.' }));
@@ -2828,7 +2849,7 @@ function renderMacrosPanel(file) {
     rows.push(el('h3', {
       class: 'subhead',
       text: `record #${ordinal} (binding byte ${macroBindingByte(record.offset - macroRegionStart(doc))}, payload ${record.offset}): `
-        + `${record.mode_name ?? MACRO_MODE_NAMES[record.mode] ?? `mode 0x${hex2(record.mode)}`} (0x${hex2(record.mode)}), interval ${record.interval_ms} ms - ${macroKeystrokes(record)}`,
+        + `${macroModeLabel(record)} (mode 0x${hex2(record.mode)}) - ${macroKeystrokes(record)}`,
     }));
     rows.push(line('Bound by', el('span', {
       class: 'mono',
@@ -3182,7 +3203,7 @@ const SsggProfileApp = {
   WHEEL_UP, WHEEL_DOWN, WHEEL_KEYS, OLED_RECT, OLED_W, OLED_H, oledBytes, oledPixels, oledDataUrl, paintOled, renderOledPanel,
   MACRO_DATA_LEN, macroBlockBytes,
   wheelEntry, copyName, CODE_COUNT, CONSUMER_TARGETS, PRODUCT_NAMES, LEGACY_ONBOARD_PIDS, PRODUCTS, IMPORT_SOURCE, onboardModelPids, importedName, productKind, deviceFeatures, deviceLabel, productHex, MEDIA_NAMES, MOUSE_FUNCTIONS, MOUSE_NAMES, META_ACTION_NAMES, META_CAP_LABELS, BINDING_GROUPS, FACTORY_BASE_ZEROS, FACTORY_BASE_MEDIA, FACTORY_BASE_EXTRA, FACTORY_META, bindingGroup, factoryEntry, optionSelect, bindingGroupOptions, mouseActionOptions, keyboardKeyOptions, mediaKeyOptions, metaActionOptions, macroBindingOptions, macroSummary, bindingOf, bindingCounts, codesPerEntry, customBindings, normalizeDoc, normalizeEntry, selectKey, renderBindingsPanel, FUNCTION_NAMES, functionName, hex2, hexOf, parseHex, colorToHex, hexToColor, LAYOUT_ROWS, LAYOUT, LAYOUT_HIDS, EXTRA_HIDS, MAPPING_COUNT, LAYER_BASE, LAYER_META, EXPECTED_ARRAYS, isValidProfileDoc, layerArray, keyEntry, mappingCodes, writeCodes, setFunction, setCode, setAllCodes, keyState, rapidTap, setRapidPair, rapidTapKeysFor, lighting, setLightingColor, NAME_FIELD_BYTES, setProfileName, serializeDoc, cloneDoc, diffAgainst, changeKeyHids, SVG_NS, el, svg, state, activeFile, activeDoc, nextFileId, addFile, downloadText, saveFile, fileChanges, changedFiles, revertFile, codeOptions, CODE_OPTIONS, buildKeySelect, buildFunctionSelect, UNIT, GAP, boardKeyList, buildBoard, FILL_COLORS, paintBoard, ui, panel, line, numberInput, textInput, button, renderTabs, renderHeader, mappingRows, renderKeyPanel, renderBindingPanel, renderNameBar, panelPlan,
-  MACRO_MARKER, MACRO_MODE_NAMES, MACRO_INDEX_UNIT, MACRO_BINDING_BYTE_MAX, MACRO_BINDING_REACH_BYTES, MACRO_MOUSE_BITS, macroRecords, macroIndex, macroRegionStart, macroBindingByte, macroOffsetForBindingByte, macroRecordOrdinal, macroRecordFor, macroMouseMaskName, macroKeystrokes, macroBoundKeys, macroLine, macroDetailRows, renderMacrosPanel,
+  MACRO_MARKER, MACRO_MODE_NAMES, MACRO_MODE_SHORT, MACRO_MODE_COUNTED, MACRO_MODE_TIMED, macroModeLabel, MACRO_INDEX_UNIT, MACRO_BINDING_BYTE_MAX, MACRO_BINDING_REACH_BYTES, MACRO_MOUSE_BITS, macroRecords, macroIndex, macroRegionStart, macroBindingByte, macroOffsetForBindingByte, macroRecordOrdinal, macroRecordFor, macroMouseMaskName, macroKeystrokes, macroBoundKeys, macroLine, macroDetailRows, renderMacrosPanel,
   MACRO_CHANNEL, macroEditor, sessionToken, macroSessionPost, macroSessionGet, adoptMacroRecords, adoptProfileJson, syncMacroSession, mountInlineMacroEditor, openMacroEditor,
   META_TOGGLE_FUNCTION, META_LOCK_WIN_ACTION, computeMetaMask, metaMaskDiffers, META_KEY_HID, META_KEY_GG_CODE, META_KEY_SLOT, hidSlot, boardHid, metaToggleByte, toggleByteFor, isLockWinEntry, lockWinBinding, lockWinMarkers,
   PAYLOAD_LEN_A, PAYLOAD_LEN_B, PROFILE_REGION_BYTES, payloadLenForSchema, payloadSplit,

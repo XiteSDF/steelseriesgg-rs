@@ -180,6 +180,13 @@ Still open:
   `1..=8`); the read's bytes for keys 3 and 7 (`0x03`, `0x07`) are the button number written raw, which that
   converter rejects, so the panels print the byte beside the names. Editing stays GUI-only and `encode` still
   refuses a list that is not the block's own bytes, so no macro write has been replayed on hardware.
+  Two operator dumps read 2026-10-28 (`Vanilla Bounds` slot 2, `Some rebounds` slot 3) put the records in the
+  9,600-byte block at payload 2076 - the 140-byte schema-b region at 11800 is empty in both - and show the grammar
+  is narrower than GG: a 20 ms delay written on the key-push triple (`02 00 14 00`) and a release written
+  `01 key 00 00`, neither of which the walk reads, so the record list is short and the note names the bytes the
+  write sends back untouched. The flags low byte follows the mode (0 on mode 1, 1 on modes 2-5, and 0 on the mode-4
+  record carrying repeat count 3), and the header word is GG's own number per record. All of it is in
+  `docs/development/apex-7-gg-capture.md`.
 - Apex 7 macro modes: the mode byte, action count, repeat count and interval are read out of the engine binary
   (mode = GG playback type + 1, accepted `1..=5`; the repeat pair is used by modes 2, 3, 4 only), in
   `docs/development/apex-7-gg-capture.md`. Nothing implemented, by user decision 2026-10-28. Recorded there too:

@@ -249,7 +249,8 @@ console.log('key names, mapping slots and function names against the Rust tables
   ok('the macro marker is the byte GG writes in front of a macro record',
     () => app.MACRO_MARKER === 0x77 && /0x77/.test(mod), () => app.MACRO_MARKER);
   ok('macro mode names cover the modes the samples use',
-    () => app.MACRO_MODE_NAMES[4] === 'repeat' && app.MACRO_MODE_NAMES[1] === 'once');
+    () => eq(Object.values(app.MACRO_MODE_NAMES), ['once on release', 'play N times', 'repeat while pressed', 'toggle auto repeat', 'toggle hold'])
+      && eq(Object.values(app.MACRO_MODE_SHORT), ['once', 'N times', 'while held', 'auto repeat', 'hold']));
 })();
 
 console.log('product IDs, model names and the read platform');
@@ -967,7 +968,7 @@ okMacros('the whole macro of a binding is a block of its own, keystroke by keyst
   const list = rows.find((node) => node.tagName === 'UL');
   const text = rows.map((node) => node.textContent).join(' ');
   return list !== undefined && list.children.length === (record.actions ?? []).length
-    && text.includes(`the whole macro: record #${record.ordinal}`) && text.includes(`interval ${record.interval_ms} ms`)
+    && text.includes(`the whole macro: record #${record.ordinal}`) && text.includes(app.macroModeLabel(record))
     && text.includes('press ') && text.includes(record.raw) && text.includes('Bound by');
 }, () => [app.macroDetailRows(macrosDoc, 1).map((n) => n.tagName), app.macroDetailRows(macrosDoc, 1).map((n) => n.textContent).join(' ').slice(0, 200)]);
 ok('a binding byte naming an offset the block does not hold says there is nothing to show', () => {
@@ -981,12 +982,13 @@ okMacros('the macro select labels records shortly, with no keystrokes in the opt
   const labels = options.map((o) => o.label);
   const longest = Math.max(...labels.map((l) => l.length));
   const records = app.macroRecords(macrosDoc);
-  const repeatAt = labels.findIndex((l) => l.includes('repeat'));
+  const repeatAt = labels.findIndex((l) => l.includes('auto repeat'));
   return options.length === records.length && eq(options.map((o) => o.value), records.map((r) => r.index))
     && eq(records.map((r) => r.index), [0, 7, 14, 21, 28])
     && labels.every((l) => l.startsWith('Record ')) && labels.every((l) => l.includes('action(s)'))
     && labels.every((l) => !l.includes('press ') && !l.includes('..'))
     && repeatAt >= 0 && labels[repeatAt].includes(`${records[repeatAt].interval_ms} ms`)
+    && labels.every((l) => !l.includes('binding byte'))
     && longest <= 60;
 }, () => [app.macroBindingOptions(macrosDoc, 0).map((o) => o.label), app.macroRecords(macrosDoc).map((r) => [r.index, r.mode_name, r.interval_ms, r.actions.length])]);
 ok('the macro select keeps a binding byte it cannot name, and says where it points', () => {
@@ -2316,7 +2318,7 @@ okMacros('the key panel of a macro-bound key shortens the select and shows the w
   return macroSelect.value === '7' && Math.max(...labels.map((l) => l.length)) <= 60
     && !labels.some((l) => l.includes('press ')) && list.length === 1
     && list[0].children.length === (record.actions ?? []).length
-    && text.includes(`the whole macro: record #${record.ordinal}`) && text.includes(`interval ${record.interval_ms} ms`)
+    && text.includes(`the whole macro: record #${record.ordinal}`) && text.includes(app.macroModeLabel(record))
     && text.includes(record.raw) && text.includes('Bound by') && text.includes('code 3 holds the record index');
 }, () => app.renderKeyPanel(macroBindFile).textContent.slice(0, 260)));
 ok('the file info rows edit nothing: no dropdown, no text field, byte and Lock Win named apart', () => withFile(headerFile, () => {
@@ -2591,9 +2593,11 @@ ok('every limit that stops a write is named before the editor lets the list thro
   const base = { mode: 4, header_word: 1, flags: macro.RECORD_FLAGS, interval_ms: 100, actions: [macro.makePress(4)] };
   return check(base) === ''
     && check({ ...base, actions: [] }).includes('no action')
-    && check({ ...base, flags: 0x0100 }).includes('0x0101')
-    && check({ ...base, header_word: 70000 }).includes('header word must be a whole number 1..65535')
-    && check({ ...base, header_word: 0 }).includes('header word must be a whole number 1..65535')
+    && check({ ...base, flags: 0x0102 }).includes('the low byte is 0 on the mode-1 record')
+    // The repeat count is the flags high byte: GG's "play N times" carries any byte there.
+    && check({ ...base, flags: 0x4501 }) === ''
+    && check({ ...base, header_word: 70000 }).includes('the action count (the header word) must be a whole number 1..65535')
+    && check({ ...base, header_word: 0 }).includes('the action count (the header word) must be a whole number 1..65535')
     && check({ ...base, mode: 0 }).includes('mode must be a whole number 1..8')
     && check({ ...base, mode: 9 }).includes('mode must be a whole number 1..8')
     && check({ ...base, interval_ms: -5 }).includes('interval must be a whole number 1..65535')

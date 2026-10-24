@@ -1071,16 +1071,38 @@ pub const MACRO_HEADER_LEN: usize = 8;
 /// 4.16.8, schema b, slot 3, 2026-10-22) whose 14 macros of 168 actions split into exactly these five
 /// forms, with nothing left over.
 pub const MACRO_ACTION_LEN: usize = 4;
-/// Macro mode GG writes for a record that plays again every `interval`: the META + Insert binding of
-/// profile 1 in the read round is a mode 4 record that presses `4` with `interval` 5000 ms, and a
-/// wired read's mode 4 record presses one key once. `[EXPERIMENTAL]`.
+/// Macro mode that plays the whole macro again every `interval` ms: GG's **Toggle auto repeat**.
 pub const MACRO_MODE_REPEAT: u8 = 4;
-/// Macro mode of a record that steps its actions `interval` ms apart. `[EXPERIMENTAL]`: the mode of
-/// every record of the read surveyed that carries more than one action.
+/// Macro mode that steps its actions `interval` ms apart: GG's **Play once on release**.
 pub const MACRO_MODE_ONCE: u8 = 1;
-/// Highest mode a record header is accepted with: modes 1, 2, 4 and 5 appear in the reads surveyed,
-/// and GG writes one mode byte. `[EXPERIMENTAL]`.
+/// Macro mode that plays the macro `repeat_count` times, `interval` ms apart: GG's **Play N times
+/// every T ms**. Ground truth (Apex 7 `0x1612`, firmware 4.16.8, schema b, slot 2, 2026-10-24: a
+/// profile GG wrote, whose five macros the operator named in GG's own words) pairs this mode with
+/// `repeat_count` 69 and `interval` 15.
+pub const MACRO_MODE_COUNTED: u8 = 2;
+/// Macro mode that plays the macro while its key is held, `interval` ms apart: GG's **Repeat while
+/// pressed every T ms**. Ground truth as on [`MACRO_MODE_COUNTED`]: interval 25 ms.
+pub const MACRO_MODE_WHILE_PRESSED: u8 = 3;
+/// Macro mode that latches the macro on: GG's **Toggle hold**. Ground truth as on
+/// [`MACRO_MODE_COUNTED`]; its interval is not used.
+pub const MACRO_MODE_TOGGLE_HOLD: u8 = 5;
+/// The five playback modes GG's macro editor offers, in its order, measured on the ground-truth
+/// profile named on [`MACRO_MODE_COUNTED`]: one mode per macro, all five in one profile, each named by
+/// the operator from GG's UI. Modes above this table are not named.
+/// `[EXPERIMENTAL]` for any mode beyond these five.
+pub const MACRO_MODE_NAMES: [(u8, &str); 5] = [
+    (MACRO_MODE_ONCE, "once on release"),
+    (MACRO_MODE_COUNTED, "play N times"),
+    (MACRO_MODE_WHILE_PRESSED, "repeat while pressed"),
+    (MACRO_MODE_REPEAT, "toggle auto repeat"),
+    (MACRO_MODE_TOGGLE_HOLD, "toggle hold"),
+];
+/// Highest mode a record header is accepted with: the five modes of [`MACRO_MODE_NAMES`] are measured,
+/// and the reads surveyed also carry 6, 7 and 8, which no source names. `[EXPERIMENTAL]`.
 pub const MACRO_MODE_MAX: u8 = 8;
+/// The header byte at `+4`: `0` on the mode-1 record of the ground-truth profile, `1` on its mode 2,
+/// 3, 4 and 5 records. `[EXPERIMENTAL]`: five records measured; what it gates is not known.
+pub const MACRO_RECORD_LOOP_FLAGS: [u8; 2] = [0, 1];
 /// The `flags` words a real record carries at `+4`: `01 01` on the records with actions, `01 00` on
 /// the header that carries none. `[EXPERIMENTAL]`: measured on the read named on [`MACRO_ACTION_LEN`];
 /// a record with other bytes there is reported by [`OnboardMacro::flags_ok`].
@@ -1135,23 +1157,36 @@ pub struct OnboardMacro {
     /// Position in the list [`decode_macros`] walked, from 0. Display order only: a binding names a
     /// macro by its offset, not by this number.
     pub ordinal: usize,
-    /// `false` when this record's `+4` bytes are not one of [`MACRO_RECORD_FLAGS_KNOWN`], which every
-    /// record of the read surveyed is: a record that differs is shown, not listed as if it matched.
+    /// `false` when this record's `+4` byte is not one of [`MACRO_RECORD_LOOP_FLAGS`] (the high byte of
+    /// its `flags` word is the repeat count and takes any value): a record that differs is shown, not
+    /// listed as if it matched.
     pub flags_ok: bool,
     /// Offset of the record inside the payload.
     pub offset: usize,
-    /// Mode byte, see [`MACRO_MODE_REPEAT`] and [`MACRO_MODE_ONCE`]; `[EXPERIMENTAL]`, two records seen.
+    /// Mode byte, one of [`MACRO_MODE_NAMES`]; the names are ground truth, see there.
     pub mode: u8,
     /// Mode as a word, for the summary line.
     pub mode_name: &'static str,
-    /// The header's u16 at `+2`, carried through as the read had it. `[EXPERIMENTAL]`: it equals
-    /// [`OnboardMacro::action_count`] in 8 of the 9 records measured (the ninth carries 83 with 48
-    /// actions), so it reads as an action count, and a binding does not name it - a binding names the
-    /// position.
+    /// The header's u16 at `+2`, carried through as the read had it. Ground truth (Apex 7 `0x1612`,
+    /// firmware 4.16.8, schema b, slot 2, 2026-10-24: a profile GG wrote, its five macros named in
+    /// GG's own words): the number GG keeps per macro - on that profile it equals each record's action
+    /// count (1, 3, 3, 3, 1), on a second dump it counts 5 in a record whose first triple carries GG's
+    /// 20 ms delay on the key-push byte, which this grammar does not read, so treat it as GG's own
+    /// number, not as a derived field. A binding
+    /// does not name it, and a rewrite keeps the value the read carried.
     pub header_word: u16,
-    /// The two bytes every record seen carries as `01 01`, unexplained.
+    /// The header's u16 at `+4`, ground truth: low byte = [`OnboardMacro::loop_flag`], high byte =
+    /// [`OnboardMacro::repeat_count`].
     pub flags: u16,
-    /// Repeat interval in mode [`MACRO_MODE_REPEAT`], inter-action delay in mode [`MACRO_MODE_ONCE`].
+    /// Header byte 4: `0` on the mode-1 record, `1` on the mode 2, 3, 4 and 5 records of the
+    /// ground-truth profile. What it gates is not known.
+    pub loop_flag: u8,
+    /// Header byte 5, the repeat count: `69` on the record the operator named "play 69 times every
+    /// 15 ms", `1` on the four others.
+    pub repeat_count: u8,
+    /// Header bytes 6-7, the interval in **milliseconds** in every mode measured: 15 on the "play 69
+    /// times every 15 ms" record, 25 on "repeat while pressed every 25 ms", 30 on "toggle auto repeat
+    /// every 30 ms".
     pub interval_ms: u16,
     /// Bytes the record fills: header plus its actions. The list is packed with no length word, so
     /// this is what the decoder walked. In the reference read 2076 + 20 + 116 = 2212 is where the
@@ -1224,14 +1259,14 @@ pub const fn macro_mouse_button(mask: u8) -> Option<u8> {
     if button <= 8 { Some(button) } else { None }
 }
 
-/// Mode byte as a word.
+/// Mode byte as a word: one of the five names of [`MACRO_MODE_NAMES`], `unknown` above them.
 #[must_use]
 pub fn macro_mode_name(mode: u8) -> &'static str {
-    match mode {
-        MACRO_MODE_REPEAT => "repeat",
-        MACRO_MODE_ONCE => "once",
-        _ => "unknown",
-    }
+    MACRO_MODE_NAMES
+        .iter()
+        .find(|(byte, _)| *byte == mode)
+        .map(|(_, name)| *name)
+        .unwrap_or("unknown")
 }
 
 /// Where a schema's macro block is and how many bytes it has: the block a write sends back
@@ -1375,12 +1410,14 @@ pub fn decode_macros(data: &[u8], offset: usize, len: usize) -> (Vec<OnboardMacr
         records.push(OnboardMacro {
             index: macro_index(start + at, start),
             ordinal,
-            flags_ok: MACRO_RECORD_FLAGS_KNOWN.contains(&flags),
+            flags_ok: MACRO_RECORD_LOOP_FLAGS.contains(&(flags as u8)),
             offset: start + at,
             mode,
             mode_name: macro_mode_name(mode),
             header_word: id,
             flags,
+            loop_flag: (flags & 0xff) as u8,
+            repeat_count: (flags >> 8) as u8,
             interval_ms,
             record_bytes: pos - at,
             action_count: actions.len(),
@@ -2758,8 +2795,13 @@ fn macro_lines(profile: &OnboardProfile) -> Vec<String> {
         lines.push(format!("    {line}"));
     }
     for rec in &profile.macros {
+        let times = if rec.mode == MACRO_MODE_COUNTED {
+            format!(" x{}", rec.repeat_count)
+        } else {
+            String::new()
+        };
         lines.push(format!(
-            "    #{} {} at {} (mode {} {}, interval {} ms, binding byte {}): {} action(s), {} bytes, header word {}",
+            "    #{} {} at {} (mode {} {}, interval {} ms{}, loop {}, binding byte {}): {} action(s), {} bytes, action count {}",
             rec.ordinal,
             if rec.flags_ok {
                 ""
@@ -2770,6 +2812,8 @@ fn macro_lines(profile: &OnboardProfile) -> Vec<String> {
             rec.mode,
             rec.mode_name,
             rec.interval_ms,
+            times,
+            rec.loop_flag,
             rec.index,
             rec.action_count,
             rec.record_bytes,
@@ -3747,7 +3791,7 @@ mod tests {
         );
         assert_eq!(
             (repeat.mode_name, repeat.interval_ms, repeat.flags_ok),
-            ("repeat", 5000, true)
+            ("toggle auto repeat", 5000, true)
         );
         assert_eq!(
             repeat.actions,
@@ -3781,7 +3825,7 @@ mod tests {
             (16, 4, 1, 1, 11, 15),
             "the record packed 16 bytes into the block is carried by the binding byte 16 / 4"
         );
-        assert_eq!(once.mode_name, "once");
+        assert_eq!(once.mode_name, "once on release");
         assert_eq!(once.actions.len(), 15);
         assert_eq!(once.actions.iter().filter(|a| a.kind == "press").count(), 4);
         assert_eq!(once.actions.iter().filter(|a| a.kind == "release").count(), 4);
@@ -3797,6 +3841,90 @@ mod tests {
             84,
             "the two records fill 84 of the block's {} bytes, with no gap and no length word between them",
             SYNTH_MACRO_BLOCK.len()
+        );
+    }
+
+    /// The five records of a profile GG wrote to the board (Apex 7 `0x1612`, firmware 4.16.8, schema b,
+    /// slot 2, 2026-10-24), with the playback the operator read off GG's macro editor for each one. This
+    /// is the ground truth behind [`MACRO_MODE_NAMES`], [`MACRO_RECORD_LOOP_FLAGS`] and the header fields
+    /// of [`OnboardMacro`]: the mode byte is GG's playback mode, the header word is GG's per-record
+    /// number (equal to the action count on this profile, not on a second one), the
+    /// flags low byte is 0 only on the mode-1 record, the flags high byte is the repeat count, and the
+    /// interval is milliseconds.
+    const GROUND_TRUTH_MACRO_BLOCK: [u8; 84] = [
+        0x77, 0x01, 0x01, 0x00, 0x00, 0x01, 0x0f, 0x00, 0x00, 0x03, 0x00, 0x01, 0x77, 0x02, 0x03, 0x00, 0x01, 0x45,
+        0x0f, 0x00, 0x00, 0x08, 0x00, 0x01, 0x04, 0x00, 0x01, 0x00, 0x00, 0x08, 0x00, 0x00, 0x77, 0x03, 0x03, 0x00,
+        0x01, 0x01, 0x19, 0x00, 0x00, 0x10, 0x00, 0x01, 0x04, 0x00, 0x01, 0x00, 0x00, 0x10, 0x00, 0x00, 0x77, 0x04,
+        0x03, 0x00, 0x01, 0x01, 0x1e, 0x00, 0x00, 0x20, 0x00, 0x01, 0x04, 0x00, 0x01, 0x00, 0x00, 0x20, 0x00, 0x00,
+        0x77, 0x05, 0x01, 0x00, 0x01, 0x01, 0x0f, 0x00, 0x00, 0x07, 0x00, 0x01,
+    ];
+
+    /// The five GG playback modes, one per record, decoded from the profile named on
+    /// [`GROUND_TRUTH_MACRO_BLOCK`]: each header field against what GG's UI showed.
+    #[test]
+    fn the_five_gg_playback_modes_decode_from_the_profile_gg_wrote() {
+        let mut data = vec![0u8; MACRO_DATA_LEN];
+        data[..GROUND_TRUTH_MACRO_BLOCK.len()].copy_from_slice(&GROUND_TRUTH_MACRO_BLOCK);
+        let (macros, note) = decode_macros(&data, 0, data.len());
+        assert!(note.is_none(), "the block is all records: {note:?}");
+        assert_eq!(macros.len(), 5);
+        let measured = macros
+            .iter()
+            .map(|rec| {
+                (
+                    rec.offset,
+                    rec.mode,
+                    rec.mode_name,
+                    rec.header_word,
+                    rec.loop_flag,
+                    rec.repeat_count,
+                    rec.interval_ms,
+                    rec.record_bytes,
+                    rec.action_count,
+                    rec.flags_ok,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            measured,
+            vec![
+                (0, 1, "once on release", 1, 0, 1, 15, 12, 1, true),
+                (12, 2, "play N times", 3, 1, 69, 15, 20, 3, true),
+                (32, 3, "repeat while pressed", 3, 1, 1, 25, 20, 3, true),
+                (52, 4, "toggle auto repeat", 3, 1, 1, 30, 20, 3, true),
+                (72, 5, "toggle hold", 1, 1, 1, 15, 12, 1, true),
+            ],
+            "GG's five modes in its own order, each with its header word, repeat count and interval"
+        );
+        assert_eq!(
+            macros.iter().map(|rec| rec.index).collect::<Vec<_>>(),
+            vec![0usize, 3, 8, 13, 18],
+            "the records sit at 0, 12, 32, 52 and 72 bytes into the block, so their binding bytes are 0, 3, 8, 13, 18"
+        );
+        let counted = &macros[1];
+        assert_eq!(
+            counted.actions,
+            vec![
+                MacroAction {
+                    kind: "press_mouse",
+                    key: None,
+                    mask: Some(0x08),
+                    ms: None
+                },
+                MacroAction {
+                    kind: "delay",
+                    key: None,
+                    mask: None,
+                    ms: Some(1)
+                },
+                MacroAction {
+                    kind: "release_mouse",
+                    key: None,
+                    mask: Some(0x08),
+                    ms: None
+                },
+            ],
+            "the 69-times macro presses mouse 4, waits, releases it: 4-byte actions, no terminator, no length word"
         );
     }
 
@@ -3833,7 +3961,7 @@ mod tests {
         );
         assert_eq!(
             (target.mode_name, target.interval_ms, target.actions[0].key),
-            ("once", 15, Some(0x1E)),
+            ("once on release", 15, Some(0x1E)),
             "the record names its keys by HID code, not by mapping slot"
         );
         assert_eq!((target.record_bytes, target.action_count), (68, 15));
@@ -3970,6 +4098,114 @@ mod tests {
                     && n.contains("1 header(s) there carry no action")
             ),
             "{note:?}"
+        );
+    }
+
+    /// The operator's `Some rebounds` dump of one `0x1612` board (2026-10-28), read byte by byte: GG
+    /// counts five actions in its first record and puts a 20 ms delay on the key-push triple (byte 1
+    /// `00`, the grammar's page byte), so the grammar walks only the press it can name and the rest -
+    /// counted actions and the trailing `01 key 00 00` release alike - is named as the bytes of the
+    /// block that are not records. The decode is byte-for-byte; the walk is a display reading.
+    #[test]
+    fn apex_7_macro_decode_stops_where_the_dump_grammar_stops_matching() {
+        let block: Vec<u8> = [
+            0x77u8, 0x04, 0x05, 0x00, 0x01, 0x01, 0x14, 0x00, 0x02, 0xe0, 0x01, 0x01, 0x02, 0x00, 0x14, 0x00, 0x02,
+            0xe0, 0x01, 0x01, 0x02, 0x00, 0x14, 0x00, 0x02, 0xe0, 0x01, 0x01, 0x01, 0x1f, 0x00, 0x00,
+        ]
+        .to_vec();
+        let (macros, note) = decode_macros(&block, 0, block.len());
+        assert_eq!(macros.len(), 1, "one record; the tail byte is not one: {macros:?}");
+        assert_eq!(
+            (macros[0].header_word, macros[0].action_count),
+            (5, 1),
+            "the header counts 5 actions; the grammar walks the press it can name"
+        );
+        assert_eq!(
+            macros[0].record_bytes, 12,
+            "the walk stops on the delay byte GG writes as 02 00 ms 00"
+        );
+        assert!(
+            note.as_ref().is_some_and(
+                |n| n.contains("14 non-zero byte(s) of the block are not records") && n.contains("first at +12")
+            ),
+            "the bytes GG counts inside the record and the release it leaves behind are named as the gap: \
+             {note:?}"
+        );
+        // The same tail behind a record whose count matches what walks: the walk stops on it, the
+        // record is its counted length, and the tail is the gap.
+        let ok: Vec<u8> = [
+            0x77u8, 0x04, 0x03, 0x00, 0x01, 0x01, 0x14, 0x00, 0x02, 0xe0, 0x01, 0x01, 0x02, 0x00, 0x14, 0x00, 0x01,
+            0x1f, 0x00, 0x00,
+        ]
+        .to_vec();
+        let (macros, note) = decode_macros(&ok, 0, ok.len());
+        assert_eq!((macros.len(), macros[0].action_count), (1, 1));
+        assert_eq!(macros[0].record_bytes, 12, "the counted press, the tail excluded");
+        assert!(note.as_ref().is_some_and(|n| n.contains("first at +12")), "{note:?}");
+    }
+
+    /// The flags low byte follows the mode, not a fixed pair: the operator's `Vanilla Bounds` dump
+    /// carries `00 03` on a mode-4 record, GG's "play N times" carries 69 in the high byte, and a
+    /// record with no actions keeps GG's `01 01`. The decoder's `flags_ok` marks a low byte outside
+    /// `0..=1`; the encoder sends the bytes a read produced and refuses only a list that describes
+    /// other bytes (see `a_mouse_mask_past_the_measured_bits_is_refused`).
+    #[test]
+    fn apex_7_macro_flags_accept_the_measured_rule() {
+        let record = |flags: u16| JsonMacro {
+            offset: 2076,
+            record_bytes: MACRO_HEADER_LEN + MACRO_ACTION_LEN,
+            raw: hex_of(&{
+                let mut bytes = vec![MACRO_RECORD_MARKER, 4u8, 5, 0];
+                bytes.extend_from_slice(&flags.to_le_bytes());
+                bytes.extend_from_slice(&20u16.to_le_bytes());
+                bytes.extend_from_slice(&[MACRO_ACTION_KEY, 0xe0, 0x01, 0x01]);
+                bytes
+            }),
+            mode: 4,
+            header_word: 5,
+            flags,
+            interval_ms: 20,
+            actions: vec![JsonMacroAction {
+                kind: "press".to_owned(),
+                key: Some(0xe0),
+                mask: None,
+                ms: None,
+            }],
+        };
+        // Low byte 0 with a repeat count: the bytes the operator's GG wrote.
+        assert!(
+            macro_record_bytes(&record(0x0300)).is_ok_and(|bytes| bytes[4] == 0x00 && bytes[5] == 0x03),
+            "the measured 00 03 writes"
+        );
+        // Any repeat count GG's "play N times" can carry, with the low byte 1.
+        assert!(
+            macro_record_bytes(&record(0x4501)).is_ok_and(|bytes| bytes[5] == 0x45),
+            "the repeat count is the high byte"
+        );
+        // The decoder marks a low byte outside 0..=1 as unmeasured, and carries the bytes through.
+        let (macros, note) = decode_macros(
+            &[
+                0x77, 0x04, 0x01, 0x00, 0x02, 0x01, 0x14, 0x00, 0x02, 0xe0, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
+            ],
+            0,
+            16,
+        );
+        assert_eq!(
+            (macros.len(), macros[0].flags_ok),
+            (1, false),
+            "low byte 2 is not a measured flag"
+        );
+        assert!(note.is_none(), "an unmeasured flag is not a parse problem: {note:?}");
+        let (measured, note) = decode_macros(
+            &[
+                0x77, 0x04, 0x01, 0x00, 0x00, 0x03, 0x14, 0x00, 0x02, 0xe0, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
+            ],
+            0,
+            16,
+        );
+        assert!(
+            measured[0].flags_ok && note.is_none(),
+            "the dump's 00 03 is a measured flag: {measured:?} {note:?}"
         );
     }
 

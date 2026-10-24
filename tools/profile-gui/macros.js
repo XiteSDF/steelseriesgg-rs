@@ -68,8 +68,17 @@
   const SCHEMA_B = 0x000b;
   const MODE_REPEAT = 4;
   const MODE_ONCE = 1;
+  const MODE_COUNTED = 2;
+  const MODE_WHILE_PRESSED = 3;
+  const MODE_TOGGLE_HOLD = 5;
   const MODE_LOOP = 6;
   const MODE_MAX = 8;
+  // The header's flags word, ground truth (Apex 7 `0x1612`, firmware 4.16.8, schema b, slot 2,
+  // 2026-10-24: a profile GG wrote, its five macros named in GG's own words): the low byte is a flag
+  // (0 on the mode-1 record, 1 on the mode 2, 3, 4 and 5 records) and the high byte is the repeat
+  // count - 69 on the "play 69 times every 15 ms" record, 1 on the four others.
+  const LOOP_FLAGS = [0, 1];
+  const REPEAT_MAX = 255;
   const U16_MAX = 65_535;
   // A `0x71` binding row names a record with one byte: the byte counts 4-byte units from the block
   // start, so the record it plays starts at `byte x 4` bytes into the block. Measured on a wired read
@@ -81,12 +90,15 @@
   const BINDING_REACH_BYTES = BINDING_BYTE_MAX * INDEX_UNIT;
   const CHANNEL = 'ssgg-macros';
 
-  // Modes the editor offers. Names come from the codec's `macro_mode_name` and GG's own words; only
-  // mode 4 is measured on a read, so the panel says what is measured and what is inferred.
+  // Modes the editor offers: the five playback modes of GG's macro editor, each measured on the
+  // ground-truth profile named on `LOOP_FLAGS` - one record per mode, all five in one profile, each
+  // named by the operator from GG's UI. The words are GG's own.
   const MODE_OPTIONS = [
-    { value: MODE_REPEAT, label: 'repeat every interval (mode 4)', measured: true },
-    { value: MODE_ONCE, label: 'once, interval ms between the actions (mode 1)', measured: true },
-    { value: MODE_LOOP, label: 'loop (mode 6, name from GG, unverified)', measured: false },
+    { value: MODE_ONCE, label: 'play once on release', measured: true },
+    { value: MODE_COUNTED, label: 'play N times every interval', measured: true },
+    { value: MODE_WHILE_PRESSED, label: 'repeat while pressed, every interval', measured: true },
+    { value: MODE_REPEAT, label: 'toggle auto repeat, every interval', measured: true },
+    { value: MODE_TOGGLE_HOLD, label: 'toggle hold', measured: true },
   ];
 
   const bindingByte = (offsetFromStart) => Math.floor(offsetFromStart / INDEX_UNIT);
@@ -102,15 +114,17 @@
   const mouseButton = (mask) => (mask > 0 && mask <= 128 && (mask & (mask - 1)) === 0
     ? MOUSE_BITS.findIndex(([bit]) => bit === mask) + 1
     : null);
-  // The header word a record carries: the measured rule is its action count (8 of the 9 records
-  // surveyed carry exactly that; the ninth carries 83 with 48 actions). It is data, not an identity -
-  // a binding names the position, never this word.
+  // The header word a record carries: the measured rule is its action count (14 of the 15 records
+  // surveyed carry exactly that; one carries 83 with 48 actions). It is data, not an identity - a
+  // binding names the position, never this word, and a rewrite keeps the number the read carried.
   const headerWordFor = (record) => record.header_word ?? (record.actions ?? []).length;
 
   const hex2 = (byte) => byte.toString(16).padStart(2, '0');
 
   // The macro record region of a profile: the read's own numbers when the report carries them
   // (`macro_region`, written by `ssgg onboard read`), the measured schema b constants otherwise.
+  // Ground truth (see `LOOP_FLAGS`): GG packs the records from the block's first byte, 8-byte header
+  // plus 4-byte actions, with no length word and no terminator between them.
   function regionOf(doc) {
     const region = doc && doc.macro_region;
     return {
@@ -216,7 +230,7 @@
         mode: record.mode & 0xff,
         mode_name: modeName(record.mode),
         flags: record.flags ?? RECORD_FLAGS,
-        flags_ok: (record.flags ?? RECORD_FLAGS) === RECORD_FLAGS,
+        flags_ok: flagsOk({ flags: record.flags ?? RECORD_FLAGS }),
         interval_ms: record.interval_ms,
         header_word: headerWordFor(record),
         action_count: actions.length,
@@ -229,10 +243,26 @@
   }
 
   function modeName(mode) {
-    if (mode === MODE_REPEAT) return 'repeat';
-    if (mode === MODE_ONCE) return 'once';
-    return 'unknown';
+    const option = MODE_OPTIONS.find((entry) => entry.value === mode);
+    return option ? option.label : 'unknown';
   }
+
+  // The two halves of the flags word, see `LOOP_FLAGS`.
+  const loopFlagOf = (record) => (record.flags ?? RECORD_FLAGS) & 0xff;
+  const repeatOf = (record) => ((record.flags ?? RECORD_FLAGS) >> 8) & 0xff;
+  const flagsOk = (record) => flagsRuleOk(record.flags ?? RECORD_FLAGS, record.mode);
+  // The measured rule, in one place: low byte 0 on the mode-1 record and on the mode-4 record that
+  // carries a repeat count (the second dump's `00 03`), 1 on the other measured records; the high byte
+  // is the repeat count and takes any byte. Modes the reads carry above the five measured ones keep
+  // their flags as they are.
+  const flagsRuleOk = (flags, mode) => {
+    const low = flags & 0xff;
+    const high = (flags >> 8) & 0xff;
+    if (mode > MODE_TOGGLE_HOLD) return true;
+    if (low === 1) return mode >= MODE_ONCE;
+    return low === 0 && (mode === MODE_ONCE || high > 0);
+  };
+  const withRepeat = (record, times) => ((record.flags ?? RECORD_FLAGS) & 0xff) | ((times & 0xff) << 8);
 
   function normalizeAction(action) {
     if (action.kind === 'press') return { kind: 'press', key: action.key ?? 0 };
@@ -327,7 +357,7 @@
           offset: at,
           ordinal: records.length,
           index: bindingByte(totalBytes(records)),
-          flags_ok: header.flags === RECORD_FLAGS,
+          flags_ok: flagsOk(header),
           mode: header.mode,
           mode_name: modeName(header.mode),
           header_word: header.headerWord,
@@ -396,8 +426,9 @@
     records.forEach((record, position) => {
       const where = `record ${position} (${recordBytes(record)} bytes)`;
       if (!Number.isInteger(headerWordFor(record)) || headerWordFor(record) < 1 || headerWordFor(record) > U16_MAX) {
-        problems.push(`${where}: the header word must be a whole number 1..${U16_MAX} - every record of every `
-          + 'read surveyed carries a non-zero word there, and 8 of the 9 carry exactly their action count');
+        problems.push(`${where}: the action count (the header word) must be a whole number 1..${U16_MAX} - every record of every `
+          + 'read surveyed carries a non-zero word there; it is the number GG keeps for the record, equal to '
+          + 'the action count on one dump and short of it on the other');
       }
       if ((record.actions ?? []).length === 0) {
         problems.push(`${where}: a record with no action is not a macro - the walk skips a header with no `
@@ -407,9 +438,11 @@
         problems.push(`${where}: interval must be a whole number 1..${U16_MAX} ms (a 16-bit word, and every `
           + 'record of every read surveyed has one)');
       }
-      if (record.flags !== RECORD_FLAGS) {
-        problems.push(`${where}: flags 0x${hex2(record.flags & 0xff)}${hex2((record.flags >> 8) & 0xff)} are `
-          + 'not 0x0101, the two bytes every record of every read surveyed carries');
+      if (!flagsRuleOk(record.flags ?? RECORD_FLAGS, record.mode)) {
+        problems.push(`${where}: flags 0x${hex2(record.flags & 0xff)}${hex2((record.flags >> 8) & 0xff)} - the low byte `
+          + 'is 0 on the mode-1 record and on the mode-4 record that carries a repeat count (the dumps '
+          + 'carry 00 03 there) and 1 on the other measured records; the high byte is the repeat count '
+          + 'and takes any byte');
       }
       if (!Number.isInteger(record.mode) || record.mode < 1 || record.mode > MODE_MAX) {
         problems.push(`${where}: mode must be a whole number 1..${MODE_MAX} (one byte; the reads surveyed `
@@ -586,20 +619,20 @@
       if (!record) {
         detail.replaceChildren(el('p', {
           class: 'hint',
-          text: 'Pick a macro above, or add one. A record is a header (mode, header word, interval) and its actions: key push, key release, mouse press, mouse release, wait.',
+          text: 'Pick a macro above, or add one. A record is a header (mode, action count, interval, repeat count) and its actions: key push, key release, mouse press, mouse release, wait.',
         }));
         return;
       }
       const modeSelect = select(MODE_OPTIONS.map((option) => ({
         value: option.value,
-        label: option.label,
+        label: `${option.label} (mode ${option.value})`,
       })), record.mode);
       modeSelect.addEventListener('change', () => {
         record.mode = Number.parseInt(modeSelect.value, 10);
         record.mode_name = modeName(record.mode);
         draw();
       });
-      const headerWordInput = numberInput(headerWordFor(record), 1, U16_MAX, 'header word (data: the measured rule is the action count)');
+      const headerWordInput = numberInput(headerWordFor(record), 1, U16_MAX, 'action count (the header word: the measured rule is the action count)');
       headerWordInput.addEventListener('change', () => {
         record.header_word = clampNumber(headerWordInput, 1, U16_MAX);
         headerWordInput.value = String(record.header_word);
@@ -609,6 +642,14 @@
       intervalInput.addEventListener('change', () => {
         record.interval_ms = clampNumber(intervalInput, 0, U16_MAX);
         intervalInput.value = String(record.interval_ms);
+        drawMeter();
+      });
+      // The repeat count, the flags word's high byte: GG's "play N times". Measured at 69 on the
+      // mode-2 record; the other modes carry 1 there.
+      const timesInput = numberInput(repeatOf(record), 0, REPEAT_MAX, "repeat count (the flags high byte; GG's \"play N times\")");
+      timesInput.addEventListener('change', () => {
+        record.flags = withRepeat(record, clampNumber(timesInput, 0, REPEAT_MAX));
+        timesInput.value = String(repeatOf(record));
         drawMeter();
       });
 
@@ -700,18 +741,18 @@
           class: 'subhead',
           text: `record #${state.selected} - binding byte `
             + `${bindingByte(record.offset - (region ? region.start : REGION_START_B))} `
-            + `(${INDEX_UNIT} x the bytes from the block start), header word ${headerWordFor(record)}, `
+            + `(${INDEX_UNIT} x the bytes from the block start), action count ${headerWordFor(record)}, `
             + `${recordBytes(record)} bytes, ${record.action_count ?? (record.actions ?? []).length} action(s)`,
         }),
         el('div', { class: 'macro-fields' }, [
           el('label', { class: 'mono', text: 'mode ' }, modeSelect),
-          el('label', { class: 'mono', text: 'header word ' }, headerWordInput),
+          el('label', { class: 'mono', text: 'actions ' }, headerWordInput),
           el('label', { class: 'mono', text: 'interval ms ' }, intervalInput),
+          el('label', { class: 'mono', text: 'times ' }, timesInput),
         ]),
         el('p', {
           class: 'hint mono',
-          text: `flags 0x${hex2(record.flags & 0xff)}${hex2((record.flags >> 8) & 0xff)} - every record of every read surveyed carries 0x0101, so the editor writes those; `
-            + 'mode 4 is measured on a read, mode 1 and 6 are named from GG. A push, a release, a mouse press and a mouse release are 4 bytes each and hold no duration: a wait is what carries milliseconds. The header word is the action count - every record of the reads surveyed carries its action count there.',
+          text: `flags 0x${hex2(record.flags & 0xff)}${hex2((record.flags >> 8) & 0xff)} - the low byte is 0 on the mode-1 record and on the mode-4 record carrying a repeat count (the second dump's 00 03) and 1 on the other records of the profile measured (the flag gates what is not known); the high byte is the repeat count, 69 on the "play 69 times every 15 ms" record and 1 on the four others. Mode 1 plays once on release, 2 plays N times every interval, 3 repeats while the key is pressed, 4 toggles auto repeat, 5 toggles hold - all five measured in one profile, each named from GG's UI. A push, a release, a mouse press and a mouse release are 4 bytes each and hold no duration: a wait is what carries milliseconds. The header word is GG's own number per record: 1, 3, 3, 3, 1 on the five records of the profile measured, each matching its actions, and on the second dump GG counts 5 actions in a record whose first triple carries its 20 ms delay on the key-push byte (02 00 14 00, byte 1 = 0 where the grammar wants a page), so the walk stops after the press and the rest is named as bytes that are not records.`,
         }),
         el('div', { class: 'macro-actions-list' }, actionRows),
         pushRow,
@@ -855,7 +896,7 @@
     SCHEMA_B, MODE_REPEAT,
     MODE_ONCE, MODE_LOOP, MODE_MAX, U16_MAX, INDEX_UNIT, BINDING_BYTE_MAX, BINDING_REACH_BYTES, bindingByte,
     offsetForBindingByte, maskName, makePressMouse, makeReleaseMouse, makePress, makeRelease, makeDelay,
-    headerWordFor, maxActions, MODE_OPTIONS,
+    headerWordFor, maxActions, MODE_OPTIONS, loopFlagOf, repeatOf, flagsOk, withRepeat, MODE_COUNTED,
     regionOf, editorDisabledReason, actionLen, recordBytes, totalBytes, plan, recordRaw, packRecords, modeName,
     normalizeAction, makePress, makeRelease, makeDelay, makeRecord, recordsFromBlock, workingRecords, applyRecords,
     limitProblems, keyLabel, keyOptions, describeAction, mount, bootPopup, CHANNEL,

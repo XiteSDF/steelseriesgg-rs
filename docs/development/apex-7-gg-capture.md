@@ -286,8 +286,10 @@ One code byte reaches `255`, so a binding names records up to `4 x 255 = 1020` b
 (`MACRO_BINDING_REACH_BYTES`); the block's capacity is larger than that reach, and a record packed past it is
 written and read back with no key able to play it. The u16 at record `+2` is **the record's action count**, not a
 macro id: GG's own writer stores the number of actions it packed there, and it equals the number of actions in all
-14 records of that read (the longest, at 2544, carries 83 and lists 83). The codec carries it as `header_word`
-data and validates only that it is non-zero. The two bytes at `+4` and `+5` are `01 01` in 13 of the 14 records and
+14 records of that read (the longest, at 2544, carries 83 and lists 83). The 2026-10-28 dumps keep that reading -
+`Vanilla Bounds` matches its count on every record - and add one record where GG counts 5 and its bytes walk as 6,
+so the number is GG's count of what it packed, not a value a reader can derive. The codec carries it as
+`header_word` data and validates only that it is non-zero. The two bytes at `+4` and `+5` are `01 01` in 13 of the 14 records and
 `00 01` in the one whose only action is a press with no release; `+5` is the repeat count and `+4` is a carried GG
 field - see [Macro playback modes](#macro-playback-modes-engine-binary-2026-10-28) (`MACRO_RECORD_FLAGS_KNOWN`
 lists the pairs the codec has seen).
@@ -332,7 +334,7 @@ What is **not** supported, and the limits that go with it:
   says so on each record past the reach.
 - **Two record fields are now GG-verified, two are not.** The mode byte, the u16 at `+2` (the action count, which
   is what the engine's writer stores there - `header_word` is that count, not an id, in all 14 records of the read
-  above) and the repeat count and interval are read out of the engine binary; see
+  above and in `Vanilla Bounds`) and the repeat count and interval are read out of the engine binary; see
   [Macro playback modes](#macro-playback-modes-engine-binary-2026-10-28). Unconfirmed: the carried byte at `+4`
   (`flags` is `01 01` in 13 of the 14 records, `00 01` in the one whose only action is a press with no release) and
   the UI name of each mode. The binding rule is `[EXPERIMENTAL]`: `offset / 4`, measured on the read named above,
@@ -448,13 +450,39 @@ carrying the block through, not validating it as GG does): `MACRO_MODE_MAX` is `
 `macro_mode_name` names mode `1` "once" and mode `4` "repeat" and calls `2`, `3`, `5` unknown, where GG's rule is
 that modes `2, 3, 4` carry the repeat pair and modes `1` and `5` carry none; and the decode walks a record's
 actions by its grammar and ignores the header's action count, which agrees with GG in all 14 records of the read
-above.
+above. The 2026-10-28 dumps show where the grammar is narrower than GG: on `Some rebounds` the first triple carries
+the delay on the key-push byte (`02 00 14 00`) and the release is written `01 key 00 00`, neither of which the
+grammar reads, so the record list is short and the note names the bytes; the write sends them back untouched.
 
 One more binding-side fact from the same read: GG writes a **second** binding for the mouse 4 / mouse 8 pair - the
 binding writer swaps the `0xE3` and `0xE7` codes when a flag is set, and the read's mapping table shows the pair
 (two rows naming one record). `[EXPERIMENTAL]`: from the writer's source, matched against the read's rows.
 
-## Profile write: open (`0x88`), buffer write (`03 00`), push (`0x05`), commit (`0xEB`)
+## Two operator dumps of one `0x1612` board (2026-10-28)
+
+Two profile files the operator saved from GG's own folder (`Vanilla Bounds`, slot 2; `Some rebounds`, slot 3) were
+read byte by byte. They pack their records contiguously from byte 0 of the 9,600-byte block at payload 2076 -
+where the codec's schema-b region starts - and they say the grammar is narrower than GG's writer:
+
+- **GG puts a delay on the key-push triple.** `Some rebounds` record 0 counts 5 actions and starts `02 00 14 00`:
+  byte 1 is `00`, where the grammar wants the keyboard page `01`. The grammar stops after the press it can name and
+  the note reports the rest as bytes that are not records. The decode is byte-for-byte, so a write sends all of it
+  back; only the record list in the report is a display reading.
+- **GG's own release style is `01 key 00 00`** (and `01 key 01 01` for a press), behind the counted actions. The
+  grammar does not read it; the walk stops there and the note names the four bytes.
+- **The flags low byte is not fixed to `0x01`.** `Vanilla Bounds` record 0 carries `00 03` on a mode-4 record: low
+  byte `0`, repeat count `3`. The accepted set is now the measured rule - low byte `0` on a mode-1 record, `1` on
+  the mode 2, 3, 4 and 5 records - and the high byte is free (GG's "play N times" carries 69 there). A record with
+  no actions keeps GG's `01 01`.
+- **The header word is GG's own number per record.** It equals each record's action count in `Vanilla Bounds`
+  (1, 3, 3, 3, 1) and counts 5 in the `Some rebounds` record whose triples walk as 6. The engine's writer stores the
+  count of the actions it packed and its reader loops that many triples, which is what the `Vanilla Bounds` numbers
+  agree with; it is not a field a reader can derive, and a rewrite keeps the value the read carried.
+
+The two dumps also differ from what GG's UI showed the operator: `Vanilla Bounds` record 0 is a 4 ms press-release
+gap where GG showed 10 ms, and its mode-4 record carries repeat count 3 where GG showed 1.
+
+## ## Profile write: open (`0x88`), buffer write (`03 00`), push (`0x05`), commit (`0xEB`)
 
 The engine's write API fills the whole **profile region**, which is larger than any schema's payload:
 `profile_size` = `0xA000` = 40,960 bytes (`PROFILE_REGION_BYTES`). Frames (`OnboardWriteFrame`, plan built by
