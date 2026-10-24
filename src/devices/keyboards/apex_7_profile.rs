@@ -946,7 +946,8 @@ pub struct Color {
 /// Lighting block of the on-board profile (57 bytes at payload offset 27).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LightingProfile {
-    /// Six raw OLED illumination option bytes, hex.
+    /// Six raw OLED illumination option bytes, hex. GG's name for the group; no field name for any of the six
+    /// exists in the engine binary or in the 4.16.8 firmware (`docs/development/apex-7-gg-capture.md`).
     pub oled_illumination_options: String,
     /// Colour of the lock-key cluster.
     pub lock_key_color: Color,

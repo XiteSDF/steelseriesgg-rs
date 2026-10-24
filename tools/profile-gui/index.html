@@ -16,7 +16,8 @@
   <div class="brand">
     <h1>ssgg on-board profile editor</h1>
     <p class="mono">edits the JSON of <code>ssgg onboard read --json</code> / <code>ssgg onboard decode --json</code> &middot;
-      files only, no device (live lighting only under <code>ssgg gui</code>) &middot; read, write and deploy are hardware-tested on an Apex 7 (`0x1612`)
+      files only, no device (live lighting only under <code>ssgg gui</code>) &middot; read, write and deploy are hardware-tested on an Apex 7 (`0x1612`) &middot;
+      the tab row below marks the open file with its change count and carries the revert of the whole file at its right end
       <span class="tag">reverse-engineered protocol</span></p>
   </div>
   <div class="toolbar">
@@ -48,12 +49,19 @@
       <span class="mono">[RT n]</span>. The two half caps above the numpad <span class="mono">-</span>
       are the wheel mappings, and clicking one binds it in the Key panel like any key; the rectangle above the numpad is the on-board OLED, drawn from
       the <span class="mono">oled.bytes_hex</span> block as a 128x40 monochrome bitmap, bit 7 of
-      each byte its left pixel; click the rect to edit the block.
+      each byte its left pixel; click the rect to paint it pixel by pixel, or upload a BMP into it.
     </p>
     <div id="belowBox" class="below-box"></div>
   </section>
   <section id="inspector" class="inspector"></section>
 </main>
+<section id="detailsBox" class="details-box" hidden>
+  <h2 class="details-title">Details</h2>
+  <p class="mono note">The read's own header, the binding tables and the macro block: what the file records,
+    not the keys the board shows. The two blocks above the keyboard, under the board, edit what the caps
+    display.</p>
+  <div id="detailsPanels" class="details-panels"></div>
+</section>
 <footer class="foot mono">
   Key binding source: <span class="mono">lisp/base_apex_legacy.lisp</span> (decrypted <span class="mono">.edevice</span> spec)
   model names and the per-model feature set are imported from Rust

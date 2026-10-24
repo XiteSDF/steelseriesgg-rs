@@ -10,6 +10,8 @@ const controls = {
   nameBar: document.getElementById('nameBar'),
   inspector: document.getElementById('inspector'),
   below: document.getElementById('belowBox'),
+  details: document.getElementById('detailsPanels'),
+  detailsBox: document.getElementById('detailsBox'),
   tabs: document.getElementById('tabs'),
   legend: document.getElementById('legend'),
   status: document.getElementById('status'),

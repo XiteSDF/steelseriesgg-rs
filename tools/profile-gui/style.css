@@ -57,6 +57,10 @@ code { font-family: var(--mono); }
 .btn.primary { background: #173a5e; border-color: #2a6ba8; }
 .btn.warn { background: #3b2a17; border-color: #6a4a22; }
 .btn.seg.active { background: #1d3a24; border-color: #2f7a44; color: #b9f0c8; }
+/* A disabled control has to read as disabled in this palette (the revert button on the OLED row
+   is disabled while the block matches the file as loaded). */
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn:disabled:hover { border-color: var(--line); }
 .btn.file { display: inline-flex; align-items: center; gap: 8px; }
 /* A display:none input is not labelable: clicking the label would open nothing.
    Keep it in the layout, invisible, so the label click opens the picker. */
@@ -81,6 +85,10 @@ code { font-family: var(--mono); }
   cursor: pointer;
 }
 .tab.active { color: var(--text); border-color: var(--accent); background: #16202b; }
+/* The undo for a whole file sits at the right end of the tab row, next to the tab it names: the
+   spacer eats the space between the tabs and the button. */
+.tabs-spacer { flex: 1 1 0; }
+.tab-revert { font-family: var(--mono); font-size: 12px; padding: 4px 9px; }
 
 .status { margin: 0; padding: 8px 16px; color: var(--muted); border-bottom: 1px solid var(--line); }
 
@@ -170,6 +178,12 @@ svg.board { display: block; width: 100%; height: auto; }
 .oled-img { image-rendering: pixelated; }
 .oled-box { margin-top: 8px; }
 .oled-preview { display: block; background: #000; border: 1px solid var(--line); image-rendering: pixelated; }
+/* The pixel editor: every OLED control in one row above the picture, and the stage under it as a
+   crosshair target that drags paint instead of selecting text or scrolling. The picture is
+   decoration - the stage takes the pointer, so the coordinates are the bitmap's own. */
+.oled-paint .oled-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 8px; }
+.oled-stage { display: inline-block; cursor: crosshair; user-select: none; -webkit-user-select: none; touch-action: none; }
+.oled-editor { pointer-events: none; }
 .key.selected .cap { stroke: var(--accent); stroke-width: 2.5; }
 .key.changed .cap { stroke: var(--warn); stroke-width: 2.5; stroke-dasharray: 4 3; }
 .strip-label { fill: var(--muted); font: 11px var(--mono); }
@@ -193,8 +207,16 @@ svg.board { display: block; width: 100%; height: auto; }
 /* The inspector edits the current selection; it stays in view while the panels under the
    board scroll past. */
 .inspector { display: flex; flex-direction: column; gap: 12px; position: sticky; top: 12px; }
-/* Panels that describe the rest of the profile: they fill the wide space under the board. */
+/* The two blocks that edit what the caps on the board show sit directly under the keyboard, side by
+   side: Rapid Tap and Lighting. */
 .below-box { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 12px; margin-top: 12px; }
+/* The Details section under the page: everything the file records that the board does not show. The
+   section is hidden while no file is open, and its heading is the page's own, not a panel's. */
+.details-box { padding: 0 16px 16px; }
+.details-box[hidden] { display: none; }
+.details-title { margin: 20px 0 6px; font-size: 15px; letter-spacing: 0.5px; text-transform: uppercase; color: var(--accent); }
+.details-box .note { margin: 0 0 10px; }
+.details-panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 12px; }
 .panel {
   background: var(--panel);
   border: 1px solid var(--line);
@@ -235,9 +257,6 @@ input[type="color"].color { width: 54px; height: 28px; padding: 2px; background:
 /* The whole macro, shown as its own block under the (short-labelled) binding select in the key panel. */
 ul.macro-actions { margin: 4px 0 0; padding: 0 0 0 16px; list-style: none; }
 ul.macro-actions li { margin: 2px 0; font-size: 11px; }
-
-ul.changes { margin: 6px 0 0; padding: 0 0 0 16px; color: var(--muted); }
-ul.changes li { margin: 2px 0; }
 
 .foot { padding: 12px 16px 24px; color: var(--muted); border-top: 1px solid var(--line); }
 

@@ -393,13 +393,13 @@ function toggleByteFor(hid) {
 }
 
 // The META mapping mask (lighting.meta_mapped_elements: 32 bytes at payload offset 42, 256 bits, the
-// bit index is a key's own HID usage). The rule is measured, not invented: in 8 of the 9 reports this
-// page decodes - the three fixtures, config_1, config_3 (as read and as stored older), and the
-// wired reads in the repo root - the stored bytes are exactly what this returns: a bit is set for every key
-// whose META-layer entry carries a binding (function byte != 0), the key named by meta_toggle_hid is
-// not set, and the wheel's two entries are never in it (no slot, no usage). The ninth file is
-// config_1-copy.json, edited on this page: its mask is the read's stale bytes and misses the binding
-// that edit added, which is why the mask is derived here and not typed.
+// bit index is a key's own HID usage). The rule is measured, not invented: in 8 of the 9 profile reports
+// decoded so far - this page's three fixtures and five wired reads of one `0x1612` board, taken as the
+// board stored them and as GG stored them - the stored bytes are exactly what this returns: a bit is set
+// for every key whose META-layer entry carries a binding (function byte != 0), the key named by
+// meta_toggle_hid is not set, and the wheel's two entries are never in it (no slot, no usage). The ninth
+// report is a copy of a read edited on this page: its mask is the read's stale bytes and misses the
+// binding that edit added, which is why the mask is derived here and not typed.
 // [EXPERIMENTAL] measured bit-for-bit in the reads this page decodes; a write carrying the derived mask has
 // applied on an Apex 7 (2026-10-20).
 function computeMetaMask(doc) {
@@ -1005,15 +1005,6 @@ function diffAgainst(original, current) {
   return changes;
 }
 
-function summarizeChanges(changes) {
-  const groups = new Map();
-  for (const { path, from, to } of changes) {
-    const key = path.replace(/\[\d+\]/g, '[]');
-    groups.set(key, (groups.get(key) ?? 0) + 1);
-  }
-  return [...groups.entries()].sort((a, b) => b[1] - a[1]);
-}
-
 // Which key a change path belongs to, for the keyboard to show pending edits.
 function changeKeyHids(changes) {
   const hids = new Map();
@@ -1059,6 +1050,9 @@ const state = {
   activeId: null,
   layer: LAYER_BASE,
   selected: null,
+  // The OLED pixel editor: which brush the next click uses, and the stroke in progress, so a drag
+  // paints a connected line instead of the two ends of it.
+  oledPaint: { mode: 'white', stroke: false, last: null },
   // Set when the Meta group is picked on the base layer: the binding select writes 0x62 to show the
   // action list, and picking Meta Toggle gives this entry its function byte back, because binding the
   // toggle is the profile byte alone.
@@ -1129,6 +1123,15 @@ function fileChanges(file) {
 
 function changedFiles() {
   return state.files.filter((file) => fileChanges(file).length > 0);
+}
+
+// Put one file back to the JSON it came in with. Every panel edit is a page-local edit of `doc`, and
+// `original` is the parsed file untouched, so the undo for a whole profile is one clone of it.
+function revertFile(file) {
+  const index = state.files.findIndex((item) => item.id === file.id);
+  if (index < 0) return null;
+  state.files[index] = { ...file, doc: cloneDoc(file.original) };
+  return state.files[index];
 }
 
 // Codes offered in the pickers: every code the offset table maps, plus 0x00.
@@ -1242,6 +1245,224 @@ function oledDataUrl(bytes) {
   image.data.set(oledPixels(bytes));
   ctx.putImageData(image, 0, 0);
   return canvas.toDataURL('image/png');
+}
+
+// A picture upload has to become the block geometry above: 128x40, 8 px per byte, bit 7 left.
+// The Rust codec carries the block byte-for-byte, so this page is the only place a file turns
+// into those 640 bytes. Sampling is nearest-neighbour over the whole picture - the rule for a
+// picture stretched to fill a fixed slot, which is how GG fills this panel from any image - and a
+// pixel lights at OLED_LIT_THRESHOLD/255 or above.
+const OLED_LIT_THRESHOLD = 128;
+const BMP_DIB_SIZES = [12, 40, 64, 108, 124];
+const BMP_ACCEPTED_BITS = [1, 4, 8, 24, 32];
+// BI_RGB, BI_RLE8, BI_RLE4, BI_BITFIELDS, BI_JPEG, BI_PNG, BI_ALPHABITFIELDS, then the CMYK set.
+const BMP_COMPRESSION_NAMES = {
+  0: 'BI_RGB', 1: 'BI_RLE8', 2: 'BI_RLE4', 3: 'BI_BITFIELDS', 4: 'BI_JPEG', 5: 'BI_PNG',
+  6: 'BI_ALPHABITFIELDS', 11: 'BI_CMYSTRGB', 12: 'BI_CMYSTRLE8', 13: 'BI_CMYSTRLE4',
+  14: 'BI_CMYSTBitFields', 15: 'BI_CMYSTALPHABITFIELDS',
+};
+// The masks a 32 bpp BI_BITFIELDS file carries, in the order the file stores them (little-endian
+// u32 each): blue, green, red. Anything else is a layout this page does not guess.
+const BMP_PLAIN_MASKS = [0x00ff0000, 0x0000ff00, 0x000000ff];
+
+const bmpU16 = (b, at) => b[at] | (b[at + 1] << 8);
+const bmpU32 = (b, at) => (b[at] | (b[at + 1] << 8) | (b[at + 2] << 16) | (b[at + 3] << 24)) >>> 0;
+const bmpI32 = (b, at) => b[at] | (b[at + 1] << 8) | (b[at + 2] << 16) | (b[at + 3] << 24);
+
+// How many palette entries the file actually carries: biClrCount says it, and 0 means the file
+// ships none (the spec's default of 2^bits entries is a synthetic palette, not bytes in the file).
+const declaredPaletteEntries = (bits, colorCount) => (colorCount > 0 ? Math.min(colorCount, 1 << bits) : 0);
+const defaultPalette = (bits) => (bits === 1
+  ? [[0, 0, 0], [255, 255, 255]]
+  : Array.from({ length: 1 << bits }, (_, i) => Array(3).fill(Math.round((i * 255) / ((1 << bits) - 1)))));
+
+// Reads the header only: width, height, bit depth, compression, orientation, row stride, pixel
+// offset and the palette. Rows are padded to 4 bytes and a positive height means bottom-up, so
+// both are recorded here and applied by bmpColor. Every rejection names what it found.
+function decodeBmp(input) {
+  const bytes = input instanceof Uint8Array ? input : Uint8Array.from(input ?? []);
+  const fail = (message) => { throw new Error(`not a BMP this page can read: ${message}`); };
+  if (bytes.length < 54) fail(`the file is ${bytes.length} bytes, a BMP needs a 14-byte file header and at least a 40-byte DIB header`);
+  if (bytes[0] !== 0x42 || bytes[1] !== 0x4d) fail(`the magic is 0x${hex2(bytes[0])} 0x${hex2(bytes[1])}, not 0x42 0x4d ("BM")`);
+  const dibSize = bmpU32(bytes, 14);
+  if (!BMP_DIB_SIZES.includes(dibSize)) fail(`the DIB header is ${dibSize} bytes, expected one of ${BMP_DIB_SIZES.join(', ')}`);
+  const core = dibSize === 12;
+  const width = core ? bmpU16(bytes, 18) : bmpI32(bytes, 18);
+  const rawHeight = core ? bmpU16(bytes, 20) : bmpI32(bytes, 22);
+  const bits = core ? bmpU16(bytes, 24) : bmpU16(bytes, 28);
+  const compression = core ? 0 : bmpU32(bytes, 30);
+  const compressionName = BMP_COMPRESSION_NAMES[compression] ?? `compression #${compression}`;
+  if (width <= 0) fail(`the width is ${width}, a BMP width must be positive`);
+  if (rawHeight === 0) fail('the height is 0, an empty picture');
+  const height = Math.abs(rawHeight);
+  const topDown = rawHeight < 0;
+  if (compression === 4 || compression === 5) fail(`${compressionName} embeds a ${compression === 4 ? 'JPEG' : 'PNG'} in the file, and this page decodes BMP pixels only`);
+  if (compression === 1 || compression === 2) fail(`${compressionName} is run-length encoded, this page reads uncompressed rows only`);
+  if (compression !== 0 && compression !== 3) fail(`${compressionName} is not a layout this page reads`);
+  if (!BMP_ACCEPTED_BITS.includes(bits)) {
+    fail(`${bits} bpp is not one of ${BMP_ACCEPTED_BITS.join(', ')} bpp${bits === 16 ? ' (5-5-5 and 5-6-5 are not decoded)' : ''}`);
+  }
+  const masksAt = 14 + dibSize;
+  let paletteAt = masksAt;
+  if (compression === 3) {
+    const masks = [bmpU32(bytes, masksAt), bmpU32(bytes, masksAt + 4), bmpU32(bytes, masksAt + 8)];
+    if (bits !== 32 || masks.some((mask, i) => mask !== BMP_PLAIN_MASKS[i])) {
+      fail(`BI_BITFIELDS with masks 0x${masks.map((mask) => hexOf([mask & 0xff, (mask >> 8) & 0xff, (mask >> 16) & 0xff, (mask >> 24) & 0xff].reverse())).join(' ')} at ${bits} bpp, this page takes the plain blue/green/red masks at 32 bpp`);
+    }
+    paletteAt = masksAt + 12;
+  }
+  const colorCount = core ? 1 << bits : bmpU32(bytes, 46);
+  const stride = (((bits * width + 31) >> 5) << 2);
+  const needed = stride * height;
+  let dataOffset = bmpU32(bytes, 10);
+  if (dataOffset < 14 + dibSize) dataOffset = paletteAt + (bits <= 8 ? declaredPaletteEntries(bits, colorCount) : 0);
+  if (bytes.length < dataOffset + needed) {
+    fail(`the file is ${bytes.length} bytes, ${dataOffset} + ${needed} are needed for ${width}x${height} at ${bits} bpp with ${stride}-byte rows`);
+  }
+  let palette = null;
+  if (bits <= 8) {
+    // A 1 bpp file usually ships no palette: index 0 is black, index 1 white. A 4 bpp file
+    // without one gets the grey ramp its 16 indices stand for, an 8 bpp file its own grey ramp.
+    // Entries the file does carry win over the default.
+    const declared = declaredPaletteEntries(bits, colorCount);
+    if (bytes.length < paletteAt + declared * 4) fail(`the file has ${bytes.length} bytes, the ${bits} bpp palette needs ${declared} entries at offset ${paletteAt}`);
+    palette = defaultPalette(bits);
+    for (let i = 0; i < declared; i += 1) {
+      // A BMP palette entry is blue, green, red, reserved.
+      palette[i] = [bytes[paletteAt + i * 4 + 2], bytes[paletteAt + i * 4 + 1], bytes[paletteAt + i * 4]];
+    }
+  }
+  return { bytes, width, height, bits, compression, compressionName, topDown, stride, dataOffset, palette };
+}
+
+// The colour of one source pixel: palette formats read the palette entry, 24 and 32 bpp read the
+// triple. 1 bpp puts bit 7 of a byte on its left pixel and 4 bpp its high nibble, matching the
+// row-major left-to-right order of the block itself.
+function bmpColor(bmp, x, y) {
+  const row = bmp.topDown ? y : bmp.height - 1 - y;
+  const at = bmp.dataOffset + row * bmp.stride;
+  if (bmp.bits === 24) return [bmp.bytes[at + x * 3 + 2], bmp.bytes[at + x * 3 + 1], bmp.bytes[at + x * 3]];
+  if (bmp.bits === 32) return [bmp.bytes[at + x * 4 + 2], bmp.bytes[at + x * 4 + 1], bmp.bytes[at + x * 4]];
+  let index;
+  if (bmp.bits === 1) index = (bmp.bytes[at + (x >> 3)] >> (7 - (x & 7))) & 1;
+  else if (bmp.bits === 4) index = (x & 1) ? bmp.bytes[at + (x >> 1)] & 0x0f : (bmp.bytes[at + (x >> 1)] >> 4) & 0x0f;
+  else index = bmp.bytes[at + x];
+  return bmp.palette[Math.min(index, bmp.palette.length - 1)];
+}
+
+// Nearest-neighbour sampling of a decoded BMP into the block, and the lit-pixel count it produced.
+function bmpToOledBytes(bmp, { width = OLED_W, height = OLED_H, threshold = OLED_LIT_THRESHOLD } = {}) {
+  const out = new Array((width * height) / 8).fill(0);
+  let lit = 0;
+  for (let y = 0; y < height; y += 1) {
+    const sy = Math.min(bmp.height - 1, Math.floor((y * bmp.height) / height));
+    for (let x = 0; x < width; x += 1) {
+      const sx = Math.min(bmp.width - 1, Math.floor((x * bmp.width) / width));
+      const [r, g, b] = bmpColor(bmp, sx, sy);
+      if (Math.round((r + g + b) / 3) >= threshold) {
+        out[y * (width / 8) + (x >> 3)] |= 1 << (7 - (x & 7));
+        lit += 1;
+      }
+    }
+  }
+  return { bytes: out, lit, width, height };
+}
+
+// Decode, sample and write the block in one call; the summary fields come from setOledBitmap.
+function applyBmpBytes(doc, input, options = {}) {
+  const bmp = decodeBmp(input);
+  const { bytes, lit, width, height } = bmpToOledBytes(bmp, options);
+  setOledBitmap(doc, bytes);
+  return {
+    source_width: bmp.width, source_height: bmp.height, bits: bmp.bits,
+    compression: bmp.compressionName, top_down: bmp.topDown, lit,
+    pixels: width * height, threshold: options.threshold ?? OLED_LIT_THRESHOLD,
+  };
+}
+
+// A File from the picker, read as bytes. The page has FileReader; the node-side suite calls
+// applyBmpBytes with the bytes directly.
+function applyBmpFile(doc, file) {
+  return new Promise((resolve, reject) => {
+    if (typeof FileReader !== 'function') { reject(new Error('this page has no FileReader')); return; }
+    const reader = new FileReader();
+    reader.onload = () => {
+      try { resolve(applyBmpBytes(doc, new Uint8Array(reader.result))); } catch (error) { reject(error); }
+    };
+    reader.onerror = () => reject(new Error(`${file?.name ?? 'the file'} could not be read`));
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+// Per-pixel painting. A pixel is one bit of the block: pixel index y * 128 + x lives in byte
+// index >> 3 at bit 7 - (index & 7), the same order the raster and the BMP sampler use, so a
+// painted pixel is the pixel the preview shows and the one the board lights.
+const OLED_PAINT_MODES = ['white', 'black'];
+const OLED_PAINT_SCALE = 2;
+
+const oledPixelIndex = (x, y) => (x >= 0 && x < OLED_W && y >= 0 && y < OLED_H ? y * OLED_W + x : null);
+const oledPixelXY = (index) => ({ x: index % OLED_W, y: Math.floor(index / OLED_W) });
+const oledLitPixels = (bytes) => bytes.reduce((total, byte) => {
+  let bits = byte & 0xff;
+  let count = 0;
+  while (bits) { bits &= bits - 1; count += 1; }
+  return total + count;
+}, 0);
+
+// Bresenham between two pixels: a fast drag reports a few points along it and every one of them
+// has to land, or the stroke comes out as dots.
+function oledLine(from, to) {
+  const a = oledPixelXY(from);
+  const b = oledPixelXY(to);
+  const dx = Math.abs(b.x - a.x);
+  const dy = Math.abs(b.y - a.y);
+  const stepX = a.x < b.x ? 1 : -1;
+  const stepY = a.y < b.y ? 1 : -1;
+  const out = [];
+  let x = a.x;
+  let y = a.y;
+  let err = dx - dy;
+  for (let guard = 0; guard < OLED_W * OLED_H; guard += 1) {
+    out.push(y * OLED_W + x);
+    if (x === b.x && y === b.y) break;
+    const twice = 2 * err;
+    if (twice > -dy) { err -= dy; x += stepX; }
+    if (twice < dx) { err += dx; y += stepY; }
+  }
+  return out;
+}
+
+// Paint a run of pixels with one brush into a copy of the block. `changed` counts the bits that
+// actually flipped, so painting white over white reports nothing written. A block with no
+// bytes_hex starts from every pixel off, like the Invert control treats it.
+function applyOledPixels(bytes, indices, mode) {
+  const out = Array.from(bytes && bytes.length === OLED_BYTES ? bytes : new Array(OLED_BYTES).fill(0));
+  const litBefore = oledLitPixels(out);
+  let changed = 0;
+  for (const index of indices) {
+    if (!Number.isInteger(index) || index < 0 || index >= OLED_W * OLED_H) continue;
+    const at = index >> 3;
+    const bit = 7 - (index & 7);
+    const want = mode === 'black' ? 0 : 1;
+    if (((out[at] >> bit) & 1) !== want) {
+      out[at] ^= 1 << bit;
+      changed += 1;
+    }
+  }
+  return { bytes: out, changed, lit: oledLitPixels(out), litBefore, pixels: OLED_W * OLED_H };
+}
+
+// Paint on the doc through setOledBitmap, so len, nonzero, fnv1a_64 and head stay true to the bytes.
+function applyOledPaint(doc, indices, mode) {
+  const info = applyOledPixels(oledBytes(doc), indices, mode);
+  setOledBitmap(doc, info.bytes);
+  return info;
+}
+
+// offsetX and offsetY are relative to the target, and the preview is drawn at OLED_PAINT_SCALE
+// device pixels per bitmap pixel, so the click's own coordinates name the pixel under it.
+function oledPixelAtEvent(event, scale = OLED_PAINT_SCALE) {
+  return oledPixelIndex(Math.floor((event.offsetX ?? 0) / scale), Math.floor((event.offsetY ?? 0) / scale));
 }
 
 function boardKeyList() {
@@ -1469,6 +1690,26 @@ function setOledBitmap(doc, bytes) {
   return oled;
 }
 
+// The block as the file was loaded with it. Every OLED control on the page is a page-local edit, so
+// this is the undo for all of them: the block object the file came in with goes back over the
+// current one, summary fields included, because those describe the bytes being restored.
+function revertOledBlock(file) {
+  const original = file?.original?.oled;
+  if (!original) return null;
+  file.doc.oled = JSON.parse(JSON.stringify(original));
+  const bytes = oledBytes(file.doc);
+  return {
+    bytes,
+    lit: oledLitPixels(bytes ?? []),
+    len: file.doc.oled.len,
+    nonzero: file.doc.oled.nonzero,
+    fnv1a_64: file.doc.oled.fnv1a_64,
+  };
+}
+
+// Whether the block differs from the file as loaded, which is what the revert button is disabled on.
+const oledBlockDiffers = (file) => JSON.stringify(file?.original?.oled ?? null) !== JSON.stringify(file?.doc?.oled ?? null);
+
 // ---------------------------------------------------------------------------
 // Panels
 // ---------------------------------------------------------------------------
@@ -1592,7 +1833,7 @@ function renderNameBar(file) {
     revert,
     el('span', {
       class: 'hint name-note',
-      text: `the name field of the profile is ${NAME_FIELD_BYTES} bytes (name_hex: ${doc.name_hex}); the changes list marks it, and Save writes it with the rest of the JSON`,
+      text: `the name field of the profile is ${NAME_FIELD_BYTES} bytes (name_hex: ${doc.name_hex}); the tab row marks the file as edited and its revert button takes the name back with the rest of the file, and Save writes it with the rest of the JSON`,
     }),
   );
 }
@@ -1613,7 +1854,28 @@ function renderTabs() {
     });
     box.appendChild(tab);
   }
-  if (!state.files.length) box.appendChild(el('span', { class: 'hint', text: 'no file loaded' }));
+  if (!state.files.length) {
+    box.appendChild(el('span', { class: 'hint', text: 'no file loaded' }));
+    return;
+  }
+  // The undo for the whole profile sits at the end of the tab row, where the tab it names is.
+  const file = activeFile();
+  const changes = file ? fileChanges(file).length : 0;
+  box.appendChild(el('span', { class: 'tabs-spacer' }));
+  box.appendChild(el('button', {
+    class: 'btn warn tab-revert',
+    text: changes ? `Revert ${file.filename} (${changes} change${changes === 1 ? '' : 's'})` : 'Revert this file',
+    ...(changes ? {} : { disabled: 'true' }),
+    onclick: () => {
+      if (!file) return;
+      revertFile(file);
+      state.selected = null;
+      if (ui.status) {
+        ui.status.textContent = `${file.filename} reverted to the JSON it was loaded with - save a copy to write it out`;
+      }
+      render();
+    },
+  }));
 }
 
 /// The keyboard a decode report records, stamped by the read as the report's first three fields:
@@ -1991,7 +2253,7 @@ function renderBindingPanel(file, target) {
         + (dirty ? ` This key is changed: 0x${hex2(entry.function)} ${hexOf(codes)}, and the file as loaded had 0x${hex2(original.function)} ${original.key_codes}.` : '')
       : `This entry has no factory binding measured in this editor, so there is nothing to reset to.`
         + (dirty ? ` This entry is changed: 0x${hex2(entry.function)} ${hexOf(codes)}, and the file as loaded had 0x${hex2(original.function)} ${original.key_codes}.` : ` The file as loaded had function 0x${hex2(original.function)} ${original.key_codes}.`))
-      + ' Undo and factory reset change this entry only: the profile byte meta_toggle_hid is a separate field and shows in the Changes list.',
+      + ' Undo and factory reset change this entry only: the profile byte meta_toggle_hid is a separate field and shows in the tab row as a change count.',
   }));
   return panel(`${name} - ${layer} layer`, rows);
 }
@@ -2101,7 +2363,7 @@ function renderLightingPanel(file) {
     });
     return line(label, input, note ?? `${field}: ${hexOf([light[field].r, light[field].g, light[field].b])}`);
   };
-  const hexFieldRow = (label, field, bytes) => line(label, textInput(light[field], (value) => {
+  const hexFieldRow = (label, field, bytes, note) => line(label, textInput(light[field], (value) => {
     const parsed = parseHex(value);
     if (!parsed || parsed.length !== bytes) {
       ui.status.textContent = `${field} needs ${bytes} hex bytes`;
@@ -2109,12 +2371,31 @@ function renderLightingPanel(file) {
     }
     light[field] = hexOf(parsed);
     render();
-  }), `${field}: ${bytes} bytes, hex`);
+  }), `${field}: ${bytes} bytes, hex${note ? `. ${note}` : ''}`);
   const winRow = line('Win key code', buildKeySelect(light.win_key_hid_code, { noneLabel: '0x00 - none' }), `0x${hex2(light.win_key_hid_code)} ${keyName(light.win_key_hid_code)}`);
   winRow.querySelector('select').addEventListener('change', (event) => {
     light.win_key_hid_code = Number(event.target.value);
     render();
   });
+  const oledNote = [
+    "GG's name for these six bytes - nothing in the engine binary and nothing in the 4.16.8 firmware names the",
+    "fields, and the name comes from the encrypted lisp spec. GG's Apex 7 front end offers no OLED option beyond",
+    "the image upload (operator-reported 2026-10-23), so these are the keyboard's own DISPLAY-menu settings the",
+    "profile carries: BRIGHTNESS, DISPLAY ICONS, TIMEOUT. Which byte is which is unverified - the read-out is set",
+    "one on the board, read the slot, diff it. The captures this page ships read 02 00 00 00 00 00 on the live",
+    "board's slot and 00 02 00 00 00 00 on the stock slot, and this page never edits these bytes on a write: a",
+    "decoded payload round-trips them byte for byte.",
+  ].join(' ');
+  const dimmerNote = [
+    "0-255, and every capture this page ships carries 255. The board's own menu offers DIM and BRIGHTNESS levels.",
+    "Unverified as a brightness scale.",
+  ].join(' ');
+  const timeoutNote = [
+    "u32 ms, and 0 in every capture this page ships. The board's own ladder, read out of the 4.16.8 firmware",
+    "2026-10-23, is 5 SECS, 10 SECS, 30 SECS, 1 MIN, 5, 10, 15, 30, 45 MINS, 1, 2, 3, 5 HOURS, NONE, NEVER - so 0,",
+    "5000, 10000, 30000, 60000, 300000, 600000, 900000, 1800000, 2700000, 3600000, 7200000, 10800000, 18000000 are",
+    "the values it can show. Unverified as this field's units.",
+  ].join(' ');
   const rows = [
     colorRow('Lock-key cluster', 'lock_key_color'),
     colorRow('META cluster', 'meta_key_color'),
@@ -2126,20 +2407,20 @@ function renderLightingPanel(file) {
       const bits = metaMaskDiffers(stored, derived);
       return line('META mapped mask', el('span', { class: 'mono', text: derived }), `derived from the META layer, so it is not editable: bit n is set for every key whose META-layer entry carries a binding (function byte != 0), the bit index is that key's own HID usage, the key meta_toggle_hid names (0x${hex2(Number(doc.meta_toggle_hid ?? 0))}) is left out, and the wheel's two entries are never in it. ${bits === 0 ? 'the bytes this read carries (meta_mapped_elements) are the same' : `this read carries ${stored}, which differs from the derived mask in ${bits} bit(s) - a write sends the derived mask`} [EXPERIMENTAL] measured bit-for-bit in the reports this page decodes, and verified on hardware 2026-10-20 (a write carrying it applied: the META lighting followed the META-layer bindings with the meta_toggle_hid key left out)`);
     })(),
-    hexFieldRow('OLED illumination options', 'oled_illumination_options', 6),
+    hexFieldRow('OLED illumination options', 'oled_illumination_options', 6, oledNote),
     winRow,
     line('META background dimmer', numberInput(light.meta_key_background_dimmer, 0, 255, (value) => {
       light.meta_key_background_dimmer = value;
       render();
-    })),
+    }), dimmerNote),
     line('Idle-mode dimmer', numberInput(light.idle_mode_dimmer, 0, 255, (value) => {
       light.idle_mode_dimmer = value;
       render();
-    })),
+    }), dimmerNote),
     line('Idle timeout (ms)', numberInput(light.idle_timeout_ms, 0, 4294967295, (value) => {
       light.idle_timeout_ms = value;
       render();
-    })),
+    }), timeoutNote),
   ];
   return panel('Lighting block', rows);
 }
@@ -2379,7 +2660,7 @@ async function macroSessionGet() {
 }
 
 // The edited records land on the open file as a change against it: the file keeps its name and its
-// `original`, so the Changes panel lists the macros and Save a copy writes them out.
+// `original`, so the tab row's change count marks them and Save a copy writes them out.
 function adoptMacroRecords(records) {
   const file = activeFile();
   const editor = globalThis.SsggMacroEditor;
@@ -2439,7 +2720,7 @@ function mountInlineMacroEditor(file) {
       const result = adoptMacroRecords(records);
       if (macroEditor.mounted) {
         macroEditor.mounted.setStatus(result.ok
-          ? `applied: ${result.records} record(s), ${result.used} bytes used, ${result.free} free - the Changes panel lists them, and Save a copy writes the JSON`
+          ? `applied: ${result.records} record(s), ${result.used} bytes used, ${result.free} free - the tab row marks the file with the change count, and Save a copy writes the JSON`
           : `not applied: ${result.error}`);
       }
     },
@@ -2587,54 +2868,114 @@ function renderOledPanel(file) {
         + (bytes && bytes.length && fnv1a64(bytes) !== oled.fnv1a_64 ? ` - the stored hash does not match the ${bytes.length} bytes in bytes_hex (those hash to ${fnv1a64(bytes)}); the picture is drawn from bytes_hex` : ''),
     }), `${OLED_W} x ${OLED_H} monochrome pixels = 8 px per byte, 16 bytes per row, ${OLED_BYTES} bytes; bit 7 of a byte is its left pixel (confirmed on an Apex 7, 0x1612: the image GG paints on its panel decodes to these bytes, and writing them back paints that picture), so there is no bit-order switch. The decoder writes the whole block as bytes_hex.`),
   ];
-  rows.push(line('Drawn',
-    url
-      ? el('div', { class: 'oled-box' }, [
-        el('img', { class: 'oled-preview', src: url, width: String(OLED_W * 2), height: String(OLED_H * 2), alt: 'on-board OLED bitmap' }),
-      ])
-      : el('p', {
-        class: 'hint',
-        text: bytes
-          ? 'this page cannot raster the bitmap (no 2D canvas), so the board keeps its text label.'
-          : 'this dump has no oled.bytes_hex: it was written before the decoder started dumping the block. Run `ssgg onboard decode <image.bin>` on the saved image to get it.',
-      })));
+  const paint = state.oledPaint;
+  // A stroke ends on the pointer leaving the stage or the button coming up: the full repaint then
+  // carries the new bytes to the board's picture and to the summary row.
+  const endStroke = () => {
+    if (!paint.stroke) return;
+    paint.stroke = false;
+    paint.last = null;
+    render();
+  };
+  const paintAt = (event) => {
+    if (event.button !== undefined && event.button !== 0) return;
+    const index = oledPixelAtEvent(event);
+    if (index === null) return;
+    const stroke = paint.last === null ? [index] : oledLine(paint.last, index);
+    paint.last = index;
+    const info = applyOledPaint(doc, stroke, paint.mode);
+    if (editor) editor.setAttribute('src', oledDataUrl(info.bytes));
+    if (ui.status) {
+      ui.status.textContent = `OLED painted with the ${paint.mode} brush: ${stroke.length} pixel(s) in this stroke, ${info.changed} changed, ${info.lit}/${info.pixels} lit - save the JSON, then \`ssgg onboard write\``;
+    }
+  };
+  let editor = null;
+  if (url) {
+    editor = el('img', {
+      class: 'oled-preview oled-editor',
+      src: url,
+      width: String(OLED_W * OLED_PAINT_SCALE),
+      height: String(OLED_H * OLED_PAINT_SCALE),
+      alt: `on-board OLED bitmap, painted with the ${paint.mode} brush`,
+    });
+  }
+  // The pointer target is the stage, not the picture: the paint works from the click coordinates
+  // alone, so it keeps working on a page that cannot raster the preview (no 2D canvas) and the
+  // brush buttons above never shift the coordinates.
+  const stage = el('div', {
+    class: 'oled-stage',
+    onmousedown: (event) => { paint.stroke = true; paintAt(event); },
+    onmousemove: (event) => { if (paint.stroke) paintAt(event); },
+    onmouseup: endStroke,
+    onmouseleave: endStroke,
+  }, [editor ?? el('p', {
+    class: 'hint',
+    text: bytes
+      ? 'this page cannot raster the bitmap (no 2D canvas), so the paint works on the blank stage: click where the pixel is, the picture below the board shows the block after a repaint.'
+      : 'this dump has no oled.bytes_hex: it was written before the decoder started dumping the block. Run `ssgg onboard decode <image.bin>` on the saved image to get it.',
+  })]);
+  // Every OLED control lives in this one row, above the picture it edits: the two brushes, the
+  // revert to the bytes the file was loaded with, the blank and invert actions, and the BMP picker.
+  const clean = !oledBlockDiffers(file);
+  const upload = el('label', { class: 'btn file oled-upload' }, [
+    el('span', { text: 'Upload a BMP' }),
+    el('input', {
+      type: 'file',
+      accept: '.bmp,image/bmp',
+      onchange: (event) => {
+        const picked = event.target.files?.[0];
+        if (!picked) return;
+        applyBmpFile(doc, picked)
+          .then((info) => {
+            if (ui.status) {
+              ui.status.textContent = `OLED block replaced from ${picked.name}: ${info.source_width}x${info.source_height} ${info.bits} bpp ${info.compression}${info.top_down ? ' (top-down rows)' : ''} sampled to ${OLED_W}x${OLED_H}, ${info.lit}/${info.pixels} pixels lit at ${info.threshold}/255 - save the JSON, then \`ssgg onboard write\``;
+            }
+            render();
+          })
+          .catch((error) => { if (ui.status) ui.status.textContent = `BMP refused: ${error.message}`; });
+      },
+    }),
+  ]);
+  rows.push(line('Paint', el('div', { class: 'oled-box oled-paint' }, [
+    el('div', { class: 'oled-tools' }, [
+      button('White pixel', () => { paint.mode = 'white'; paint.stroke = false; paint.last = null; render(); }, `btn seg oled-tool${paint.mode === 'white' ? ' active' : ''}`),
+      button('Black pixel', () => { paint.mode = 'black'; paint.stroke = false; paint.last = null; render(); }, `btn seg oled-tool${paint.mode === 'black' ? ' active' : ''}`),
+      el('button', {
+        class: 'btn oled-tool oled-revert',
+        text: 'Revert the OLED block',
+        ...(clean ? { disabled: 'true' } : {}),
+        onclick: () => {
+          const info = revertOledBlock(file);
+          paint.stroke = false;
+          paint.last = null;
+          if (ui.status) {
+            ui.status.textContent = info
+              ? `OLED block reverted to the ${info.len} bytes the file was loaded with (${info.lit}/${OLED_W * OLED_H} pixels lit) - save the JSON, then \`ssgg onboard write\``
+              : 'this file has no OLED block as loaded, so there is nothing to revert to';
+          }
+          render();
+        },
+      }),
+      button('Set all black', () => {
+        paint.stroke = false;
+        paint.last = null;
+        setOledBitmap(doc, new Array(OLED_BYTES).fill(0));
+        render();
+      }, 'btn oled-tool oled-clear'),
+      button('Invert every pixel', () => {
+        const src = bytes ? Array.from(bytes) : new Array(OLED_BYTES).fill(0);
+        setOledBitmap(doc, src.map((byte) => byte ^ 0xff));
+        render();
+      }, 'btn oled-tool oled-invert'),
+      upload,
+      el('span', { class: 'hint', text: `brush: ${paint.mode}; click paints one pixel, drag paints the line` }),
+    ]),
+    stage,
+  ]),
+    `white lights a pixel and black turns it off: a click paints the pixel under the pointer (${OLED_W}x${OLED_H} pixels at ${OLED_PAINT_SCALE}x scale, so the click's own coordinates name it) and a drag paints every pixel between the points it reports, so a fast stroke comes out connected. Revert the OLED block puts back the bytes_hex the file was loaded with, and is disabled while the block already matches it - every control in this row is a page-local edit, so that button is the undo for all of them. Set all black writes ${OLED_BYTES} zero bytes. Invert every pixel flips every bit of bytes_hex: lit becomes off and off becomes lit, bit 7 stays the left pixel of its byte, so the picture is mirrored in colour only and never moved, inverting twice is the identity, and a block with no bytes_hex inverts to every pixel lit. Upload a BMP reads the file into ${OLED_BYTES} bytes: BI_RGB at 1, 4, 8, 24 and 32 bpp, BI_BITFIELDS at 32 bpp with the plain blue/green/red masks, bottom-up and top-down rows; BI_JPEG, BI_PNG, RLE, 16 bpp and any other mask layout are refused with what was found; the picture is sampled to ${OLED_W}x${OLED_H} by nearest neighbour (the rule for a picture stretched to fill a slot, which is how GG fills this panel from any image) and a pixel lights at ${OLED_LIT_THRESHOLD}/255 or above. Every control here rewrites bytes_hex and recomputes len, nonzero, fnv1a_64 and head from it. Only the JSON changes: this page opens configs read from an Apex 7 and writes files, never a keyboard - the write to the board is \`ssgg onboard write\`.`));
   rows.push(line('Bitmap data', el('span', { class: 'mono', text: `${OLED_W} x ${OLED_H} pixels, ${OLED_BYTES} bytes, 1 bit per pixel` }),
     `oled.bytes_hex (${OLED_BYTES} bytes) is the whole picture; the top-left pixel is byte 0 bit 7 (confirmed on hardware). The summary row shows the hash the dump records and the same FNV-1a-64 recomputed from these bytes.`));
-  rows.push(line('Blank', button('Set all black', () => {
-    setOledBitmap(doc, new Array(OLED_BYTES).fill(0));
-    render();
-  }, 'btn oled-clear'), 'writes 640 zero bytes into oled.bytes_hex and recomputes len, nonzero, fnv1a_64 and head. Only the JSON changes: this page opens configs read from an Apex 7 and writes files, never a keyboard - the write to the board is `ssgg onboard write`.'));
-  rows.push(line('Invert', button('Invert every pixel', () => {
-    const src = bytes ? Array.from(bytes) : new Array(OLED_BYTES).fill(0);
-    setOledBitmap(doc, src.map((byte) => byte ^ 0xff));
-    render();
-  }, 'btn oled-invert'), `flips every bit of oled.bytes_hex: ${OLED_BYTES} bytes, ${OLED_W * OLED_H} pixels, lit becomes off and off becomes lit. Bit 7 stays the left pixel of its byte, so the picture is mirrored in colour only, never moved. len, nonzero, fnv1a_64 and head are recomputed, and inverting twice is the identity. A block with no bytes_hex inverts to every pixel lit. Only the JSON changes: this page opens configs read from an Apex 7 and writes files, never a keyboard - the write to the board is ssgg onboard write.`));
   return panel(`On-board OLED (the board rect, ${OLED_W}x${OLED_H} 1bpp)`, rows);
-}
-
-function renderChangesPanel(file) {
-  const changes = fileChanges(file);
-  const rows = [
-    el('p', { class: 'hint', text: `${changes.length} change(s) against the file as loaded. Saving writes the whole JSON, unknown fields included.` }),
-  ];
-  if (changes.length) {
-    const list = el('ul', { class: 'changes' });
-    for (const [path, count] of summarizeChanges(changes)) {
-      list.appendChild(el('li', { class: 'mono', text: `${path} x${count}` }));
-    }
-    for (const { path, from, to } of changes.slice(0, 40)) {
-      list.appendChild(el('li', { class: 'mono', text: `${path}: ${JSON.stringify(from)} -> ${JSON.stringify(to)}` }));
-    }
-    rows.push(list);
-    rows.push(el('div', { class: 'btnrow' }, [
-      button('Revert this file', () => {
-        const index = state.files.findIndex((item) => item.id === file.id);
-        state.files[index] = { ...file, doc: cloneDoc(file.original) };
-        render();
-      }, 'btn warn'),
-    ]));
-  }
-  return panel('Changes', rows);
 }
 
 // ---------------------------------------------------------------------------
@@ -2676,7 +3017,8 @@ function legendRows() {
 }
 
 // Where each panel goes: the column right of the board edits the current selection (a key, a wheel
-// cap, or the OLED), the wide space under the board carries the rest of the profile.
+// cap, or the OLED), the two blocks under the board edit what the caps show (Rapid Tap, lighting), and
+// the Details section under the page carries the rest of the profile.
 function panelPlan(file) {
   const changes = fileChanges(file);
   return {
@@ -2684,13 +3026,18 @@ function panelPlan(file) {
     inspector: [
       state.selected === SELECT_OLED ? renderOledPanel(file) : renderKeyPanel(file),
     ],
-    below: [
+    // Directly under the keyboard, the two blocks that edit what the caps on the board show: the Rapid Tap
+    // pairs (marked [RT n] on the caps) and the lighting colour the board paints with.
+    primary: [
+      renderRapidTapPanel(file),
+      renderLightingPanel(file),
+    ],
+    // Everything that describes the file rather than the keys on it, under the Details heading: the read's
+    // own header, the binding tables and the macro block.
+    details: [
       renderHeader(file, changes),
       renderBindingsPanel(file),
       renderMacrosPanel(file),
-      renderLightingPanel(file),
-      renderRapidTapPanel(file),
-      renderChangesPanel(file),
     ],
   };
 }
@@ -2702,6 +3049,8 @@ function render() {
   renderTabs();
   ui.inspector.replaceChildren();
   ui.below.replaceChildren();
+  ui.details.replaceChildren();
+  if (ui.detailsBox) ui.detailsBox.hidden = true;
   if (!file) {
     ui.status.textContent = 'load one or more profile JSON dumps (schema a or b). The board binds keys through the legacy HID -> offset table.';
     ui.legend.replaceChildren();
@@ -2713,7 +3062,9 @@ function render() {
   renderNameBar(file);
   paintBoard(ui.board, doc, state.layer, state.selected, changedHids);
   ui.inspector.replaceChildren(...plan.inspector);
-  ui.below.replaceChildren(...plan.below);
+  ui.below.replaceChildren(...plan.primary);
+  ui.details.replaceChildren(...plan.details);
+  if (ui.detailsBox) ui.detailsBox.hidden = false;
   ui.legend.replaceChildren(legendRows());
   if (ui.onRender) ui.onRender();
 }
@@ -2806,7 +3157,7 @@ function handleKeyClick(hid) {
     state.selected = SELECT_OLED;
     const oled = file.doc.oled;
     ui.status.textContent = oled && oled.bytes_hex
-      ? `on-board OLED selected - ${OLED_W}x${OLED_H} bitmap at payload offset ${oled.offset}, ${oled.nonzero}/${oled.len} bytes non-zero; the panel next to the board shows the bitmap data and can blank the block`
+      ? `on-board OLED selected - ${OLED_W}x${OLED_H} bitmap at payload offset ${oled.offset}, ${oled.nonzero}/${oled.len} bytes non-zero; the panel next to the board paints it pixel by pixel and can blank the block`
       : 'on-board OLED selected - this dump has no oled.bytes_hex, re-decode the saved image with ssgg onboard decode';
     render();
     return;
@@ -2830,13 +3181,13 @@ const SsggProfileApp = {
   MASK_MODE_REPORT_BOTH, HID2OFF, OFF2HID, KEY_NAMES, keyName, LAYOUT_LABELS, boardLabel, labelClass, subClass, fitSubText, ARROW_GLYPHS,
   WHEEL_UP, WHEEL_DOWN, WHEEL_KEYS, OLED_RECT, OLED_W, OLED_H, oledBytes, oledPixels, oledDataUrl, paintOled, renderOledPanel,
   MACRO_DATA_LEN, macroBlockBytes,
-  wheelEntry, copyName, CODE_COUNT, CONSUMER_TARGETS, PRODUCT_NAMES, LEGACY_ONBOARD_PIDS, PRODUCTS, IMPORT_SOURCE, onboardModelPids, importedName, productKind, deviceFeatures, deviceLabel, productHex, MEDIA_NAMES, MOUSE_FUNCTIONS, MOUSE_NAMES, META_ACTION_NAMES, META_CAP_LABELS, BINDING_GROUPS, FACTORY_BASE_ZEROS, FACTORY_BASE_MEDIA, FACTORY_BASE_EXTRA, FACTORY_META, bindingGroup, factoryEntry, optionSelect, bindingGroupOptions, mouseActionOptions, keyboardKeyOptions, mediaKeyOptions, metaActionOptions, macroBindingOptions, macroSummary, bindingOf, bindingCounts, codesPerEntry, customBindings, normalizeDoc, normalizeEntry, selectKey, renderBindingsPanel, FUNCTION_NAMES, functionName, hex2, hexOf, parseHex, colorToHex, hexToColor, LAYOUT_ROWS, LAYOUT, LAYOUT_HIDS, EXTRA_HIDS, MAPPING_COUNT, LAYER_BASE, LAYER_META, EXPECTED_ARRAYS, isValidProfileDoc, layerArray, keyEntry, mappingCodes, writeCodes, setFunction, setCode, setAllCodes, keyState, rapidTap, setRapidPair, rapidTapKeysFor, lighting, setLightingColor, NAME_FIELD_BYTES, setProfileName, serializeDoc, cloneDoc, diffAgainst, summarizeChanges, changeKeyHids, SVG_NS, el, svg, state, activeFile, activeDoc, nextFileId, addFile, downloadText, saveFile, fileChanges, changedFiles, codeOptions, CODE_OPTIONS, buildKeySelect, buildFunctionSelect, UNIT, GAP, boardKeyList, buildBoard, FILL_COLORS, paintBoard, ui, panel, line, numberInput, textInput, button, renderTabs, renderHeader, mappingRows, renderKeyPanel, renderBindingPanel, renderNameBar, panelPlan,
+  wheelEntry, copyName, CODE_COUNT, CONSUMER_TARGETS, PRODUCT_NAMES, LEGACY_ONBOARD_PIDS, PRODUCTS, IMPORT_SOURCE, onboardModelPids, importedName, productKind, deviceFeatures, deviceLabel, productHex, MEDIA_NAMES, MOUSE_FUNCTIONS, MOUSE_NAMES, META_ACTION_NAMES, META_CAP_LABELS, BINDING_GROUPS, FACTORY_BASE_ZEROS, FACTORY_BASE_MEDIA, FACTORY_BASE_EXTRA, FACTORY_META, bindingGroup, factoryEntry, optionSelect, bindingGroupOptions, mouseActionOptions, keyboardKeyOptions, mediaKeyOptions, metaActionOptions, macroBindingOptions, macroSummary, bindingOf, bindingCounts, codesPerEntry, customBindings, normalizeDoc, normalizeEntry, selectKey, renderBindingsPanel, FUNCTION_NAMES, functionName, hex2, hexOf, parseHex, colorToHex, hexToColor, LAYOUT_ROWS, LAYOUT, LAYOUT_HIDS, EXTRA_HIDS, MAPPING_COUNT, LAYER_BASE, LAYER_META, EXPECTED_ARRAYS, isValidProfileDoc, layerArray, keyEntry, mappingCodes, writeCodes, setFunction, setCode, setAllCodes, keyState, rapidTap, setRapidPair, rapidTapKeysFor, lighting, setLightingColor, NAME_FIELD_BYTES, setProfileName, serializeDoc, cloneDoc, diffAgainst, changeKeyHids, SVG_NS, el, svg, state, activeFile, activeDoc, nextFileId, addFile, downloadText, saveFile, fileChanges, changedFiles, revertFile, codeOptions, CODE_OPTIONS, buildKeySelect, buildFunctionSelect, UNIT, GAP, boardKeyList, buildBoard, FILL_COLORS, paintBoard, ui, panel, line, numberInput, textInput, button, renderTabs, renderHeader, mappingRows, renderKeyPanel, renderBindingPanel, renderNameBar, panelPlan,
   MACRO_MARKER, MACRO_MODE_NAMES, MACRO_INDEX_UNIT, MACRO_BINDING_BYTE_MAX, MACRO_BINDING_REACH_BYTES, MACRO_MOUSE_BITS, macroRecords, macroIndex, macroRegionStart, macroBindingByte, macroOffsetForBindingByte, macroRecordOrdinal, macroRecordFor, macroMouseMaskName, macroKeystrokes, macroBoundKeys, macroLine, macroDetailRows, renderMacrosPanel,
   MACRO_CHANNEL, macroEditor, sessionToken, macroSessionPost, macroSessionGet, adoptMacroRecords, adoptProfileJson, syncMacroSession, mountInlineMacroEditor, openMacroEditor,
   META_TOGGLE_FUNCTION, META_LOCK_WIN_ACTION, computeMetaMask, metaMaskDiffers, META_KEY_HID, META_KEY_GG_CODE, META_KEY_SLOT, hidSlot, boardHid, metaToggleByte, toggleByteFor, isLockWinEntry, lockWinBinding, lockWinMarkers,
   PAYLOAD_LEN_A, PAYLOAD_LEN_B, PROFILE_REGION_BYTES, payloadLenForSchema, payloadSplit,
   FACTORY_WHEEL_BASE, FACTORY_WHEEL_META,
-  fnv1a64, setOledBitmap, OLED_BYTES, SELECT_OLED, oledBytes, oledPixels, oledDataUrl, renderLightingPanel, renderRapidTapPanel, renderChangesPanel, legendRows, render, loadFiles, init, handleKeyClick,
+  fnv1a64, setOledBitmap, OLED_BYTES, SELECT_OLED, oledBytes, oledPixels, oledDataUrl, OLED_LIT_THRESHOLD, BMP_COMPRESSION_NAMES, decodeBmp, bmpColor, bmpToOledBytes, applyBmpBytes, applyBmpFile, OLED_PAINT_MODES, OLED_PAINT_SCALE, oledPixelIndex, oledPixelXY, oledLitPixels, oledLine, applyOledPixels, applyOledPaint, oledPixelAtEvent, revertOledBlock, oledBlockDiffers, renderLightingPanel, renderRapidTapPanel, legendRows, render, loadFiles, init, handleKeyClick,
 };
 
 globalThis.SsggProfileApp = SsggProfileApp;
